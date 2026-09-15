@@ -1,0 +1,4 @@
+0 Empty Model
+1 No Crack Egg
+2 Crack Egg
+3 Dirty Egg

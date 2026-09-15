@@ -1,0 +1,48 @@
+{
+  "project_info": {
+    "project_number": "706362147152",
+    "project_id": "egg-system-c36f5",
+    "storage_bucket": "egg-system-c36f5.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:706362147152:android:94e410ade88996aacbac55",
+        "android_client_info": {
+          "package_name": "com.chickenfarm.eggsystem"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyA1HNb83G70H9nWRnAEMuvACadR7oN4KPg"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:706362147152:android:c16f163414da3683cbac55",
+        "android_client_info": {
+          "package_name": "com.example.egg_system_flutter"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyA1HNb83G70H9nWRnAEMuvACadR7oN4KPg"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
