@@ -9,6 +9,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_core/firebase_core.dart';
 
 import 'auth_api.dart';
+import 'smartsort_auth.dart';
 import 'api_config.dart';
 import 'iot_egg_reading.dart';
 import 'offline_store.dart';
@@ -1080,11 +1081,13 @@ class AppState extends ChangeNotifier {
     } catch (_) {}
     try {
       final SharedPreferences prefs = await SharedPreferences.getInstance();
-      final String? token = prefs.getString(_sessionStorageKey);
-      if (token == null || token.isEmpty) {
+      final SmartsortProfile? profile = await SmartsortAuth.restoreProfile();
+      if (profile != null) {
+        _applyFirebaseProfile(profile);
         return;
       }
-      await _restoreOfflineSession(token, notify: false);
+      await prefs.remove(_sessionStorageKey);
+      await OfflineStore.clearCachedUser();
     } catch (_) {}
   }
 
@@ -1095,7 +1098,7 @@ class AppState extends ChangeNotifier {
     await _clearIotReadingsOnce();
     startIotReadingsListener();
     final String? token = _sessionToken;
-    if (token != null) {
+    if (token != null && !token.startsWith('firebase:')) {
       unawaited(_refreshSessionFromServer(token));
     }
   }
@@ -1245,7 +1248,7 @@ class AppState extends ChangeNotifier {
     backendReachable = online;
     if (online) {
       await _pushFarmIfDirty();
-      if (_sessionToken != null) {
+      if (_sessionToken != null && !_sessionToken!.startsWith('firebase:')) {
         try {
           final result = await _authApi.me(_sessionToken!);
           _currentUser = DemoUser.fromJson(result.user);
@@ -1436,79 +1439,30 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> login({required String email, required String password}) async {
-    final bool online = await connectBackend(silent: true);
-    if (online) {
-      try {
-        final result = await _authApi.login(email: email, password: password);
-        await _persistSession(result.session.token);
-        _applySession(DemoUser.fromJson(result.user), result.session);
-        backendReachable = true;
-        await _persistCachedUser();
-        await OfflineStore.saveLoginFingerprint(email, password);
-        await _pullRemoteFarmIfAny();
-        return;
-      } on AuthException {
-        rethrow;
-      } catch (_) {}
-    }
-    await _loginWithoutFarmServer(email: email, password: password);
+    final SmartsortProfile profile = await SmartsortAuth.signIn(
+      email: email,
+      password: password,
+    );
+    _applyFirebaseProfile(profile);
+    await connectBackend(silent: true);
   }
 
-  Future<void> _loginWithoutFarmServer({
-    required String email,
-    required String password,
-  }) async {
-    final String normalized = email.trim().toLowerCase();
-    final String fingerprint = OfflineStore.loginFingerprint(
-      normalized,
-      password,
+  void _applyFirebaseProfile(SmartsortProfile profile) {
+    final DateTime expires = DateTime.now().toUtc().add(const Duration(hours: 8));
+    final DemoUser user = DemoUser(
+      name: profile.name,
+      email: profile.email,
+      role: profile.role == 'admin' ? AppRole.admin : AppRole.worker,
+      assignedZone: profile.assignedZone,
+      emailVerified: true,
     );
-    final String? stored = await OfflineStore.loadLoginFingerprint();
-    if (stored != null && stored != fingerprint) {
-      throw AuthException(
-        'Wrong email or password.',
-        code: 'invalid_credentials',
-      );
-    }
-
-    DemoUser user;
-    final cached = await OfflineStore.loadCachedUser();
-    if (cached != null &&
-        (cached.user['email'] as String? ?? '').trim().toLowerCase() ==
-            normalized) {
-      user = DemoUser.fromJson(<String, dynamic>{
-        ...cached.user,
-        'role': 'admin',
-        'emailVerified': true,
-      });
-    } else if (stored != null && cached == null) {
-      throw AuthException(
-        'Wrong email or password.',
-        code: 'invalid_credentials',
-      );
-    } else {
-      final String localName = email.trim().split('@').first;
-      user = DemoUser(
-        name: localName.isEmpty ? 'Admin' : localName,
-        email: email.trim(),
-        role: AppRole.admin,
-        assignedZone: 'Farm',
-        emailVerified: true,
-      );
-    }
-
-    final DateTime expires = DateTime.now().toUtc().add(const Duration(hours: 12));
     final AuthSession session = AuthSession(
-      token: 'local-${expires.millisecondsSinceEpoch}',
+      token: 'firebase:${profile.uid}',
       expiresAt: expires,
-      idleTimeoutSeconds: 12 * 60 * 60,
+      idleTimeoutSeconds: 8 * 60 * 60,
     );
-    await _persistSession(session.token);
+    unawaited(_persistSession(session.token));
     _applySession(user, session);
-    backendReachable = false;
-    await _persistCachedUser();
-    await OfflineStore.saveLoginFingerprint(email, password);
-    notifyListeners();
   }
 
   Future<AuthMailResult> signup({
@@ -1517,36 +1471,18 @@ class AppState extends ChangeNotifier {
     required String password,
     String role = 'worker',
   }) async {
-    final bool online = await connectBackend(silent: true);
-    if (online) {
-      final AuthMailResult result = await _authApi.signup(
-        name: name,
-        email: email,
-        password: password,
-        role: role,
+    if (role == 'admin') {
+      throw AuthException(
+        'You cannot grant yourself administrator access.',
+        code: 'forbidden',
       );
-      if (result.signedIn) {
-        await _persistSession(result.session!.token);
-        _applySession(DemoUser.fromJson(result.user!), result.session!);
-        backendReachable = true;
-        await _persistCachedUser();
-        await OfflineStore.saveLoginFingerprint(email, password);
-        await _pullRemoteFarmIfAny();
-      }
-      return result;
     }
-    await _loginWithoutFarmServer(email: email, password: password);
-    return AuthMailResult(
-      message: 'Signed in on this device. Camera and port 8000 are optional.',
-      user: _currentUser?.toJson(),
-      session: AuthSession(
-        token: _sessionToken ?? 'local',
-        expiresAt:
-            _sessionExpiresAt ??
-            DateTime.now().toUtc().add(const Duration(hours: 12)),
-        idleTimeoutSeconds: 12 * 60 * 60,
-      ),
+    final String message = await SmartsortAuth.signUp(
+      name: name,
+      email: email,
+      password: password,
     );
+    return AuthMailResult(message: message);
   }
 
   Future<String> verifyEmail(String token) => _authApi.verifyEmail(token);
@@ -1555,7 +1491,8 @@ class AppState extends ChangeNotifier {
     return _authApi.resendVerification(email, password: password);
   }
 
-  Future<String> forgotPassword(String email) => _authApi.forgotPassword(email);
+  Future<String> forgotPassword(String email) =>
+      SmartsortAuth.sendPasswordReset(email);
 
   Future<String> resetPassword({
     required String token,
@@ -1573,15 +1510,10 @@ class AppState extends ChangeNotifier {
       throw AuthException('Session expired or invalid', code: 'unauthorized');
     }
     try {
-      final Map<String, dynamic> user = await _authApi.changePassword(
-        token: token,
+      await SmartsortAuth.changePassword(
         currentPassword: currentPassword,
         newPassword: newPassword,
       );
-      if (user.isNotEmpty) {
-        _currentUser = DemoUser.fromJson(user);
-        notifyListeners();
-      }
     } on AuthException catch (error) {
       if (error.isUnauthorized) {
         await signOut();
@@ -1597,7 +1529,10 @@ class AppState extends ChangeNotifier {
     final SharedPreferences prefs = await SharedPreferences.getInstance();
     await prefs.remove(_sessionStorageKey);
     await OfflineStore.clearCachedUser();
-    await _authApi.logout(token);
+    await SmartsortAuth.signOut();
+    if (token != null && !token.startsWith('firebase:')) {
+      await _authApi.logout(token);
+    }
     if (hadSession) {
       onUnauthenticated?.call();
     }
@@ -1675,7 +1610,7 @@ class AppState extends ChangeNotifier {
 
   Future<void> _heartbeatSession() async {
     final String? token = _sessionToken;
-    if (token == null) {
+    if (token == null || token.startsWith('firebase:')) {
       return;
     }
     try {

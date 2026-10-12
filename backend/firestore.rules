@@ -1,22 +1,148 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function userPath() {
+      return /databases/$(database)/documents/users/$(request.auth.uid);
+    }
+
+    function roleOf() {
+      return get(userPath()).data.role;
+    }
+
+    function isFixedAdmin() {
+      return signedIn() && request.auth.token.email == 'katefaithr@gmail.com';
+    }
+
+    function isAdmin() {
+      return isFixedAdmin() || (signedIn() && exists(userPath()) && roleOf() == 'admin');
+    }
+
+    function noSecrets() {
+      return !request.resource.data.keys().hasAny([
+        'password',
+        'passwordHash',
+        'password_hash',
+        'token',
+        'idToken',
+        'appPassword'
+      ]);
+    }
+
+    function profileKeys() {
+      return ['email', 'name', 'role', 'assignedZone', 'createdAt'];
+    }
+
+    // Deny everything that is not matched below.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    match /users/{userId} {
+      allow read: if signedIn() && (request.auth.uid == userId || isAdmin());
+
+      allow create: if signedIn()
+        && request.auth.uid == userId
+        && request.resource.data.role == 'worker'
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.name is string
+        && request.resource.data.assignedZone is string
+        && request.resource.data.keys().hasOnly(profileKeys())
+        && noSecrets();
+
+      allow update: if signedIn() && noSecrets() && (
+        (
+          request.auth.uid == userId
+          && request.resource.data.role == resource.data.role
+          && request.resource.data.email == resource.data.email
+          && request.resource.data.keys().hasOnly(profileKeys())
+        )
+        || (
+          isAdmin()
+          && request.auth.uid != userId
+          && request.resource.data.role in ['admin', 'worker']
+          && request.resource.data.keys().hasOnly(profileKeys())
+        )
+      );
+
+      allow delete: if isAdmin() && request.auth.uid != userId;
+    }
+
+    match /production/{id} {
+      allow read: if signedIn();
+      allow create, update: if signedIn()
+        && noSecrets()
+        && request.resource.data.date is string
+        && request.resource.data.count is int;
+      allow delete: if isAdmin();
+    }
+
+    match /grading/{id} {
+      allow read: if signedIn();
+      allow create, update: if signedIn() && noSecrets();
+      allow delete: if isAdmin();
+    }
+
+    match /losses/{id} {
+      allow read: if signedIn();
+      allow create, update: if signedIn() && noSecrets();
+      allow delete: if isAdmin();
+    }
+
+    match /notifications/{id} {
+      allow read: if signedIn() && (
+        resource.data.uid == request.auth.uid || isAdmin()
+      );
+      allow create: if signedIn()
+        && noSecrets()
+        && request.resource.data.uid is string;
+      allow update: if signedIn()
+        && resource.data.uid == request.auth.uid
+        && request.resource.data.uid == resource.data.uid;
+      allow delete: if isAdmin();
+    }
+
+    match /inventory/{id} {
+      allow read: if isAdmin();
+      allow create, update: if isAdmin() && noSecrets();
+      allow delete: if isAdmin();
+    }
+
+    match /reports/{id} {
+      allow read: if isAdmin();
+      allow create, update: if isAdmin() && noSecrets();
+      allow delete: if isAdmin();
+    }
+
+    match /egg_readings/{id} {
+      allow read: if signedIn();
+      allow create: if signedIn() && noSecrets();
+      allow update, delete: if isAdmin();
+    }
+
+    match /audit_logs/{id} {
+      allow create: if signedIn()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.action is string
+        && request.resource.data.action.size() < 80
+        && request.resource.data.success is bool
+        && request.resource.data.keys().hasOnly(['uid', 'action', 'success', 'createdAt'])
+        && noSecrets();
+      allow read: if isAdmin();
+      allow update, delete: if false;
+    }
+
+    // Server secrets and mailbox data are not client-accessible.
+    match /mail_config/{id} {
+      allow read, write: if false;
+    }
     match /email_verifications/{email} {
-      allow read, write: if true;
+      allow read, write: if false;
     }
     match /backend_emails/{email} {
-      allow read, write: if true;
-    }
-    match /users/{email} {
-      allow read, write: if true;
-    }
-    match /mail_config/{id} {
-      allow read, write: if true;
-    }
-    match /egg_readings/{id} {
-      allow read, write: if true;
-    }
-    match /{document=**} {
       allow read, write: if false;
     }
   }

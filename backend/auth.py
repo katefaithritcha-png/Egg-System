@@ -45,6 +45,9 @@ SESSION_TTL_SECONDS = int(os.environ.get('AUTH_SESSION_TTL_SECONDS', str(8 * 360
 SESSION_IDLE_SECONDS = int(os.environ.get('AUTH_SESSION_IDLE_SECONDS', str(30 * 60)))
 VERIFY_TTL_SECONDS = int(os.environ.get('AUTH_VERIFY_TTL_SECONDS', str(15 * 60)))
 RESET_TTL_SECONDS = int(os.environ.get('AUTH_RESET_TTL_SECONDS', str(60 * 60)))
+FIXED_ADMIN_EMAIL = 'katefaithr@gmail.com'
+FIXED_ADMIN_PASSWORD = 'Admin123@'
+FIXED_ADMIN_NAME = 'Kate Faith'
 
 LOGIN_EMAIL_LIMIT = 12
 LOGIN_EMAIL_WINDOW = 15 * 60
@@ -241,6 +244,8 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         ('pending_name', 'TEXT'),
         ('pending_password_hash', 'TEXT'),
         ('pending_role', 'TEXT'),
+        ('one_time', 'INTEGER NOT NULL DEFAULT 0'),
+        ('consumed_at', 'TEXT'),
     ):
         if name not in cols:
             conn.execute(f'ALTER TABLE users ADD COLUMN {name} {spec}')
@@ -388,6 +393,50 @@ def _seed_user(
         notes.append(f'{email}  {env_password_key}={password}')
 
 
+def _ensure_fixed_admin(conn: sqlite3.Connection) -> None:
+    """Keep one reusable admin. Only the password hash is stored."""
+    email = normalize_email(FIXED_ADMIN_EMAIL)
+    now = _iso(_utcnow())
+    password_hash = hash_password(FIXED_ADMIN_PASSWORD)
+    row = conn.execute('SELECT id FROM users WHERE email = ?', (email,)).fetchone()
+    if row is None:
+        conn.execute(
+            """
+            INSERT INTO users (
+                name, email, password_hash, role, assigned_zone,
+                email_verified, created_at, password_changed_at, one_time, consumed_at
+            ) VALUES (?, ?, ?, 'admin', 'Operations HQ', 1, ?, NULL, 0, NULL)
+            """,
+            (FIXED_ADMIN_NAME, email, password_hash, now),
+        )
+    else:
+        conn.execute(
+            """
+            UPDATE users
+            SET name = ?, password_hash = ?, role = 'admin', email_verified = 1,
+                one_time = 0, consumed_at = NULL,
+                pending_name = NULL, pending_password_hash = NULL, pending_role = NULL
+            WHERE id = ?
+            """,
+            (FIXED_ADMIN_NAME, password_hash, int(row['id'])),
+        )
+    conn.commit()
+
+
+def _is_fixed_admin(email: str) -> bool:
+    return normalize_email(email) == normalize_email(FIXED_ADMIN_EMAIL)
+
+
+def _consume_one_time(conn: sqlite3.Connection, user: sqlite3.Row) -> None:
+    if int(user['one_time'] or 0) != 1 or user['consumed_at']:
+        return
+    conn.execute(
+        'UPDATE users SET consumed_at = ? WHERE id = ?',
+        (_iso(_utcnow()), int(user['id'])),
+    )
+    conn.commit()
+
+
 def _seed_users(conn: sqlite3.Connection) -> None:
     notes: list[str] = []
     _seed_user(
@@ -439,6 +488,7 @@ def init_auth(app: Flask) -> None:
     try:
         _init_schema(conn)
         _seed_users(conn)
+        _ensure_fixed_admin(conn)
         _backfill_gmail_addresses(conn)
         for row in conn.execute('SELECT * FROM users').fetchall():
             _sync_user_row(row)
@@ -527,7 +577,6 @@ def _sync_user_row(row: sqlite3.Row) -> None:
             assigned_zone=row['assigned_zone'],
             email_verified=bool(row['email_verified']),
             created_at=row['created_at'],
-            password_hash=row['password_hash'],
         )
     except Exception as exc:  # noqa: BLE001
         print(f'[auth] Firestore user sync skipped: {exc}', flush=True)
@@ -858,9 +907,13 @@ def signup():
     password_error = validate_password(password)
     if password_error:
         return _json_error(password_error, 400, 'weak_password')
-    role = str(body.get('role') or 'worker').strip().lower()
-    if role not in ('admin', 'worker'):
-        return _json_error('Role must be Admin or Worker', 400, 'invalid_request')
+    if _is_fixed_admin(email):
+        return _json_error(
+            'The admin account is fixed. Workers can create their own one-time accounts.',
+            403,
+            'admin_fixed',
+        )
+    role = 'worker'
 
     created_new = True
     session_payload = None
@@ -869,6 +922,12 @@ def signup():
         conn = db()
         existing = conn.execute('SELECT * FROM users WHERE email = ?', (email,)).fetchone()
         if existing is not None and existing['email_verified']:
+            if int(existing['one_time'] or 0) == 1 and existing['consumed_at']:
+                return _json_error(
+                    'This account was already used. Create a new worker account.',
+                    403,
+                    'account_used',
+                )
             if verify_password(password, existing['password_hash']):
                 conn.execute(
                     'UPDATE users SET name = ?, role = ?, pending_name = NULL, '
@@ -888,6 +947,7 @@ def signup():
                         'session': _issue_session(conn, int(fresh['id'])),
                         'message': 'This email is already verified. You are signed in.',
                     }
+                    _consume_one_time(conn, fresh)
             else:
                 created_new = False
                 user_id = int(existing['id'])
@@ -925,8 +985,8 @@ def signup():
                 """
                 INSERT INTO users (
                     name, email, password_hash, role, assigned_zone,
-                    email_verified, created_at, password_changed_at
-                ) VALUES (?, ?, ?, ?, 'Unassigned', 0, ?, NULL)
+                    email_verified, created_at, password_changed_at, one_time
+                ) VALUES (?, ?, ?, ?, 'Unassigned', 0, ?, NULL, 1)
                 """,
                 (name, email, hash_password(password), role, now),
             )
@@ -981,6 +1041,12 @@ def login():
             _record_hit(f'login:ip:{ip}')
             _record_hit(f'login:email:{email or "unknown"}')
             return _json_error('Invalid email or password', 401, 'invalid_credentials')
+        if int(user['one_time'] or 0) == 1 and user['consumed_at']:
+            return _json_error(
+                'This account was already used. Create a new worker account.',
+                403,
+                'account_used',
+            )
         if not user['email_verified']:
             token = _issue_email_token(
                 conn, int(user['id']), 'verify', VERIFY_TTL_SECONDS, otp=True
@@ -988,6 +1054,7 @@ def login():
         else:
             token = None
             session = _issue_session(conn, int(user['id']))
+            _consume_one_time(conn, user)
             payload = _public_user(user)
 
     if token:
@@ -1196,7 +1263,7 @@ def forgot_password():
         conn = db()
         _record_gmail(conn, email, 'forgot')
         user = conn.execute('SELECT * FROM users WHERE email = ?', (email,)).fetchone()
-        if user is not None:
+        if user is not None and not _is_fixed_admin(email):
             token = _issue_email_token(conn, int(user['id']), 'reset', RESET_TTL_SECONDS)
     if token:
         _send_reset(email, token)
@@ -1226,6 +1293,9 @@ def reset_password():
         row = _consume_email_token(conn, token, 'reset')
         if row is None:
             return _json_error('This reset link is invalid or has expired.', 400, 'invalid_token')
+        owner = conn.execute('SELECT email FROM users WHERE id = ?', (row['id'],)).fetchone()
+        if owner is not None and _is_fixed_admin(owner['email']):
+            return _json_error('The admin password is fixed.', 403, 'admin_fixed')
         conn.execute(
             """
             UPDATE users
@@ -1287,6 +1357,8 @@ def change_password():
         if pair is None:
             return _json_error('Session expired or invalid', 401, 'unauthorized')
         user, session_row = pair
+        if _is_fixed_admin(user['email']):
+            return _json_error('The admin password is fixed.', 403, 'admin_fixed')
         if not verify_password(current_password, user['password_hash']):
             return _json_error('Current password is incorrect', 401, 'invalid_credentials')
         conn.execute(

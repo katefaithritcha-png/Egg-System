@@ -39,8 +39,13 @@ dependencies:
 
   http: ^1.6.0
   shared_preferences: ^2.5.3
-  firebase_core: ^4.14.0
-  cloud_firestore: ^6.9.0
+  firebase_core: ^4.15.0
+  firebase_auth: ^6.5.0
+  cloud_firestore: ^6.10.0
+
+dependency_overrides:
+  firebase_core_web: 3.12.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
@@ -81,7 +86,6 @@ flutter:
     - assets/egg-factory-bg.jpg
     - assets/egg-logo.png
     - assets/app-icon.png
-    - assets/models/egg_model.tflite
     - assets/models/labels.txt
 
   # An image asset can refer to one or more resolution-specific "variants", see

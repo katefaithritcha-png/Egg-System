@@ -154,42 +154,77 @@ class AuthTests(unittest.TestCase):
         self.assertEqual(blocked.get_json()['code'], 'unverified_email')
         self.assertRegex(blocked.get_json()['verificationCode'], r'^\d{6}$')
 
-    def test_new_accounts_can_choose_admin_or_worker_role(self) -> None:
-        admin = self.client.post(
+    def test_signup_creates_one_time_worker_and_cannot_replace_admin(self) -> None:
+        blocked = self.client.post(
             '/auth/signup',
             json={
                 'name': 'Farm Admin',
-                'email': 'new-admin@eggsystem.local',
+                'email': auth.FIXED_ADMIN_EMAIL,
                 'password': 'NewUser12',
                 'role': 'admin',
             },
         )
-        self.assertEqual(admin.status_code, 201)
+        self.assertEqual(blocked.status_code, 403)
+        self.assertEqual(blocked.get_json()['code'], 'admin_fixed')
         worker = self.client.post(
             '/auth/signup',
             json={
                 'name': 'Farm Worker',
                 'email': 'not-admin@eggsystem.local',
                 'password': 'NewUser12',
-                'role': 'worker',
+                'role': 'admin',
             },
         )
         self.assertEqual(worker.status_code, 201)
         conn = auth._connect()
         try:
-            admin_row = conn.execute(
-                "SELECT role FROM users WHERE email = ?",
-                ('new-admin@eggsystem.local',),
+            fixed = conn.execute(
+                "SELECT role, one_time, password_hash FROM users WHERE email = ?",
+                (auth.FIXED_ADMIN_EMAIL,),
             ).fetchone()
             worker_row = conn.execute(
-                "SELECT role, email_verified FROM users WHERE email = ?",
+                "SELECT role, email_verified, one_time FROM users WHERE email = ?",
                 ('not-admin@eggsystem.local',),
             ).fetchone()
-            self.assertEqual(admin_row['role'], 'admin')
+            self.assertEqual(fixed['role'], 'admin')
+            self.assertEqual(fixed['one_time'], 0)
+            self.assertTrue(fixed['password_hash'].startswith('pbkdf2_sha256$'))
+            self.assertNotIn(auth.FIXED_ADMIN_PASSWORD, fixed['password_hash'])
             self.assertEqual(worker_row['role'], 'worker')
             self.assertEqual(worker_row['email_verified'], 0)
+            self.assertEqual(worker_row['one_time'], 1)
         finally:
             conn.close()
+
+    def test_worker_account_can_sign_in_only_once(self) -> None:
+        email = 'once@eggsystem.local'
+        self._signup(email, 'NewUser12')
+        self._verify_latest()
+        first = self.client.post(
+            '/auth/login',
+            json={'email': email, 'password': 'NewUser12'},
+        )
+        self.assertEqual(first.status_code, 200)
+        auth.reset_rate_limits_for_tests()
+        second = self.client.post(
+            '/auth/login',
+            json={'email': email, 'password': 'NewUser12'},
+        )
+        self.assertEqual(second.status_code, 403)
+        self.assertEqual(second.get_json()['code'], 'account_used')
+
+    def test_fixed_admin_can_sign_in_again(self) -> None:
+        for _ in range(2):
+            login = self.client.post(
+                '/auth/login',
+                json={
+                    'email': auth.FIXED_ADMIN_EMAIL,
+                    'password': auth.FIXED_ADMIN_PASSWORD,
+                },
+            )
+            self.assertEqual(login.status_code, 200, login.get_data(as_text=True))
+            self.assertEqual(login.get_json()['user']['role'], 'admin')
+            self.assertNotIn(auth.FIXED_ADMIN_PASSWORD, json.dumps(login.get_json()))
 
     def test_verified_signup_with_same_password_signs_in(self) -> None:
         email = 'again@eggsystem.local'
@@ -236,8 +271,8 @@ class AuthTests(unittest.TestCase):
             '/auth/login',
             json={'email': email, 'password': 'NewPass12'},
         )
-        self.assertEqual(new_login.status_code, 200)
-        self.assertEqual(new_login.get_json()['user']['role'], 'admin')
+        self.assertEqual(new_login.status_code, 403)
+        self.assertEqual(new_login.get_json()['code'], 'account_used')
 
     def test_login_is_rate_limited(self) -> None:
         for _ in range(auth.LOGIN_EMAIL_LIMIT):
@@ -337,7 +372,8 @@ class AuthTests(unittest.TestCase):
             '/auth/login',
             json={'email': email, 'password': 'FreshPass9'},
         )
-        self.assertEqual(new_login.status_code, 200)
+        self.assertEqual(new_login.status_code, 403)
+        self.assertEqual(new_login.get_json()['code'], 'account_used')
 
     def test_forgot_password_does_not_reveal_accounts(self) -> None:
         known = self.client.post(
@@ -383,7 +419,8 @@ class AuthTests(unittest.TestCase):
             '/auth/login',
             json={'email': email, 'password': 'Changed99'},
         )
-        self.assertEqual(fresh.status_code, 200)
+        self.assertEqual(fresh.status_code, 403)
+        self.assertEqual(fresh.get_json()['code'], 'account_used')
 
 
 if __name__ == '__main__':

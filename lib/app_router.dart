@@ -2,6 +2,7 @@ import 'package:flutter/foundation.dart';
 import 'package:image/image.dart' as img;
 import 'package:flutter/services.dart';
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'tflite_interpreter.dart';
 
 import 'app_state.dart';
@@ -248,8 +249,6 @@ class NotFoundScreen extends StatelessWidget {
   }
 }
 
-enum _AuthMode { login, signup }
-
 String _extractAuthToken(String raw) {
   final String trimmed = raw.trim();
   if (trimmed.contains('token=')) {
@@ -361,32 +360,56 @@ class AuthScreen extends StatefulWidget {
 }
 
 class _AuthScreenState extends State<AuthScreen> {
-  static const int _minPasswordLength = 8;
+  static const String _rememberEmailKey = 'auth.remember_email';
+  static const Color _orange = Color(0xFFE8B423);
+  static const Color _ink = Color(0xFFF7F3EA);
+  static const Color _muted = Color(0xFFC8BBA8);
+  static const Color _line = Color(0x33FFFFFF);
 
   final GlobalKey<FormState> _formKey = GlobalKey<FormState>();
-  final TextEditingController _fullNameController = TextEditingController();
+  final TextEditingController _nameController = TextEditingController();
   final TextEditingController _emailController = TextEditingController();
   final TextEditingController _passwordController = TextEditingController();
 
-  _AuthMode _mode = _AuthMode.login;
-  AppRole _signupRole = AppRole.worker;
+  bool _workerSignUp = false;
   bool _obscurePassword = true;
+  bool _rememberMe = false;
   bool _submitting = false;
   String? _error;
 
   @override
+  void initState() {
+    super.initState();
+    _loadRememberedEmail();
+  }
+
+  @override
   void dispose() {
-    _fullNameController.dispose();
+    _nameController.dispose();
     _emailController.dispose();
     _passwordController.dispose();
     super.dispose();
   }
 
-  void _setMode(_AuthMode mode) {
+  Future<void> _loadRememberedEmail() async {
+    final SharedPreferences prefs = await SharedPreferences.getInstance();
+    final String? email = prefs.getString(_rememberEmailKey);
+    if (!mounted || email == null || email.isEmpty) {
+      return;
+    }
     setState(() {
-      _mode = mode;
-      _error = null;
+      _rememberMe = true;
+      _emailController.text = email;
     });
+  }
+
+  Future<void> _persistRememberedEmail(String email) async {
+    final SharedPreferences prefs = await SharedPreferences.getInstance();
+    if (_rememberMe) {
+      await prefs.setString(_rememberEmailKey, email);
+    } else {
+      await prefs.remove(_rememberEmailKey);
+    }
   }
 
   void _openVerifyEmail({
@@ -417,13 +440,6 @@ class _AuthScreenState extends State<AuthScreen> {
 
     final String email = _emailController.text.trim();
     final String password = _passwordController.text;
-    if (_mode == _AuthMode.signup) {
-      final String? passwordError = _validatePassword(password);
-      if (passwordError != null) {
-        setState(() => _error = passwordError);
-        return;
-      }
-    }
 
     setState(() {
       _submitting = true;
@@ -431,34 +447,46 @@ class _AuthScreenState extends State<AuthScreen> {
     });
 
     try {
-      if (_mode == _AuthMode.login) {
-        await widget.appState.login(email: email, password: password);
+      if (_workerSignUp) {
+        final String name = _nameController.text.trim();
+        if (name.isEmpty) {
+          setState(() => _error = 'Name is required');
+          return;
+        }
+        final String? passwordError = _validateNewPassword(password);
+        if (passwordError != null) {
+          setState(() => _error = passwordError);
+          return;
+        }
+        final AuthMailResult result = await widget.appState.signup(
+          name: name,
+          email: email,
+          password: password,
+          role: 'worker',
+        );
         if (!mounted) {
           return;
         }
-        Navigator.of(context).pushReplacementNamed(AppPaths.dashboard);
+        if (widget.appState.isAuthenticated) {
+          Navigator.of(context).pushReplacementNamed(AppPaths.dashboard);
+          return;
+        }
+        setState(() {
+          _workerSignUp = false;
+          _error = null;
+          _passwordController.clear();
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(result.message)),
+        );
         return;
       }
-
-      final AuthMailResult result = await widget.appState.signup(
-        name: _fullNameController.text.trim(),
-        email: email,
-        password: password,
-        role: _signupRole == AppRole.admin ? 'admin' : 'worker',
-      );
+      await widget.appState.login(email: email, password: password);
+      await _persistRememberedEmail(email);
       if (!mounted) {
         return;
       }
-      if (widget.appState.isAuthenticated) {
-        Navigator.of(context).pushReplacementNamed(AppPaths.dashboard);
-        return;
-      }
-      _openVerifyEmail(
-        email: email,
-        password: password,
-        verificationCode: result.verificationCode,
-        message: result.message,
-      );
+      Navigator.of(context).pushReplacementNamed(AppPaths.dashboard);
     } on AuthException catch (error) {
       if (!mounted) {
         return;
@@ -472,41 +500,12 @@ class _AuthScreenState extends State<AuthScreen> {
         );
         return;
       }
-      if (error.code == 'email_taken') {
-        try {
-          await widget.appState.login(email: email, password: password);
-          if (!mounted) {
-            return;
-          }
-          Navigator.of(context).pushReplacementNamed(AppPaths.dashboard);
-          return;
-        } on AuthException catch (loginError) {
-          if (loginError.isUnverified) {
-            _openVerifyEmail(
-              email: email,
-              password: password,
-              verificationCode: loginError.verificationCode,
-              message: loginError.message,
-            );
-            return;
-          }
-          setState(() {
-            _error =
-                'This email already has an account. Sign in with that password, or use Forgot password.';
-            _mode = _AuthMode.login;
-          });
-          return;
-        }
-      }
       setState(() => _error = error.message);
     } catch (_) {
       if (!mounted) {
         return;
       }
-      setState(
-        () => _error =
-            'Wrong email or password, or the form is incomplete.',
-      );
+      setState(() => _error = 'Wrong email or password.');
     } finally {
       if (mounted) {
         setState(() => _submitting = false);
@@ -514,11 +513,27 @@ class _AuthScreenState extends State<AuthScreen> {
     }
   }
 
-  String get _ctaLabel {
-    if (_mode == _AuthMode.signup) {
-      return 'CREATE ACCOUNT';
+  void _continueWithGoogle() {
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text(
+          'Google sign-in is not available. Contact your administrator.',
+        ),
+      ),
+    );
+  }
+
+  String? _validateNewPassword(String password) {
+    if (password.length < 8) {
+      return 'Minimum 8 characters';
     }
-    return 'SIGN IN';
+    if (!RegExp(r'[A-Za-z]').hasMatch(password)) {
+      return 'Include a letter';
+    }
+    if (!RegExp(r'\d').hasMatch(password)) {
+      return 'Include a number';
+    }
+    return null;
   }
 
   String? _validateEmail(String? value) {
@@ -532,357 +547,409 @@ class _AuthScreenState extends State<AuthScreen> {
     return null;
   }
 
-  String? _validatePassword(String? value) {
-    final String password = value ?? '';
-    if (password.length < _minPasswordLength) {
-      return 'Minimum $_minPasswordLength characters';
-    }
-    if (!RegExp(r'[A-Za-z]').hasMatch(password)) {
-      return 'Include a letter';
-    }
-    if (!RegExp(r'\d').hasMatch(password)) {
-      return 'Include a number';
-    }
-    return null;
+  InputDecoration _fieldDecoration({
+    required String hintText,
+    required IconData icon,
+    Widget? suffixIcon,
+  }) {
+    final OutlineInputBorder border = OutlineInputBorder(
+      borderRadius: BorderRadius.circular(10),
+      borderSide: const BorderSide(color: _line),
+    );
+    return InputDecoration(
+      hintText: hintText,
+      hintStyle: const TextStyle(color: Color(0xFFB7AA9A), fontSize: 15),
+      prefixIcon: Icon(icon, color: const Color(0xFFB7AA9A), size: 20),
+      suffixIcon: suffixIcon,
+      filled: true,
+      fillColor: const Color(0xFF3A322B),
+      contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 16),
+      enabledBorder: border,
+      focusedBorder: border.copyWith(
+        borderSide: const BorderSide(color: _orange, width: 1.4),
+      ),
+      errorBorder: border.copyWith(
+        borderSide: const BorderSide(color: Color(0xFFEF4444)),
+      ),
+      focusedErrorBorder: border.copyWith(
+        borderSide: const BorderSide(color: Color(0xFFEF4444), width: 1.4),
+      ),
+    );
+  }
+
+  Widget _fieldLabel(String text) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Text(
+        text,
+        style: const TextStyle(
+          color: _ink,
+          fontSize: 14,
+          fontWeight: FontWeight.w700,
+        ),
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      backgroundColor: const Color(0xFF1A120C),
       resizeToAvoidBottomInset: false,
       body: Stack(
+        fit: StackFit.expand,
         children: <Widget>[
-          const Positioned.fill(
-            child: ColoredBox(
-              color: Color(0xFF140F0C),
+          Image.asset(
+            'assets/egg-factory-bg.jpg',
+            fit: BoxFit.cover,
+          ),
+          const DecoratedBox(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+                colors: <Color>[
+                  Color(0xCC3A2A12),
+                  Color(0xB31A120C),
+                  Color(0xE6140E0A),
+                ],
+              ),
             ),
           ),
-          Positioned.fill(
-            child: DecoratedBox(
-              decoration: BoxDecoration(
-                gradient: LinearGradient(
-                  begin: Alignment.topCenter,
-                  end: Alignment.bottomCenter,
-                  colors: <Color>[
-                    _AuthPalette.overlayTop,
-                    _AuthPalette.overlayBottom,
+          SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+              child: Center(
+                child: FittedBox(
+                  fit: BoxFit.scaleDown,
+                  child: SizedBox(
+                    width: 420,
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                    children: <Widget>[
+                      ClipOval(
+                        child: Image.asset(
+                          'assets/egg-logo.png',
+                          width: 72,
+                          height: 72,
+                          fit: BoxFit.cover,
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      const Text(
+                        'EGG SORTER',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 28,
+                          fontWeight: FontWeight.w800,
+                          letterSpacing: 2.4,
+                        ),
+                      ),
+                      const SizedBox(height: 6),
+                      const Row(
+                        children: <Widget>[
+                          Expanded(
+                            child: Divider(
+                              color: Color(0xFFE8B84A),
+                              thickness: 1.4,
+                              indent: 72,
+                            ),
+                          ),
+                          Padding(
+                            padding: EdgeInsets.symmetric(horizontal: 10),
+                            child: Text(
+                              'SYSTEM',
+                              style: TextStyle(
+                                color: Color(0xFFE8B84A),
+                                fontSize: 14,
+                                fontWeight: FontWeight.w700,
+                                letterSpacing: 3.2,
+                              ),
+                            ),
+                          ),
+                          Expanded(
+                            child: Divider(
+                              color: Color(0xFFE8B84A),
+                              thickness: 1.4,
+                              endIndent: 72,
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 22),
+                      DecoratedBox(
+                        decoration: BoxDecoration(
+                          color: const Color(0xD9241C16),
+                          borderRadius: BorderRadius.circular(22),
+                          border: Border.all(color: const Color(0x33FFFFFF)),
+                          boxShadow: const <BoxShadow>[
+                            BoxShadow(
+                              color: Color(0x66000000),
+                              blurRadius: 28,
+                              offset: Offset(0, 12),
+                            ),
+                          ],
+                        ),
+                        child: Padding(
+                          padding: const EdgeInsets.fromLTRB(24, 28, 24, 22),
+                          child: Form(
+                            key: _formKey,
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.stretch,
+                              children: <Widget>[
+                    Text(
+                      _workerSignUp ? 'Create worker account' : 'Welcome Back!',
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(
+                        color: _ink,
+                        fontSize: 30,
+                        fontWeight: FontWeight.w800,
+                        height: 1.15,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      _workerSignUp
+                          ? 'Workers only. The admin account cannot be created here.'
+                          : 'Log in to continue to SMARTSORT',
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(
+                        color: _muted,
+                        fontSize: 15,
+                        height: 1.3,
+                      ),
+                    ),
+                    const SizedBox(height: 32),
+                    if (_workerSignUp) ...<Widget>[
+                      _fieldLabel('Full name'),
+                      TextFormField(
+                        controller: _nameController,
+                        textInputAction: TextInputAction.next,
+                        cursorColor: _orange,
+                        style: const TextStyle(color: Colors.white, fontSize: 15),
+                        decoration: _fieldDecoration(
+                          hintText: 'Enter your name',
+                          icon: Icons.person_outline,
+                        ),
+                      ),
+                      const SizedBox(height: 18),
+                    ],
+                    _fieldLabel('Email'),
+                    TextFormField(
+                      controller: _emailController,
+                      keyboardType: TextInputType.emailAddress,
+                      textInputAction: TextInputAction.next,
+                      cursorColor: _orange,
+                      style: const TextStyle(color: Colors.white, fontSize: 15),
+                      validator: _validateEmail,
+                      decoration: _fieldDecoration(
+                        hintText: 'Enter your email',
+                        icon: Icons.mail_outline_rounded,
+                      ),
+                    ),
+                    const SizedBox(height: 18),
+                    _fieldLabel('Password'),
+                    TextFormField(
+                      controller: _passwordController,
+                      obscureText: _obscurePassword,
+                      textInputAction: TextInputAction.done,
+                      cursorColor: _orange,
+                      style: const TextStyle(color: Colors.white, fontSize: 15),
+                      onFieldSubmitted: (_) => _submit(),
+                      validator: (String? value) {
+                        if ((value ?? '').isEmpty) {
+                          return 'Password is required';
+                        }
+                        return null;
+                      },
+                      decoration: _fieldDecoration(
+                        hintText: 'Enter your password',
+                        icon: Icons.lock_outline_rounded,
+                        suffixIcon: IconButton(
+                          onPressed: () {
+                            setState(() {
+                              _obscurePassword = !_obscurePassword;
+                            });
+                          },
+                          icon: Icon(
+                            _obscurePassword
+                                ? Icons.visibility_outlined
+                                : Icons.visibility_off_outlined,
+                            color: const Color(0xFFB7AA9A),
+                            size: 20,
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    if (!_workerSignUp)
+                    Row(
+                      children: <Widget>[
+                        SizedBox(
+                          width: 22,
+                          height: 22,
+                          child: Checkbox(
+                            value: _rememberMe,
+                            onChanged: (bool? value) {
+                              setState(() => _rememberMe = value ?? false);
+                            },
+                            activeColor: _orange,
+                            side: const BorderSide(color: Color(0xFFB7AA9A)),
+                            materialTapTargetSize:
+                                MaterialTapTargetSize.shrinkWrap,
+                            visualDensity: VisualDensity.compact,
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        const Text(
+                          'Remember me',
+                          style: TextStyle(color: _muted, fontSize: 14),
+                        ),
+                        const Spacer(),
+                        TextButton(
+                          onPressed: () => Navigator.of(
+                            context,
+                          ).pushNamed(AppPaths.forgotPassword),
+                          style: TextButton.styleFrom(
+                            foregroundColor: _orange,
+                            padding: const EdgeInsets.symmetric(horizontal: 4),
+                          ),
+                          child: const Text(
+                            'Forgot Password?',
+                            style: TextStyle(
+                              color: _orange,
+                              fontWeight: FontWeight.w600,
+                              fontSize: 14,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    if (_error != null) ...<Widget>[
+                      const SizedBox(height: 8),
+                      Text(
+                        _error!,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                          color: Color(0xFFDC2626),
+                          height: 1.35,
+                        ),
+                      ),
+                    ],
+                    const SizedBox(height: 16),
+                    FilledButton(
+                      onPressed: _submitting ? null : _submit,
+                      style: FilledButton.styleFrom(
+                        backgroundColor: _orange,
+                        foregroundColor: const Color(0xFF2A2118),
+                        disabledBackgroundColor: _orange.withValues(alpha: 0.55),
+                        padding: const EdgeInsets.symmetric(vertical: 16),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        textStyle: const TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                      child: _submitting
+                          ? const SizedBox(
+                              width: 22,
+                              height: 22,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2.4,
+                                color: Color(0xFF2A2118),
+                              ),
+                            )
+                          : Text(_workerSignUp ? 'Sign up' : 'Log In'),
+                    ),
+                    const SizedBox(height: 22),
+                    const Row(
+                      children: <Widget>[
+                        Expanded(child: Divider(color: _line, thickness: 1)),
+                        Padding(
+                          padding: EdgeInsets.symmetric(horizontal: 14),
+                          child: Text(
+                            'OR',
+                            style: TextStyle(
+                              color: Color(0xFF9CA3AF),
+                              fontSize: 12,
+                              fontWeight: FontWeight.w600,
+                              letterSpacing: 1.2,
+                            ),
+                          ),
+                        ),
+                        Expanded(child: Divider(color: _line, thickness: 1)),
+                      ],
+                    ),
+                    const SizedBox(height: 18),
+                    OutlinedButton(
+                      onPressed: _submitting ? null : _continueWithGoogle,
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: _ink,
+                        backgroundColor: const Color(0xFF3A322B),
+                        padding: const EdgeInsets.symmetric(vertical: 14),
+                        side: const BorderSide(color: _line),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                      ),
+                      child: const Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: <Widget>[
+                          _GoogleMark(),
+                          SizedBox(width: 10),
+                          Text(
+                            'Continue with Google',
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontSize: 15,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 28),
+                    Wrap(
+                      alignment: WrapAlignment.center,
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      children: <Widget>[
+                        Text(
+                          _workerSignUp
+                              ? 'Already have an account? '
+                              : "Don't have an account? ",
+                          style: const TextStyle(color: _muted, fontSize: 14),
+                        ),
+                        GestureDetector(
+                          onTap: () {
+                            setState(() {
+                              _workerSignUp = !_workerSignUp;
+                              _error = null;
+                            });
+                          },
+                          child: Text(
+                            _workerSignUp ? 'Sign in' : 'Sign up',
+                            style: const TextStyle(
+                              color: _orange,
+                              fontSize: 14,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
                   ],
                 ),
               ),
             ),
           ),
-          SafeArea(
-            child: LayoutBuilder(
-              builder: (BuildContext context, BoxConstraints constraints) {
-                final double width = constraints.maxWidth < 552
-                    ? constraints.maxWidth - 32
-                    : 520;
-                return Center(
-                  child: FittedBox(
-                    fit: BoxFit.scaleDown,
-                    alignment: Alignment.center,
-                    child: SizedBox(
-                      width: width,
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 16,
-                          vertical: 12,
-                        ),
-                        child: Column(
-                          mainAxisSize: MainAxisSize.min,
-                          children: <Widget>[
-                            ClipRRect(
-                              borderRadius: BorderRadius.circular(16),
-                              child: Image.asset(
-                                'assets/app-icon.png',
-                                width: 64,
-                                height: 64,
-                                fit: BoxFit.cover,
-                              ),
-                            ),
-                            const SizedBox(height: 10),
-                            const Text(
-                              'EGG SORTING',
-                              textAlign: TextAlign.center,
-                              style: TextStyle(
-                                color: _AuthPalette.foreground,
-                                fontSize: 32,
-                                fontWeight: FontWeight.w800,
-                                letterSpacing: 4,
-                              ),
-                            ),
-                            const SizedBox(height: 6),
-                            const _SystemWordmark(),
-                            const SizedBox(height: 16),
-                            ClipRRect(
-                              borderRadius: BorderRadius.circular(24),
-                              child: Container(
-                                decoration: BoxDecoration(
-                                  color: _AuthPalette.glassBackground,
-                                  borderRadius: BorderRadius.circular(24),
-                                  border: Border.all(
-                                    color: _AuthPalette.glassBorder,
-                                  ),
-                                  boxShadow: const <BoxShadow>[
-                                    BoxShadow(
-                                      color: Color(0x66000000),
-                                      blurRadius: 32,
-                                      offset: Offset(0, 12),
-                                    ),
-                                  ],
-                                ),
-                                padding: const EdgeInsets.all(20),
-                                child: Form(
-                                  key: _formKey,
-                                  child: Column(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.stretch,
-                                    children: <Widget>[
-                                      Container(
-                                        decoration: BoxDecoration(
-                                          color: _AuthPalette.tabBackground,
-                                          borderRadius:
-                                              BorderRadius.circular(14),
-                                        ),
-                                        padding: const EdgeInsets.all(4),
-                                        child: Row(
-                                          children: <Widget>[
-                                            Expanded(
-                                              child: _AuthModeButton(
-                                                label: 'SIGN IN',
-                                                selected:
-                                                    _mode == _AuthMode.login,
-                                                onTap: () =>
-                                                    _setMode(_AuthMode.login),
-                                              ),
-                                            ),
-                                            Expanded(
-                                              child: _AuthModeButton(
-                                                label: 'CREATE ACCOUNT',
-                                                selected:
-                                                    _mode == _AuthMode.signup,
-                                                onTap: () =>
-                                                    _setMode(_AuthMode.signup),
-                                              ),
-                                            ),
-                                          ],
-                                        ),
-                                      ),
-                                      const SizedBox(height: 18),
-                                      if (_mode == _AuthMode.signup) ...<Widget>[
-                                        _AuthTextField(
-                                          controller: _fullNameController,
-                                          hintText: 'Full name',
-                                          prefixIcon: Icons.person_outline,
-                                          textInputAction: TextInputAction.next,
-                                          validator: (String? value) {
-                                            if ((value ?? '').trim().isEmpty) {
-                                              return 'Name is required';
-                                            }
-                                            return null;
-                                          },
-                                        ),
-                                        const SizedBox(height: 12),
-                                        const Text(
-                                          'Account type',
-                                          style: TextStyle(
-                                            color: _AuthPalette.mutedForeground,
-                                            fontSize: 12,
-                                            fontWeight: FontWeight.w700,
-                                            letterSpacing: 0.8,
-                                          ),
-                                        ),
-                                        const SizedBox(height: 8),
-                                        Container(
-                                          decoration: BoxDecoration(
-                                            color: _AuthPalette.tabBackground,
-                                            borderRadius:
-                                                BorderRadius.circular(14),
-                                          ),
-                                          padding: const EdgeInsets.all(4),
-                                          child: Row(
-                                            children: <Widget>[
-                                              Expanded(
-                                                child: _AuthModeButton(
-                                                  label: 'ADMIN',
-                                                  selected: _signupRole ==
-                                                      AppRole.admin,
-                                                  onTap: () => setState(() {
-                                                    _signupRole = AppRole.admin;
-                                                  }),
-                                                ),
-                                              ),
-                                              Expanded(
-                                                child: _AuthModeButton(
-                                                  label: 'WORKER',
-                                                  selected: _signupRole ==
-                                                      AppRole.worker,
-                                                  onTap: () => setState(() {
-                                                    _signupRole =
-                                                        AppRole.worker;
-                                                  }),
-                                                ),
-                                              ),
-                                            ],
-                                          ),
-                                        ),
-                                        const SizedBox(height: 12),
-                                      ],
-                                      _AuthTextField(
-                                        controller: _emailController,
-                                        hintText: 'Email',
-                                        prefixIcon:
-                                            Icons.mail_outline_rounded,
-                                        keyboardType:
-                                            TextInputType.emailAddress,
-                                        textInputAction: TextInputAction.next,
-                                        validator: _validateEmail,
-                                      ),
-                                      const SizedBox(height: 12),
-                                      _AuthTextField(
-                                        controller: _passwordController,
-                                        hintText: _mode == _AuthMode.signup
-                                            ? 'Password (8+ chars, letter and number)'
-                                            : 'Password',
-                                        prefixIcon:
-                                            Icons.lock_outline_rounded,
-                                        obscureText: _obscurePassword,
-                                        textInputAction: TextInputAction.done,
-                                        validator: _mode == _AuthMode.signup
-                                            ? _validatePassword
-                                            : (String? value) {
-                                                if ((value ?? '').isEmpty) {
-                                                  return 'Password is required';
-                                                }
-                                                return null;
-                                              },
-                                        suffixIcon: IconButton(
-                                          onPressed: () {
-                                            setState(() {
-                                              _obscurePassword =
-                                                  !_obscurePassword;
-                                            });
-                                          },
-                                          icon: Icon(
-                                            _obscurePassword
-                                                ? Icons.visibility_outlined
-                                                : Icons
-                                                    .visibility_off_outlined,
-                                            color:
-                                                _AuthPalette.mutedForeground,
-                                          ),
-                                        ),
-                                        onFieldSubmitted: (_) => _submit(),
-                                      ),
-                                      if (_error != null) ...<Widget>[
-                                        const SizedBox(height: 12),
-                                        Text(
-                                          _error!,
-                                          textAlign: TextAlign.center,
-                                          style: const TextStyle(
-                                            color: Color(0xFFED6A5A),
-                                            height: 1.35,
-                                          ),
-                                        ),
-                                      ],
-                                      if (_mode == _AuthMode.login) ...<Widget>[
-                                        Align(
-                                          alignment: Alignment.centerRight,
-                                          child: TextButton(
-                                            onPressed: () => Navigator.of(
-                                              context,
-                                            ).pushNamed(
-                                              AppPaths.forgotPassword,
-                                            ),
-                                            child: const Text(
-                                              'Forgot password?',
-                                              style: TextStyle(
-                                                color: _AuthPalette.primary,
-                                                fontWeight: FontWeight.w700,
-                                              ),
-                                            ),
-                                          ),
-                                        ),
-                                      ] else
-                                        const SizedBox(height: 12),
-                                      DecoratedBox(
-                                        decoration: BoxDecoration(
-                                          borderRadius:
-                                              BorderRadius.circular(16),
-                                          boxShadow: const <BoxShadow>[
-                                            BoxShadow(
-                                              color: Color(0x66EFB73E),
-                                              blurRadius: 24,
-                                              offset: Offset(0, 8),
-                                            ),
-                                          ],
-                                        ),
-                                        child: FilledButton(
-                                          onPressed:
-                                              _submitting ? null : _submit,
-                                          style: FilledButton.styleFrom(
-                                            backgroundColor:
-                                                _AuthPalette.primary,
-                                            foregroundColor: _AuthPalette
-                                                .primaryForeground,
-                                            disabledBackgroundColor:
-                                                _AuthPalette.primary
-                                                    .withValues(alpha: 0.55),
-                                            padding:
-                                                const EdgeInsets.symmetric(
-                                              vertical: 16,
-                                            ),
-                                            shape: RoundedRectangleBorder(
-                                              borderRadius:
-                                                  BorderRadius.circular(16),
-                                            ),
-                                            textStyle: const TextStyle(
-                                              fontSize: 16,
-                                              fontWeight: FontWeight.w800,
-                                              letterSpacing: 1.4,
-                                            ),
-                                          ),
-                                          child: _submitting
-                                              ? const SizedBox(
-                                                  width: 22,
-                                                  height: 22,
-                                                  child:
-                                                      CircularProgressIndicator(
-                                                    strokeWidth: 2.4,
-                                                    color: _AuthPalette
-                                                        .primaryForeground,
-                                                  ),
-                                                )
-                                              : Text(_ctaLabel),
-                                        ),
-                                      ),
-                                      const SizedBox(height: 12),
-                                      Text(
-                                        _mode == _AuthMode.login
-                                            ? 'ESP32 and port 8000 are not required to open Admin. Live camera stays Waiting until the station is on.'
-                                            : 'Choose Admin or Worker, then enter the 6-digit code on the next screen.',
-                                        textAlign: TextAlign.center,
-                                        style: Theme.of(context)
-                                            .textTheme
-                                            .bodySmall
-                                            ?.copyWith(
-                                              color: _AuthPalette
-                                                  .mutedForeground,
-                                              height: 1.4,
-                                            ),
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
+                      ],
                     ),
                   ),
-                );
-              },
+                ),
+              ),
             ),
           ),
         ],
@@ -1562,87 +1629,59 @@ class _AuthFormScaffold extends StatelessWidget {
   }
 }
 
-class _SystemWordmark extends StatelessWidget {
-  const _SystemWordmark();
+class _GoogleMark extends StatelessWidget {
+  const _GoogleMark();
 
   @override
   Widget build(BuildContext context) {
-    final double indent =
-        MediaQuery.sizeOf(context).width < 420 ? 8 : 72;
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.center,
-      children: <Widget>[
-        Expanded(
-          child: Divider(
-            color: _AuthPalette.primary,
-            thickness: 1,
-            indent: indent,
-          ),
-        ),
-        const Padding(
-          padding: EdgeInsets.symmetric(horizontal: 10),
-          child: Text(
-            'SYSTEM',
-            style: TextStyle(
-              color: _AuthPalette.primary,
-              fontSize: 18,
-              fontWeight: FontWeight.w700,
-              letterSpacing: 4.8,
-            ),
-          ),
-        ),
-        Expanded(
-          child: Divider(
-            color: _AuthPalette.primary,
-            thickness: 1,
-            endIndent: indent,
-          ),
-        ),
-      ],
+    return const SizedBox(
+      width: 18,
+      height: 18,
+      child: CustomPaint(painter: _GoogleLogoPainter()),
     );
   }
 }
 
-class _AuthModeButton extends StatelessWidget {
-  const _AuthModeButton({
-    required this.label,
-    required this.selected,
-    required this.onTap,
-  });
-
-  final String label;
-  final bool selected;
-  final VoidCallback onTap;
+class _GoogleLogoPainter extends CustomPainter {
+  const _GoogleLogoPainter();
 
   @override
-  Widget build(BuildContext context) {
-    return AnimatedContainer(
-      duration: const Duration(milliseconds: 180),
-      curve: Curves.easeOut,
-      decoration: BoxDecoration(
-        color: selected ? _AuthPalette.primary : Colors.transparent,
-        borderRadius: BorderRadius.circular(10),
+  void paint(Canvas canvas, Size size) {
+    final double stroke = size.width * 0.18;
+    final Rect ring = Rect.fromLTWH(
+      stroke / 2,
+      stroke / 2,
+      size.width - stroke,
+      size.height - stroke,
+    );
+    final Paint paint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = stroke
+      ..strokeCap = StrokeCap.butt;
+
+    paint.color = const Color(0xFFEA4335);
+    canvas.drawArc(ring, -1.35, 1.15, false, paint);
+    paint.color = const Color(0xFFFBBC05);
+    canvas.drawArc(ring, -0.15, 1.05, false, paint);
+    paint.color = const Color(0xFF34A853);
+    canvas.drawArc(ring, 0.95, 1.15, false, paint);
+    paint.color = const Color(0xFF4285F4);
+    canvas.drawArc(ring, 2.15, 1.55, false, paint);
+
+    paint
+      ..style = PaintingStyle.fill
+      ..color = const Color(0xFF4285F4);
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+        Rect.fromLTWH(size.width * 0.46, size.height * 0.40, size.width * 0.5, stroke),
+        const Radius.circular(1),
       ),
-      child: TextButton(
-        onPressed: onTap,
-        style: TextButton.styleFrom(
-          foregroundColor: selected
-              ? _AuthPalette.primaryForeground
-              : _AuthPalette.mutedForeground,
-          padding: const EdgeInsets.symmetric(vertical: 14),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(10),
-          ),
-          textStyle: const TextStyle(
-            fontSize: 12,
-            fontWeight: FontWeight.w700,
-            letterSpacing: 1.1,
-          ),
-        ),
-        child: Text(label, textAlign: TextAlign.center),
-      ),
+      paint,
     );
   }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
 }
 
 class _AuthTextField extends StatelessWidget {
@@ -2006,11 +2045,23 @@ class DashboardScreen extends StatelessWidget {
           ]
         : <_DashboardStat>[
             _DashboardStat(
-              label: 'Today\'s Production',
-              value: appState.todayProductionTotal.toString(),
-              unit: 'Eggs',
+              label: 'Today\'s Egg Production',
+              value: _productionBetween(
+                appState,
+                _dashboardDay(DateTime.now()),
+                _dashboardDay(DateTime.now()),
+              ).toString(),
+              unit: 'Eggs logged today',
               icon: Icons.trending_up_rounded,
               accent: _DashboardPalette.success,
+              route: AppPaths.production,
+            ),
+            _DashboardStat(
+              label: 'Today\'s Total Eggs',
+              value: _todayTotalEggs(appState).toString(),
+              unit: 'Eggs today',
+              icon: Icons.egg_alt_outlined,
+              accent: _DashboardPalette.primary,
               route: AppPaths.production,
             ),
             _DashboardStat(
@@ -2053,11 +2104,6 @@ class DashboardScreen extends StatelessWidget {
               icon: Icons.shield_outlined,
             ),
             const _QuickLinkItem(
-              label: 'Egg Classifier',
-              route: AppPaths.classification,
-              icon: Icons.smart_toy_outlined,
-            ),
-            const _QuickLinkItem(
               label: 'Profile',
               route: AppPaths.profile,
               icon: Icons.verified_user_outlined,
@@ -2078,11 +2124,6 @@ class DashboardScreen extends StatelessWidget {
               label: 'Inventory',
               route: AppPaths.inventory,
               icon: Icons.inventory_2_outlined,
-            ),
-            _QuickLinkItem(
-              label: 'Egg Classifier',
-              route: AppPaths.classification,
-              icon: Icons.smart_toy_outlined,
             ),
             _QuickLinkItem(
               label: 'Reports',
@@ -2113,38 +2154,32 @@ class DashboardScreen extends StatelessWidget {
               ? _WorkerDashboardPanels(appState: appState)
               : _AdminDashboardPanels(appState: appState);
 
-          if (!split) {
-            return Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: <Widget>[
-                kpis,
-                const SizedBox(height: 14),
-                links,
-                const SizedBox(height: 16),
-                inspect,
-                const SizedBox(height: 16),
-                panels,
-                const SizedBox(height: 10),
-                zoneLine,
-              ],
-            );
-          }
-
+          final Widget analytics = _EggAnalyticsBoard(appState: appState);
           return Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: <Widget>[
+              const _DashboardHeading('Overview'),
               kpis,
-              const SizedBox(height: 14),
+              const SizedBox(height: 16),
+              analytics,
+              const SizedBox(height: 16),
+              const _DashboardHeading('Modules'),
               links,
               const SizedBox(height: 16),
-              Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: <Widget>[
-                  Expanded(flex: 11, child: inspect),
-                  const SizedBox(width: 16),
-                  Expanded(flex: 9, child: panels),
-                ],
-              ),
+              if (split)
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    Expanded(flex: 7, child: inspect),
+                    const SizedBox(width: 16),
+                    Expanded(flex: 5, child: panels),
+                  ],
+                )
+              else ...<Widget>[
+                inspect,
+                const SizedBox(height: 16),
+                panels,
+              ],
               const SizedBox(height: 10),
               zoneLine,
             ],
@@ -7324,11 +7359,6 @@ class _EggScaffoldState extends State<EggScaffold> {
       icon: Icons.fact_check_outlined,
     ),
     _NavItem(
-      label: 'Classify',
-      route: AppPaths.classification,
-      icon: Icons.smart_toy_outlined,
-    ),
-    _NavItem(
       label: 'Profile',
       route: AppPaths.profile,
       icon: Icons.person_outline,
@@ -8068,6 +8098,459 @@ class _QuickLinkGrid extends StatelessWidget {
   }
 }
 
+class _DashboardHeading extends StatelessWidget {
+  const _DashboardHeading(this.label);
+
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Text(
+        label,
+        style: const TextStyle(
+          color: _DashboardPalette.mutedForeground,
+          fontSize: 12,
+          fontWeight: FontWeight.w800,
+          letterSpacing: 1.2,
+        ),
+      ),
+    );
+  }
+}
+
+class _EggAnalyticsBoard extends StatelessWidget {
+  const _EggAnalyticsBoard({required this.appState});
+
+  final AppState appState;
+
+  @override
+  Widget build(BuildContext context) {
+    final int good = appState.liveGoodEggs;
+    final int cracked = appState.liveCrackedEggs;
+    final int dirty = appState.liveDirtyEggs;
+    final int inspected = good + cracked + dirty;
+    final int produced = appState.productionRecords.fold<int>(
+      0,
+      (int sum, ProductionRecord record) => sum + record.count,
+    );
+    final bool hasRecords = inspected > 0 ||
+        produced > 0 ||
+        appState.iotReadings.isNotEmpty ||
+        appState.detectionRecords.isNotEmpty;
+    if (!hasRecords) {
+      return const _GlassSection(
+        title: 'Egg analytics',
+        child: Text(
+          'No egg records yet. Counts, grade mix, and production will appear here after the first egg is inspected or logged.',
+          style: TextStyle(
+            color: _DashboardPalette.mutedForeground,
+            height: 1.4,
+          ),
+        ),
+      );
+    }
+
+    final int base = inspected == 0 ? 1 : inspected;
+    final int goodPercent = ((good / base) * 100).round();
+    final List<IotEggReading> latest = appState.iotReadings.take(4).toList();
+    final Map<String, int> byDate = <String, int>{};
+    for (final ProductionRecord record in appState.productionRecords) {
+      byDate[record.date] = (byDate[record.date] ?? 0) + record.count;
+    }
+    final List<String> dates = byDate.keys.toList()..sort();
+    final List<String> recentDates = dates.length <= 6
+        ? dates
+        : dates.sublist(dates.length - 6);
+
+    return _GlassSection(
+      title: 'Egg analytics',
+      titleIcon: Icons.insights_outlined,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: <Widget>[
+          Wrap(
+            spacing: 10,
+            runSpacing: 10,
+            children: <Widget>[
+              _AnalyticsPill(label: 'Inspected', value: '$inspected'),
+              _AnalyticsPill(label: 'Good', value: '$goodPercent%'),
+              _AnalyticsPill(label: 'Logged production', value: '$produced'),
+            ],
+          ),
+          const SizedBox(height: 14),
+          _GradeBar(label: 'Good', count: good, total: base, color: _DashboardPalette.success),
+          const SizedBox(height: 8),
+          _GradeBar(label: 'Cracked', count: cracked, total: base, color: _DashboardPalette.primary),
+          const SizedBox(height: 8),
+          _GradeBar(label: 'Dirty / rejected', count: dirty, total: base, color: _DashboardPalette.danger),
+          if (recentDates.isNotEmpty) ...<Widget>[
+            const SizedBox(height: 16),
+            const Text(
+              'Production by day',
+              style: TextStyle(
+                color: _DashboardPalette.foreground,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+            const SizedBox(height: 8),
+            _SimpleLineChart(
+              data: recentDates
+                  .map(
+                    (String date) => _SeriesPoint(
+                      date.length > 5 ? date.substring(5) : date,
+                      (byDate[date] ?? 0).toDouble(),
+                    ),
+                  )
+                  .toList(),
+            ),
+          ],
+          if (latest.isNotEmpty) ...<Widget>[
+            const SizedBox(height: 8),
+            const Text(
+              'Latest egg records',
+              style: TextStyle(
+                color: _DashboardPalette.foreground,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+            const SizedBox(height: 8),
+            ...latest.map(
+              (IotEggReading reading) => Padding(
+                padding: const EdgeInsets.only(bottom: 6),
+                child: Text(
+                  '${reading.grade} · ${reading.sizeClass.isEmpty ? 'size n/a' : reading.sizeClass} · ${reading.weightGrams.toStringAsFixed(1)} g',
+                  style: const TextStyle(color: _DashboardPalette.mutedForeground),
+                ),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _AnalyticsPill extends StatelessWidget {
+  const _AnalyticsPill({required this.label, required this.value});
+
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: _DashboardPalette.tabBackground,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: _DashboardPalette.glassBorder),
+      ),
+      child: Text(
+        '$label  $value',
+        style: const TextStyle(
+          color: _DashboardPalette.foreground,
+          fontWeight: FontWeight.w700,
+        ),
+      ),
+    );
+  }
+}
+
+class _GradeBar extends StatelessWidget {
+  const _GradeBar({
+    required this.label,
+    required this.count,
+    required this.total,
+    required this.color,
+  });
+
+  final String label;
+  final int count;
+  final int total;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    final double share = total == 0 ? 0 : count / total;
+    return Row(
+      children: <Widget>[
+        SizedBox(
+          width: 110,
+          child: Text(
+            label,
+            style: const TextStyle(color: _DashboardPalette.mutedForeground),
+          ),
+        ),
+        Expanded(child: _GradientProgressBar(value: share)),
+        const SizedBox(width: 10),
+        SizedBox(
+          width: 64,
+          child: Text(
+            '$count  ${(share * 100).round()}%',
+            textAlign: TextAlign.right,
+            style: const TextStyle(
+              color: _DashboardPalette.foreground,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+DateTime _dashboardDay(DateTime value) {
+  final DateTime local = value.toLocal();
+  return DateTime(local.year, local.month, local.day);
+}
+
+String _dashboardIsoDate(DateTime date) {
+  final String month = date.month.toString().padLeft(2, '0');
+  final String day = date.day.toString().padLeft(2, '0');
+  return '${date.year}-$month-$day';
+}
+
+int _productionBetween(AppState appState, DateTime start, DateTime end) {
+  final String from = _dashboardIsoDate(start);
+  final String to = _dashboardIsoDate(end);
+  return appState.productionRecords
+      .where(
+        (ProductionRecord record) =>
+            record.date.compareTo(from) >= 0 && record.date.compareTo(to) <= 0,
+      )
+      .fold<int>(0, (int sum, ProductionRecord record) => sum + record.count);
+}
+
+class _PeriodGradeCounts {
+  const _PeriodGradeCounts({
+    required this.good,
+    required this.cracked,
+    required this.dirty,
+    required this.produced,
+  });
+
+  final int good;
+  final int cracked;
+  final int dirty;
+  final int produced;
+
+  int get inspected => good + cracked + dirty;
+}
+
+_PeriodGradeCounts _gradesBetween(
+  AppState appState,
+  DateTime start,
+  DateTime end, {
+  required bool useLiveFallback,
+}) {
+  int good = 0;
+  int cracked = 0;
+  int dirty = 0;
+  for (final IotEggReading reading in appState.iotReadings) {
+    final DateTime day = _dashboardDay(reading.createdAt);
+    if (day.isBefore(start) || day.isAfter(end)) {
+      continue;
+    }
+    final String grade = reading.grade.toLowerCase();
+    if (grade.contains('crack')) {
+      cracked += 1;
+    } else if (grade.contains('dirt') || grade.contains('reject')) {
+      dirty += 1;
+    } else if (grade.contains('good') || grade.contains('clean')) {
+      good += 1;
+    }
+  }
+  if (useLiveFallback && good + cracked + dirty == 0) {
+    good = appState.liveGoodEggs;
+    cracked = appState.liveCrackedEggs;
+    dirty = appState.liveDirtyEggs;
+  }
+  return _PeriodGradeCounts(
+    good: good,
+    cracked: cracked,
+    dirty: dirty,
+    produced: _productionBetween(appState, start, end),
+  );
+}
+
+int _todayTotalEggs(AppState appState) {
+  final DateTime today = _dashboardDay(DateTime.now());
+  final _PeriodGradeCounts counts = _gradesBetween(
+    appState,
+    today,
+    today,
+    useLiveFallback: true,
+  );
+  return counts.inspected > 0 ? counts.inspected : counts.produced;
+}
+
+enum _InventoryPeriod { daily, weekly, monthly }
+
+class _InventoryStatusCard extends StatefulWidget {
+  const _InventoryStatusCard({required this.appState});
+
+  final AppState appState;
+
+  @override
+  State<_InventoryStatusCard> createState() => _InventoryStatusCardState();
+}
+
+class _InventoryStatusCardState extends State<_InventoryStatusCard> {
+  _InventoryPeriod _period = _InventoryPeriod.daily;
+
+  DateTime get _start {
+    final DateTime today = _dashboardDay(DateTime.now());
+    switch (_period) {
+      case _InventoryPeriod.daily:
+        return today;
+      case _InventoryPeriod.weekly:
+        return today.subtract(const Duration(days: 6));
+      case _InventoryPeriod.monthly:
+        return DateTime(today.year, today.month, 1);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final DateTime today = _dashboardDay(DateTime.now());
+    final int productionToday = _productionBetween(
+      widget.appState,
+      today,
+      today,
+    );
+    final int totalToday = _todayTotalEggs(widget.appState);
+    final _PeriodGradeCounts counts = _gradesBetween(
+      widget.appState,
+      _start,
+      today,
+      useLiveFallback: _period == _InventoryPeriod.daily,
+    );
+    final int periodTotal = counts.inspected > 0 ? counts.inspected : counts.produced;
+
+    return _GlassSection(
+      title: 'Inventory Status',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: <Widget>[
+          _InventoryStatusRow(
+            label: 'Today\'s egg production',
+            value: '$productionToday',
+            color: _DashboardPalette.success,
+          ),
+          const SizedBox(height: 12),
+          _InventoryStatusRow(
+            label: 'Today\'s total eggs',
+            value: '$totalToday',
+            color: _DashboardPalette.primary,
+          ),
+          const SizedBox(height: 14),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: <Widget>[
+              _PeriodChip(
+                label: 'Daily',
+                selected: _period == _InventoryPeriod.daily,
+                onTap: () => setState(() => _period = _InventoryPeriod.daily),
+              ),
+              _PeriodChip(
+                label: 'Weekly',
+                selected: _period == _InventoryPeriod.weekly,
+                onTap: () => setState(() => _period = _InventoryPeriod.weekly),
+              ),
+              _PeriodChip(
+                label: 'Monthly',
+                selected: _period == _InventoryPeriod.monthly,
+                onTap: () => setState(() => _period = _InventoryPeriod.monthly),
+              ),
+            ],
+          ),
+          const SizedBox(height: 14),
+          _InventoryStatusRow(
+            label: 'Good Eggs',
+            value: '${counts.good}',
+            color: _DashboardPalette.success,
+          ),
+          const SizedBox(height: 12),
+          _InventoryStatusRow(
+            label: 'Cracked Eggs',
+            value: '${counts.cracked}',
+            color: _DashboardPalette.primary,
+          ),
+          const SizedBox(height: 12),
+          _InventoryStatusRow(
+            label: 'Dirty / Rejected',
+            value: '${counts.dirty}',
+            color: _DashboardPalette.danger,
+          ),
+          const SizedBox(height: 12),
+          _InventoryStatusRow(
+            label: 'Eggs produced',
+            value: '${counts.produced}',
+            color: _DashboardPalette.foreground,
+          ),
+          const SizedBox(height: 14),
+          Text(
+            periodTotal == 0
+                ? 'No egg records in this period yet.'
+                : '$periodTotal eggs in this period',
+            style: const TextStyle(color: _DashboardPalette.mutedForeground),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _PeriodChip extends StatelessWidget {
+  const _PeriodChip({
+    required this.label,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final String label;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: selected
+          ? _DashboardPalette.primary.withValues(alpha: 0.16)
+          : _DashboardPalette.tabBackground,
+      borderRadius: BorderRadius.circular(999),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(999),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(999),
+            border: Border.all(
+              color: selected
+                  ? _DashboardPalette.primary
+                  : _DashboardPalette.glassBorder,
+            ),
+          ),
+          child: Text(
+            label,
+            style: TextStyle(
+              color: selected
+                  ? _DashboardPalette.primary
+                  : _DashboardPalette.mutedForeground,
+              fontWeight: FontWeight.w700,
+              fontSize: 12,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _AdminDashboardPanels extends StatelessWidget {
   const _AdminDashboardPanels({required this.appState});
 
@@ -8075,8 +8558,11 @@ class _AdminDashboardPanels extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    const List<_SeriesPoint> productionData = <_SeriesPoint>[];
-    const List<_SalesLossPoint> salesLossData = <_SalesLossPoint>[];
+    final int good = appState.liveGoodEggs;
+    final int cracked = appState.liveCrackedEggs;
+    final int dirty = appState.liveDirtyEggs;
+    final int inspected = good + cracked + dirty;
+    final double goodShare = inspected == 0 ? 0 : good / inspected;
 
     return Column(
       children: <Widget>[
@@ -8098,84 +8584,7 @@ class _AdminDashboardPanels extends StatelessWidget {
                       : medium
                       ? half
                       : full,
-                  child: _GlassSection(
-                    title: 'Production Overview',
-                    child: _SimpleLineChart(data: productionData),
-                  ),
-                ),
-                SizedBox(
-                  width: wide
-                      ? third
-                      : medium
-                      ? half
-                      : full,
-                  child: _GlassSection(
-                    title: 'Inventory Status',
-                    child: Column(
-                      children: <Widget>[
-                        _InventoryStatusRow(
-                          label: 'Good Eggs',
-                          value: '2,800',
-                          color: _DashboardPalette.success,
-                        ),
-                        const SizedBox(height: 12),
-                        _InventoryStatusRow(
-                          label: 'Cracked Eggs',
-                          value: '420',
-                          color: _DashboardPalette.primary,
-                        ),
-                        const SizedBox(height: 18),
-                        Container(
-                          width: double.infinity,
-                          padding: const EdgeInsets.all(14),
-                          decoration: BoxDecoration(
-                            color: _DashboardPalette.tabBackground,
-                            borderRadius: BorderRadius.circular(16),
-                            border: Border.all(
-                              color: _DashboardPalette.glassBorder,
-                            ),
-                          ),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: <Widget>[
-                              const Row(
-                                children: <Widget>[
-                                  Icon(
-                                    Icons.inventory_2_outlined,
-                                    color: _DashboardPalette.primary,
-                                    size: 18,
-                                  ),
-                                  SizedBox(width: 8),
-                                  Text(
-                                    'Inventory Flow',
-                                    style: TextStyle(
-                                      color: _DashboardPalette.foreground,
-                                      fontWeight: FontWeight.w600,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                              const SizedBox(height: 12),
-                              Row(
-                                children: <Widget>[
-                                  const Text(
-                                    'FIFO Tracking',
-                                    style: TextStyle(
-                                      color: _DashboardPalette.mutedForeground,
-                                    ),
-                                  ),
-                                  const SizedBox(width: 12),
-                                  const Expanded(
-                                    child: _GradientProgressBar(value: 0),
-                                  ),
-                                ],
-                              ),
-                            ],
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
+                  child: _InventoryStatusCard(appState: appState),
                 ),
                 SizedBox(
                   width: wide ? third : full,
@@ -8217,8 +8626,8 @@ class _AdminDashboardPanels extends StatelessWidget {
                     child: Row(
                       children: <Widget>[
                         _CircularScore(
-                          value: 0.8,
-                          label: '80%',
+                          value: goodShare,
+                          label: '${(goodShare * 100).round()}%',
                           color: _DashboardPalette.success,
                         ),
                         const SizedBox(width: 20),
@@ -8230,7 +8639,9 @@ class _AdminDashboardPanels extends StatelessWidget {
                                     padding: const EdgeInsets.only(bottom: 12),
                                     child: _LegendRow(
                                       label: item.label,
-                                      value: '${item.quantity}%',
+                                      value: inspected == 0
+                                          ? '0%'
+                                          : '${((item.label == 'Good' ? good : item.label == 'Cracked' ? cracked : dirty) / inspected * 100).round()}%',
                                       color: item.color,
                                     ),
                                   ),
@@ -8240,13 +8651,6 @@ class _AdminDashboardPanels extends StatelessWidget {
                         ),
                       ],
                     ),
-                  ),
-                ),
-                SizedBox(
-                  width: width,
-                  child: _GlassSection(
-                    title: 'Sales & Losses',
-                    child: _SalesLossChart(data: salesLossData),
                   ),
                 ),
               ],

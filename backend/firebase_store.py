@@ -60,8 +60,30 @@ def _i(value: int) -> dict[str, str]:
     return {'integerValue': str(value)}
 
 
+def user_profile_fields(
+    *,
+    email: str,
+    name: str,
+    role: str,
+    assigned_zone: str,
+    email_verified: bool,
+    created_at: str,
+) -> dict[str, Any]:
+    """Profile fields safe to store. Passwords and tokens are never included."""
+    normalized = email.strip().lower()
+    return {
+        'app': _s('egg_system'),
+        'email': _s(normalized),
+        'name': _s(name),
+        'role': _s(role),
+        'assignedZone': _s(assigned_zone),
+        'emailVerified': _b(email_verified),
+        'createdAt': _s(created_at),
+    }
+
+
 def sync_mail_config() -> None:
-    """Push Gmail SMTP settings the backend uses to send 6-digit codes."""
+    """Record that SMTP is configured. The app password stays in the server environment."""
     host = os.environ.get('SMTP_HOST', '').strip()
     user = os.environ.get('SMTP_USER', '').strip()
     from_addr = (os.environ.get('SMTP_FROM') or user).strip()
@@ -77,10 +99,9 @@ def sync_mail_config() -> None:
             'port': _i(int(os.environ.get('SMTP_PORT', '587') or '587')),
             'user': _s(user),
             'fromEmail': _s(from_addr),
-            'appPassword': _s(password),
             'configured': _b(bool(host and password)),
         },
-        log='saved mail_config/smtp',
+        log='saved mail_config/smtp without the app password',
     )
 
 
@@ -92,22 +113,19 @@ def upsert_user_profile(
     assigned_zone: str,
     email_verified: bool,
     created_at: str,
-    password_hash: str,
 ) -> None:
     normalized = email.strip().lower()
     _patch(
         'users',
         normalized,
-        {
-            'app': _s('egg_system'),
-            'email': _s(normalized),
-            'name': _s(name),
-            'role': _s(role),
-            'assignedZone': _s(assigned_zone),
-            'emailVerified': _b(email_verified),
-            'createdAt': _s(created_at),
-            'passwordHash': _s(password_hash),
-        },
+        user_profile_fields(
+            email=normalized,
+            name=name,
+            role=role,
+            assigned_zone=assigned_zone,
+            email_verified=email_verified,
+            created_at=created_at,
+        ),
         log=f'saved users/{normalized}',
     )
 
