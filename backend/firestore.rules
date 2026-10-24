@@ -1,0 +1,52 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Deny-by-default. Client SDK must not read SMTP or password material.
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function validEgg(data) {
+      return data.keys().hasAll([
+            'weight', 'grade', 'sizeClass', 'deviceId', 'createdAt'
+          ])
+          && data.weight is number
+          && data.weight > 0
+          && data.weight < 500
+          && data.deviceId is string
+          && data.grade is string
+          && data.sizeClass is string;
+    }
+
+    // Server-only — never allow browser/mobile SDK access.
+    match /mail_config/{id} {
+      allow read, write: if false;
+    }
+    match /email_verifications/{email} {
+      allow read, write: if false;
+    }
+    match /backend_emails/{email} {
+      allow read, write: if false;
+    }
+    match /users/{email} {
+      allow read, write: if false;
+    }
+
+    // ESP32 may CREATE telemetry only (no updates/deletes). Staff may read when signed in.
+    match /egg_readings/{id} {
+      allow read: if signedIn();
+      allow create: if validEgg(request.resource.data);
+      // Same record id and weight can be written again. A retry does not create a second egg.
+      allow update: if validEgg(request.resource.data)
+        && request.resource.data.recordId == resource.data.recordId
+        && request.resource.data.weight == resource.data.weight
+        && request.resource.data.createdAt == resource.data.createdAt;
+      allow delete: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
