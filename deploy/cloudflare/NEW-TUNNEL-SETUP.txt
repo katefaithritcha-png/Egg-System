@@ -1,0 +1,66 @@
+NEW TUNNEL SETUP (after deleting the old one)
+Domain: eggsorting.site (already Active)
+
+============================================================
+1) CREATE TUNNEL IN CLOUDFLARE
+============================================================
+1. Open: https://one.dash.cloudflare.com/
+2. Networks → Tunnels → Create a tunnel
+3. Choose: Cloudflared
+4. Name: egg-farm-backend
+5. Save tunnel
+
+6. Install connector → Windows → copy the token
+   (long string starting like eyJ...)
+   OR copy the full install command; we only need the token part
+   after: --token 
+
+============================================================
+2) PUBLIC HOSTNAME (same tunnel screen)
+============================================================
+Add a public hostname:
+
+  Subdomain:  egg-farm
+  Domain:     eggsorting.site
+  Type:       HTTP
+  URL:        http://192.168.11.212:8000
+
+Save.
+
+Full public URL:
+  https://egg-farm.eggsorting.site
+
+============================================================
+3) SAVE TOKEN ON FARM PC
+============================================================
+1. Open Notepad
+2. Paste ONLY the token (one line, no spaces)
+3. Save as:
+   C:\Users\ADMIN\cloudflared\egg-farm-backend.token
+   (overwrite the old file)
+
+============================================================
+4) START
+============================================================
+1. Backend must be running (start-egg-farm.bat does both)
+2. Double-click:
+   C:\Users\ADMIN\cloudflared\start-egg-named-tunnel.bat
+   OR
+   c:\Egg System\start-egg-farm.bat
+
+============================================================
+5) POINT THE APP (Worker) AT THE NEW STABLE URL
+============================================================
+After https://egg-farm.eggsorting.site/health works, run in PowerShell:
+
+  cd "c:\Egg System\deploy\cloudflare"
+  echo https://egg-farm.eggsorting.site| npx wrangler secret put FARM_ORIGIN
+
+============================================================
+6) TEST
+============================================================
+  https://egg-farm.eggsorting.site/health
+  https://egg-system.paghasianjustine.workers.dev
+
+Bookmark only workers.dev. Never :8000 or localhost in the browser.
+ESP32 stays: http://192.168.11.212:8000

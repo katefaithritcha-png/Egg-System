@@ -10,26 +10,26 @@
  *   Expansion pin marked 3V3 → IR VCC and HX711 VCC. Both GNDs → expansion black G.
  *   Red V row stays empty. Do not use those red holes for servos, the IR, the HX711, or the camera.
  *
- * Yellow S holes on the expansion (one signal each):
- *   P13 ENTRANCE — UP every 13s; DOWN instantly when IR sees a passed egg (IR = entrance only)
- *   P14 GATE — middle while scanning; Clean=LEFT / Crack·Dirty=RIGHT while egg in view;
- *              back to MIDDLE when the egg leaves the camera
- *   P26 SORT — after weigh: 1=SMALL 2=MEDIUM 3=LARGE 4=JUMBO (by grams)
- *   P25 PUSH — moves ONLY after SORT has assigned the lane
- *   P19 IR — entrance only (never weigh)
- *   P32/P33 HX711 — weigh only (never moves GATE)
- *   P23 and P34 stay empty
- *   P17 and P18 stay empty — those were the L298N
+ * Yellow S holes on the expansion (one signal each) — your station flow:
+ *   P13 ENTRANCE + P19 IR
+ *      Every 10s ENTRANCE goes UP; when IR sees the egg → ENTRANCE DOWN instantly.
+ *   P14 GATE (camera decision from laptop)
+ *      Clean → full LEFT; Crack/Dirty → full RIGHT; no egg in camera → MIDDLE.
+ *   P32/P33 HX711 load cell — weigh only (never moves GATE).
+ *   P26 SORT — after weigh: 1=SMALL, 2=MEDIUM, 3=LARGE, else JUMBO.
+ *   P25 PUSH — moves ONLY after SORT has assigned the size lane.
+ *   P23 and P34 stay empty. P17/P18 stay empty (old L298N).
  *
- * Serial: t | c50 | egg | start | gate | push | sort
- * DevKit weigh: empty→t → 50g→c50 → remove→t → put egg→egg (no auto weigh).
+ * Serial (optional cal only): t | c50 | egg | gate | push | sort
+ * IoT flow: ENTRANCE→IR→camera→GATE→(Clean) scale→SORT→PUSH.
+ * Crack/Dirty: GATE right; recorded by camera; no scale required.
  */
 
 // 1 = station (ENTRANCE/IR/servos/HX711). Upload ONLY to DevKit COM5.
 // 0 = picture only. Upload ONLY to ESP32-CAM USB.
 // NEVER flash EGG_DEVKIT=1 onto the CAM — GPIO19=IR on DevKit but Y4 camera data on CAM.
 // Workflow: set 1 → Upload COM5 → set 0 → Upload CAM. Default stays 0 (CAM-safe).
-#define EGG_DEVKIT 0
+#define EGG_DEVKIT 1
 // 1 = after boot, Serial only prints Weight/Class when an egg locks (no scale spam).
 // 0 = verbose live scale lines every second (debug).
 #define SERIAL_WEIGHT_ONLY 1
@@ -116,8 +116,8 @@ const int IR_PIN = 19;
 //   SMALL [SMALL_MIN_G .. MEDIUM_MIN_G) | MEDIUM | LARGE | JUMBO
 const float DISPLAY_SCALE = 1.0f;     // lockG is already grams
 const float EMPTY_THRESHOLD_G = 5.0f;
-// Soft / inaccurate load cell: still classify anything egg-like (do not reject 30–45 g).
-const float SMALL_MIN_G = 20.0f;
+// Soft / inaccurate load cell — still never treat empty residual as an egg.
+const float SMALL_MIN_G = 40.0f;  // real chicken egg floor (empty noise is far below)
 const float MEDIUM_MIN_G = 55.0f;  // small < 55 ≤ medium
 #if EGG_DEVKIT
 // Soft cell under-reads large (~60g) as 57–59 → was stuck MEDIUM. 58 opens LARGE lane.
@@ -145,25 +145,27 @@ const unsigned long WEIGHT_SETTLE_MS = 80;
 const unsigned long PEAK_HOLD_MS = 2000;
 const unsigned long WEIGHT_FORCE_LOCK_MS = 400;
 const unsigned long WEIGHT_GIVE_UP_MS = 1600;
-const long REST_D_MIN = 10;
-const long REST_D_MAX = 40;
+const long REST_D_MIN = 35;   // never lock on empty residual (was 10 — empty weighed)
+const long REST_D_MAX = 400;  // do NOT clamp real eggs down to 40 (that faked ~40g)
 const unsigned long WEIGH_COOLDOWN_MS = 100;
 const unsigned long CLEAR_BEFORE_NEXT_MS = 250;
 const unsigned long IDLE_ARM_MS = 500;
 const int EGG_SEEN_HITS_NEED = 3;
 const int LIFT_CLEAR_HITS_NEED = 2;
 const int REST_SAMPLES_NEED = 2;
-const long PLACE_RISE_COUNTS = 8;
-const long EGG_ADC_MIN = 10;
-const long EMPTY_BAND_COUNTS = 10;  // soft residual often 12–18 — was 18 and blocked Ready
-const long EGG_D_LO = 8;
-const long EGG_D_HI = 200;
-// Soft cell: egg/50g rest usually d=12–40; empty noise mostly <10 with rare spikes.
-const long EGG_SAMPLE_MIN_D = 12;
-const long EGG_SAMPLE_MAX_D = 120;  // soft peaks hit 90–110; 80 was clipping real mass
-const long EGG_LOCK_MIN_D = 12;
-const long EGG_CAL_MIN_D = 12;   // soft mount often rests ~12–18 for 50g
-const long EGG_RISE_ABOVE_IDLE = 8;
+// Pad must bend like a REAL egg — empty residual is often d=1–25 (never weigh that).
+const long PLACE_RISE_COUNTS = 40;
+const long AUTO_WEIGH_MIN_D = 40;   // below this = empty / residual, NEVER auto-weigh
+const long EGG_ADC_MIN = 35;
+const long EMPTY_BAND_COUNTS = 12;  // empty / soft residual below this = clear pad
+const long EGG_D_LO = 35;
+const long EGG_D_HI = 400;
+// Soft cell: empty flicker <~25; real egg must sit clearly above that floor.
+const long EGG_SAMPLE_MIN_D = 35;
+const long EGG_SAMPLE_MAX_D = 400;
+const long EGG_LOCK_MIN_D = 35;
+const long EGG_CAL_MIN_D = 20;   // 50g cal can rest lower than a live egg
+const long EGG_RISE_ABOVE_IDLE = 20;
 const long BAD_TARE_D = 80;
 // Soft cell empty flicker: |d| can be 1–25 with no egg. Never treat abs-noise as grams.
 // Measured after each tare into emptyNoiseD; egg samples must sit above that floor.
@@ -186,13 +188,13 @@ const int SORT_JUMBO_US = 2400;    // lane 4 JUMBO
 const unsigned long SORT_SETTLE_MS = 700;  // wait for SORT, then PUSH
 const int PUSH_HOME_US = 700;      // retracted, scale stays clear
 const int PUSH_STROKE_US = 2100;   // one push off the scale into SORT lane
-const int ENTRANCE_HOLD_US = 1000; // down, blocks the line (500 stalls this horn)
-const int ENTRANCE_OPEN_US = 1900; // up, one egg only
+const int ENTRANCE_HOLD_US = 700;  // down / closed (wide travel vs OPEN)
+const int ENTRANCE_OPEN_US = 2300; // up / open — big swing so movement is obvious
 const int SERVO_MID_US = GATE_CENTER_US;
 const int SERVO_UP_MS = 800;
 const int SERVO_DOWN_MS = 800;
-const unsigned long ENTRANCE_EVERY_MS = 13000;   // go UP every 13 s
-// Stay UP until IR — no timeout DOWN (was 9s and closed before eggs arrived).
+const unsigned long ENTRANCE_EVERY_MS = 10000;   // go UP every 10 s (IR closes instantly)
+// Stay UP until IR — no timeout DOWN (was timed and closed before eggs arrived).
 const unsigned long ENTRANCE_OPEN_MAX_MS = 0;
 
 // GPIO 50 Hz pulses (esp_timer). Pulse only ~700 ms after a move, then stop —
@@ -205,9 +207,13 @@ volatile bool servoFrameBusy = false;
 bool servoTimerRunning = false;
 volatile unsigned long servoDriveUntil = 0;
 const unsigned long SERVO_DRIVE_MS = 1200;
-// Entrance alone: continuous LEDC 50 Hz (bit-bang was too weak / starved on P13).
+// ENTRANCE = continuous soft 50 Hz forever (LEDC was unreliable on this board).
+// GATE = soft 50 Hz (paused only during laptop HB). ENTRANCE never pauses.
 #if EGG_DEVKIT
-static bool entranceLedcOk = false;
+static int entrancePwmUs = ENTRANCE_HOLD_US;
+static int gatePwmUs = GATE_CENTER_US;
+static bool gatePwmPaused = false;  // HB only — never blocks ENTRANCE
+static unsigned long hornPwmPhaseAt = 0;
 #endif
 unsigned long entranceAt = 0;
 unsigned long entranceOpenedAt = 0;
@@ -277,6 +283,10 @@ bool stationOn = false;
 static char farmCamResult[16] = "Pending";
 static char farmSortResult[12] = "Good";
 #if EGG_DEVKIT
+// Camera Clean clears as soon as egg leaves FOV — latch so pad can still auto-weigh.
+bool weighArmedClean = false;
+unsigned long weighArmedUntil = 0;
+const unsigned long WEIGH_ARMED_MS = 45000UL;  // time for egg to reach pad after Clean
 unsigned long gateHoldUntil = 0;
 unsigned long gateReturnAt = 0;   // when >0, return GATE to middle at this time
 int gateDecisionPulsed = 0;       // -1 clean pulsed, +1 crack pulsed, 0 none
@@ -384,6 +394,7 @@ bool tareMedianNow(const char* why);
 long medianLong(long* a, int n);
 void servoPausePulses();
 void servoResumePulses();
+void serviceHornPwm();
 #endif
 void postWeight(float g);
 void postWeightEx(float g, const char* sizeCls, const char* measStatus, bool commitEgg);
@@ -481,12 +492,20 @@ void printIdleScale(long delta) {
   Serial.printf("Ready egg %d\n", eggCount + 1);
 #if EGG_DEVKIT
   eggSession = false;
+#if GATE_FROM_FARM
+  Serial.println("Ready — camera Clean → egg on pad auto-weighs (optional: type egg)");
+#else
   Serial.println("Put egg on pad, then type: egg");
+#endif
   Serial.flush();
 #endif
   needIdlePrint = false;
   idleShownOk = true;
+#if EGG_DEVKIT && GATE_FROM_FARM
+  awaitNextEgg = true;  // arm auto-weigh for next Clean egg
+#else
   awaitNextEgg = false;
+#endif
   mustSeeEmpty = false;
   sessionDone = false;
   eggSeenHits = 0;
@@ -669,10 +688,24 @@ bool commitEggResult(float lockG) {
   // One egg → one result. Never print twice for the same session.
   if (eggResultPrinted || weightShown) return true;
   float w = displayGrams(lockG);
+  // Farm-armed Clean: soft cell may under-read — allow slightly below SMALL_MIN.
+  float minCommitG = MIN_EGG_G;
+#if EGG_DEVKIT
+  if (weighArmedClean || (weighArmedUntil && millis() < weighArmedUntil)) {
+    minCommitG = MIN_EGG_G * 0.85f;
+    if (minCommitG < 30.0f) minCommitG = 30.0f;
+  }
+#endif
+  // Hard reject empty / residual — never SORT/PUSH/IoT without a real egg on the cell.
+  if (w < minCommitG || w > MAX_EGG_G) {
+    Serial.printf("Weight %.1f g — no egg on load cell (need %.0f–%.0fg)\n",
+                  w, minCommitG, MAX_EGG_G);
+    return false;
+  }
   String cls = sizeClassOf(lockG);
   if (!cls.length()) {
     // Still commit inaccurate / out-of-band grams so SORT + IoT keep working.
-    cls = (w < 5.0f) ? String("") : String("medium");
+    cls = (w < MIN_EGG_G) ? String("") : String("medium");
     if (!cls.length()) {
       Serial.printf("Weight %.1f g — empty pad, not committed\n", w);
       return false;
@@ -684,6 +717,8 @@ bool commitEggResult(float lockG) {
   eggSession = false;  // stop lock loop immediately after one result
 #if EGG_DEVKIT
   eggSeenHits = 0;
+  weighArmedClean = false;  // Clean latch consumed by a committed weigh
+  weighArmedUntil = 0;
 #endif
   liveG = lockG;
   scaleG = lockG;
@@ -708,20 +743,25 @@ bool commitEggResult(float lockG) {
 
 #if EGG_DEVKIT
 void servoPausePulses() {
+  // HX711 quiet: stop PUSH/SORT bit-bang ONLY.
+  // Never pause ENTRANCE LEDC — that made P13 look "dead" during every tare/weigh.
   if (servoTimer && servoTimerRunning) {
     esp_timer_stop(servoTimer);
     servoTimerRunning = false;
   }
-  for (int i = 0; i < 4; i++) digitalWrite(servoPins[i], LOW);
+  for (int i = 0; i < 4; i++) {
+    if (servoPins[i] == ENTRANCE_PIN || servoPins[i] == SERVO_CAM_PIN) continue;
+    digitalWrite(servoPins[i], LOW);
+  }
 }
 void servoKickDrive();  // defined with servo driver below
 void servoResumePulses() {
   servoKickDrive();
 }
 bool tareMedianNow(const char* why) {
-  // Servo bit-bang steals time from HX711 — pause during tare or zero jumps (2143→489).
+  // Short quiet only — long 1.2s pauses made the station feel broken.
   servoPausePulses();
-  delay(1200);  // soft cell must stop ringing or idle jumps (e.g. 2280→2875) ruin grams
+  delay(350);
   long buf[16];
   int n = 0;
   long bestSpan = 99999;
@@ -835,10 +875,20 @@ void postWeightEx(float g, const char* sizeCls, const char* measStatus, bool com
   if (!urlWeight.length()) {
     urlWeight = String(FARM_BACKEND_URL) + "/weight";
   }
+  // Must share the one HTTP lock with heartbeat — races assert in lwIP pbuf_free.
+  if (!takeHttpOut(800)) {
+    Serial.println("IoT weight skip — HTTP busy");
+    return;
+  }
   HTTPClient http;
+  http.setReuse(false);
   http.setConnectTimeout(800);
   http.setTimeout(1200);
-  http.begin(urlWeight);
+  if (!http.begin(urlWeight)) {
+    giveHttpOut();
+    Serial.println("IoT weight skip — begin failed");
+    return;
+  }
   farmHeaders(http);
   char eventId[40];
   snprintf(eventId, sizeof(eventId), "esp%08lx%04x", (unsigned long)millis(), (unsigned)(esp_random() & 0xFFFF));
@@ -862,6 +912,7 @@ void postWeightEx(float g, const char* sizeCls, const char* measStatus, bool com
   int code = http.POST((uint8_t*)body, strlen(body));
   Serial.printf("IoT POST /weight %.1fg [%s] → HTTP %d\n", g, status, code);
   http.end();
+  giveHttpOut();
 #endif
 }
 
@@ -873,16 +924,10 @@ int readInspectBody(const String& b) {
   if (!eggSeen) return -1;
   bool noCrack = b.indexOf("No Crack") >= 0 || b.indexOf("no crack") >= 0;
   bool crack = !noCrack && (b.indexOf("Crack") >= 0 || b.indexOf("crack") >= 0);
-  bool dirty = b.indexOf("Dirty") >= 0 || b.indexOf("dirty") >= 0;
   bool empty = b.indexOf("Empty") >= 0 || b.indexOf("empty") >= 0;
   bool rej = b.indexOf("\"reject\":true") >= 0 || b.indexOf("\"reject\": true") >= 0;
-  if (empty && !noCrack && !crack && !dirty && !rej) return -1;
-  if (dirty && !crack) {
-#if !SERIAL_WEIGHT_ONLY
-    Serial.println("QUALITY DIRTY");
-#endif
-    return 2;
-  }
+  // Dirty/dust is not a system grade — only Clean + Crack.
+  if (empty && !noCrack && !crack && !rej) return -1;
   if (crack || rej) {
 #if !SERIAL_WEIGHT_ONLY
     Serial.println("QUALITY CRACK");
@@ -999,6 +1044,209 @@ static volatile int camState = 0;
 static volatile uint32_t camHeap = 0;
 static volatile uint32_t camPsram = 0;
 
+#if EGG_DEVKIT
+// Read HTTP reply even after server closes — weak Wi‑Fi often drops late bytes.
+static int readFarmHttpReply(WiFiClient& cli, char* body, size_t bodyCap, unsigned long maxMs) {
+  if (!body || bodyCap < 2) return -1;
+  char line[128];
+  size_t li = 0;
+  unsigned long t0 = millis();
+  bool inBody = false;
+  int status = 0;
+  size_t bi = 0;
+  body[0] = 0;
+  while ((millis() - t0) < 800UL && !cli.available() && cli.connected()) {
+    delay(5);
+    yield();
+  }
+  while ((millis() - t0) < maxMs) {
+    int ch = cli.read();
+    if (ch < 0) {
+      if (!cli.connected() && !cli.available()) break;
+      delay(2);
+      yield();
+      continue;
+    }
+    if (!inBody) {
+      if (ch == '\n') {
+        line[li < sizeof(line) - 1 ? li : sizeof(line) - 1] = 0;
+        if (li == 0 || (li == 1 && line[0] == '\r')) {
+          inBody = true;
+          li = 0;
+          continue;
+        }
+        if (status == 0 && strncmp(line, "HTTP/", 5) == 0) {
+          const char* sp = strchr(line, ' ');
+          if (sp) status = atoi(sp + 1);
+        }
+        li = 0;
+      } else if (li < sizeof(line) - 1) {
+        line[li++] = (char)ch;
+      }
+    } else {
+      if (bi < bodyCap - 1) body[bi++] = (char)ch;
+      else break;
+    }
+  }
+  body[bi] = 0;
+  if (status > 0) return status;
+  if (body[0]) return 200;
+  return -1;
+}
+
+// Apply farm Clean/Crack/Dirty to GATE — called AFTER Wi‑Fi is fully released.
+static void applyFarmGateFromBody(const char* hbBody) {
+  if (!hbBody || !hbBody[0]) return;
+  if (strstr(hbBody, "\"servoTest\":true") || strstr(hbBody, "\"servoTest\": true")) {
+#if !SERIAL_WEIGHT_ONLY
+    Serial.println("Heartbeat servoTest — GATE P14 now");
+#endif
+    rejectSweep(true);
+  }
+  bool scanning = strstr(hbBody, "\"scanning\":true") || strstr(hbBody, "\"scanning\": true");
+  if (scanning && !scanNoted) {
+    scanNoted = true;
+    Serial.println("CAMERA scanning — GATE middle");
+  }
+  if (!scanning) scanNoted = false;
+  bool eggSeen = strstr(hbBody, "\"eggSeen\":true") || strstr(hbBody, "\"eggSeen\": true");
+  bool cleanEgg = strstr(hbBody, "\"cleanEgg\":true") || strstr(hbBody, "\"cleanEgg\": true");
+  bool rejectEggHb = strstr(hbBody, "\"rejectEgg\":true") || strstr(hbBody, "\"rejectEgg\": true");
+  // Farm keeps weighArm/awaitingWeight after the egg leaves the camera FOV.
+  bool weighArmHb =
+      strstr(hbBody, "\"weighArm\":true") || strstr(hbBody, "\"weighArm\": true") ||
+      strstr(hbBody, "\"awaitingWeight\":true") ||
+      strstr(hbBody, "\"awaitingWeight\": true");
+  bool camCrack =
+      strstr(hbBody, "\"cameraResult\":\"Crack\"") ||
+      strstr(hbBody, "\"cameraResult\": \"Crack\"");
+  bool camClean =
+      strstr(hbBody, "\"cameraResult\":\"Clean\"") ||
+      strstr(hbBody, "\"cameraResult\": \"Clean\"") ||
+      strstr(hbBody, "\"cameraResult\":\"Dirty\"") ||
+      strstr(hbBody, "\"cameraResult\": \"Dirty\"") ||
+      strstr(hbBody, "\"lastLabel\":\"Clean Egg\"") ||
+      strstr(hbBody, "\"lastLabel\": \"Clean Egg\"") ||
+      strstr(hbBody, "\"lastLabel\":\"No Crack Egg\"") ||
+      strstr(hbBody, "\"lastLabel\": \"No Crack Egg\"");
+  // Dirty/dust maps to Clean — only Crack is reject.
+  bool crack = rejectEggHb || camCrack;
+  bool noCrack = cleanEgg || camClean || weighArmHb;
+  // Pad auto-weigh: arm from farm even when GATE already returned middle.
+  if (weighArmHb && !crack && !weightShown && !eggResultPrinted) {
+    if (!weighArmedClean || millis() >= weighArmedUntil) {
+      Serial.println("Farm weighArm — HX711 pad armed for Clean egg");
+    }
+    weighArmedClean = true;
+    weighArmedUntil = millis() + WEIGH_ARMED_MS;
+    awaitNextEgg = true;
+    idleShownOk = true;
+    mustSeeEmpty = false;
+  }
+  if (scanning) {
+    strncpy(farmCamResult, "Scanning", sizeof(farmCamResult) - 1);
+    strncpy(farmSortResult, "Good", sizeof(farmSortResult) - 1);
+  } else if (crack) {
+    strncpy(farmCamResult, "Crack", sizeof(farmCamResult) - 1);
+    strncpy(farmSortResult, "Reject", sizeof(farmSortResult) - 1);
+    weighArmedClean = false;
+    weighArmedUntil = 0;
+  } else if (noCrack || weighArmHb) {
+    strncpy(farmCamResult, "Clean", sizeof(farmCamResult) - 1);
+    strncpy(farmSortResult, "Good", sizeof(farmSortResult) - 1);
+  } else {
+    if (!(weighArmedClean && awaitNextEgg && millis() < weighArmedUntil)) {
+      strncpy(farmCamResult, "Pending", sizeof(farmCamResult) - 1);
+    }
+    strncpy(farmSortResult, "Good", sizeof(farmSortResult) - 1);
+  }
+  farmCamResult[sizeof(farmCamResult) - 1] = 0;
+  farmSortResult[sizeof(farmSortResult) - 1] = 0;
+  int wantSide = 0;
+  if (!scanning) {
+    if (crack) wantSide = 1;
+    else if (noCrack) wantSide = -1;
+  }
+  if (scanning && wantSide == 0) {
+    if (gateAngle != 0 || gateLatchedSide != 0) {
+      camServoWrite(GATE_CENTER_US);
+      gateAngle = 0;
+      gateLatchedSide = 0;
+      gateDecisionPulsed = 0;
+      gateReturnAt = 0;
+      gateHoldUntil = 0;
+      camGateDown = true;
+      Serial.println("GATE P14 middle — scanning");
+    }
+  } else if (wantSide != 0) {
+    // Clean/Crack: swing once, HOLD while egg still in camera, MIDDLE when it vanishes.
+    // Sticky cleanEgg after FOV clear must NOT re-swing (gateDecisionPulsed stays).
+    if (!eggSeen && (gateAngle != 0 || gateLatchedSide != 0 || gateDecisionPulsed != 0)) {
+      camServoWrite(GATE_CENTER_US);
+      gateAngle = 0;
+      gateLatchedSide = 0;
+      gateDecisionPulsed = 0;  // next egg may swing again (farm clears cleanEgg when FOV empty)
+      gateReturnAt = 0;
+      gateHoldUntil = 0;
+      camGateDown = true;
+      Serial.println("GATE P14 middle — egg left camera");
+    } else if (eggSeen && gateDecisionPulsed != wantSide) {
+      if (!servoDriverOk) servoDriverInit();
+      inspectedEgg = true;
+      camRejectDone = true;
+      rejectedEgg = (wantSide > 0);
+      if (wantSide > 0 && motorRun) stopBelt();
+      if (wantSide < 0) {
+        Serial.println("CAMERA clean — GATE P14 FULL LEFT (hold until egg leaves cam)");
+        camServoWrite(GATE_LEFT_US);  // blocking ~0.8s burst + soft-PWM hold
+        gateAngle = -1;
+        awaitNextEgg = true;
+        idleShownOk = true;
+        mustSeeEmpty = false;
+        weighArmedClean = true;
+        weighArmedUntil = millis() + WEIGH_ARMED_MS;
+        weighCooldownUntil = millis() + 400UL;
+        Serial.println("GATE LEFT hold → pad auto-weigh armed 30s");
+      } else {
+        Serial.println("CAMERA crack/dirty — GATE P14 FULL RIGHT (hold until egg leaves cam)");
+        camServoWrite(GATE_RIGHT_US);
+        gateAngle = 1;
+        awaitNextEgg = false;
+        weighArmedClean = false;
+        weighArmedUntil = 0;
+        Serial.println("GATE RIGHT hold");
+      }
+      gateLatchedSide = wantSide;
+      gateDecisionPulsed = wantSide;
+      camGateDown = false;
+      gateReturnAt = millis() + GATE_MAX_HOLD_MS;
+      gateHoldUntil = gateReturnAt;
+    } else if (eggSeen) {
+      // Still in FOV — keep soft-PWM hard left/right; refresh safety timeout.
+      gatePwmUs = (wantSide < 0) ? GATE_LEFT_US : GATE_RIGHT_US;
+      gateReturnAt = millis() + GATE_MAX_HOLD_MS;
+      gateHoldUntil = gateReturnAt;
+    }
+  } else {
+    // Farm idle (Pending) — middle when egg not in view.
+    // Do NOT hold LEFT for weigh-arm; pad arm is separate from GATE pose.
+    if (!eggSeen && (gateAngle != 0 || gateLatchedSide != 0)) {
+      camServoWrite(GATE_CENTER_US);
+      gateAngle = 0;
+      gateLatchedSide = 0;
+      gateDecisionPulsed = 0;
+      gateReturnAt = 0;
+      gateHoldUntil = 0;
+      camGateDown = true;
+      Serial.println("GATE P14 middle — idle / ready for next egg");
+    } else if (eggSeen && gateAngle != 0) {
+      if (gateAngle < 0) gatePwmUs = GATE_LEFT_US;
+      else gatePwmUs = GATE_RIGHT_US;
+    }
+  }
+}
+#endif  // EGG_DEVKIT
+
 void heartbeat(float g) {
 #if ARDUINO_LOCAL && !GATE_FROM_FARM
   (void)g;
@@ -1007,15 +1255,111 @@ void heartbeat(float g) {
   if (wifiSwitching) return;
   if (WiFi.status() != WL_CONNECTED || strlen(FARM_BACKEND_URL) == 0) return;
   if (!urlStatus.length()) applyBackend(FARM_BACKEND_URL);
-  // Never steal the Wi‑Fi lock from live push — skip this beat if busy.
+#if EGG_DEVKIT
+  // Pause GATE soft-PWM only — ENTRANCE LEDC stays live on P13.
+  gatePwmPaused = true;
+  if (!takeHttpOut(500)) {
+    gatePwmPaused = false;
+    return;
+  }
+#else
   if (!takeHttpOut(15)) return;
+#endif
+
+#if EGG_DEVKIT
+  // Raw HTTP/1.0 + Connection:close — HTTPClient was crashing pbuf_free after Clean GATE.
+  int ip0 = 0, ip1 = 0, ip2 = 0, ip3 = 0;
+  const char* pUrl = strstr(activeBackend, "://");
+  pUrl = pUrl ? pUrl + 3 : activeBackend;
+  char host[16] = {0};
+  int c = -1;
+  static char hbBody[512];
+  hbBody[0] = 0;
+  if (sscanf(pUrl, "%d.%d.%d.%d", &ip0, &ip1, &ip2, &ip3) == 4) {
+    snprintf(host, sizeof(host), "%d.%d.%d.%d", ip0, ip1, ip2, ip3);
+    char payload[160];
+    int plen = snprintf(payload, sizeof(payload),
+                        "{\"status\":\"ONLINE\",\"device\":\"ESP32-DevKit\",\"weightGrams\":%.1f}",
+                        (g >= 0) ? g : 0.0f);
+    // Extender Wi‑Fi: laptop often LOGS DevKit ONLINE while this board still
+    // gets http=-1 (POST accepted, reply dropped). Wait for bytes + GET fallback.
+    const uint32_t connectMs = hbFails >= 1 ? 2200u : 1600u;
+
+    for (int attempt = 0; attempt < 2 && c != 200; attempt++) {
+      if (attempt) delay(50);
+      WiFiClient cli;
+      cli.setTimeout(1500);
+      if (!cli.connect(host, 8000, connectMs)) continue;
+      char req[384];
+      int rn = snprintf(req, sizeof(req),
+                        "POST /api/status HTTP/1.0\r\n"
+                        "Host: %s\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Connection: close\r\n"
+                        "Content-Length: %d\r\n",
+                        host, plen);
+      if (strlen(FARM_DEVICE_TOKEN) > 0) {
+        rn += snprintf(req + rn, sizeof(req) - rn,
+                       "X-Farm-Device-Token: %s\r\n", FARM_DEVICE_TOKEN);
+      }
+      rn += snprintf(req + rn, sizeof(req) - rn, "\r\n");
+      cli.write((const uint8_t*)req, rn);
+      cli.write((const uint8_t*)payload, plen);
+      cli.flush();
+      c = readFarmHttpReply(cli, hbBody, sizeof(hbBody), 2500UL);
+      cli.stop();
+    }
+    // POST landed on laptop (ONLINE in backend) but reply lost — pull gate cue.
+    if (c != 200 || !hbBody[0]) {
+      WiFiClient cli2;
+      cli2.setTimeout(1500);
+      if (cli2.connect(host, 8000, connectMs)) {
+        char greq[160];
+        snprintf(greq, sizeof(greq),
+                 "GET /api/gate-cue HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n",
+                 host);
+        cli2.print(greq);
+        cli2.flush();
+        int gc = readFarmHttpReply(cli2, hbBody, sizeof(hbBody), 2000UL);
+        cli2.stop();
+        if (gc == 200 && hbBody[0]) c = 200;
+      }
+    }
+  }
+  giveHttpOut();
+  gatePwmPaused = false;
+  delay(10);  // let lwIP free the closed socket before servo pulses
+  if (c != 200) {
+    hbFails++;
+    // Ignore single blips (OK/fail/OK spam). Only warn on real outages.
+    if (hbFails == 3 || hbFails % 10 == 0) {
+      Serial.printf(
+          "Laptop HB fail x%d http=%d rssi=%d — keep trying → %s\n",
+          hbFails, c, WiFi.RSSI(), activeBackend);
+    }
+  } else {
+    bool wasDown = (hbFails >= 3) || !hbEverOk;
+    hbFails = 0;
+    hbEverOk = true;
+    if (wasDown) {
+      Serial.printf("Laptop HB OK rssi=%d — link restored\n", WiFi.RSSI());
+    }
+    // Show what camera sent so we know if Clean reached DevKit.
+    if (strstr(hbBody, "\"cleanEgg\":true") || strstr(hbBody, "\"cameraResult\":\"Clean\"")) {
+      static unsigned long lastCleanLog = 0;
+      if (millis() - lastCleanLog > 2000UL) {
+        lastCleanLog = millis();
+        Serial.println("HB body has Clean — moving GATE if not already LEFT");
+      }
+    }
+    applyFarmGateFromBody(hbBody);
+  }
+#else
   HTTPClient http;
   WiFiClient cli;
-  // Keep HB light so frame push stays smooth.
   http.setConnectTimeout(hbFails >= 2 ? 400 : 280);
   http.setTimeout(hbFails >= 2 ? 700 : 500);
-  http.setReuse(true);
-  // Host/port form is more reliable than a full URL on ESP32 HTTPClient.
+  http.setReuse(false);
   int ip0 = 0, ip1 = 0, ip2 = 0, ip3 = 0;
   const char* pUrl = strstr(activeBackend, "://");
   pUrl = pUrl ? pUrl + 3 : activeBackend;
@@ -1030,48 +1374,30 @@ void heartbeat(float g) {
   if (!began) {
     giveHttpOut();
     hbFails++;
-#if !EGG_DEVKIT
     if (hbFails == 1 || hbFails % 5 == 0) {
       Serial.printf("Laptop HB begin-fail x%d url=%s\n", hbFails, urlStatus.c_str());
     }
-#endif
     return;
   }
   farmHeaders(http);
-  char p[480];
-#if EGG_DEVKIT
-  const char* devName = "ESP32-DevKit";
-#else
   if (!streamUrl.length()) refreshStreamUrl();
   const char* devName = "ESP32-CAM";
-#endif
-  int n = snprintf(p, sizeof(p), "{\"status\":\"ONLINE\",\"device\":\"%s\",\"zoom\":%.2f", devName, camZoom);
-  if (streamUrl.length()) n += snprintf(p + n, sizeof(p) - n, ",\"streamUrl\":\"%s\"", streamUrl.c_str());
-#if !EGG_DEVKIT
+  char pbuf[480];
+  int n = snprintf(pbuf, sizeof(pbuf), "{\"status\":\"ONLINE\",\"device\":\"%s\",\"zoom\":%.2f", devName, camZoom);
+  if (streamUrl.length()) n += snprintf(pbuf + n, sizeof(pbuf) - n, ",\"streamUrl\":\"%s\"", streamUrl.c_str());
   if (streamUrl.length()) {
     String jpgUrl = streamUrl;
     jpgUrl.replace(":81/mjpeg", ":82/jpg");
-    n += snprintf(p + n, sizeof(p) - n, ",\"jpgUrl\":\"%s\"", jpgUrl.c_str());
+    n += snprintf(pbuf + n, sizeof(pbuf) - n, ",\"jpgUrl\":\"%s\"", jpgUrl.c_str());
   }
-  n += snprintf(p + n, sizeof(p) - n, ",\"cam\":%d,\"h\":%u,\"p\":%u,\"jpg\":%u",
+  n += snprintf(pbuf + n, sizeof(pbuf) - n, ",\"cam\":%d,\"h\":%u,\"p\":%u,\"jpg\":%u",
                 camState, (unsigned)camHeap, (unsigned)camPsram, (unsigned)camJpgLen);
-#endif
-  if (g >= 0) n += snprintf(p + n, sizeof(p) - n, ",\"weightGrams\":%.1f", g);
-  snprintf(p + n, sizeof(p) - n, "}");
-  int c = http.POST((uint8_t*)p, strlen(p));
-  String body;
-#if EGG_DEVKIT
-  // Station needs gate fields from the body.
-  if (c == 200) body = http.getString();
-#else
-  // CAM: NEVER read HB body — large JSON drained Wi‑Fi for seconds → frozen hand on /watch.
-#endif
+  if (g >= 0) n += snprintf(pbuf + n, sizeof(pbuf) - n, ",\"weightGrams\":%.1f", g);
+  snprintf(pbuf + n, sizeof(pbuf) - n, "}");
+  int c = http.POST((uint8_t*)pbuf, strlen(pbuf));
   http.end();
   giveHttpOut();
-  // Do NOT postFrame here — camPushTask owns the smooth path.
   if (c != 200) {
-    // http=-1 = connect failed (laptop offline / firewall / wrong IP).
-    // Stay on this Wi‑Fi — never auto-roam.
     hbFails++;
     if (hbFails == 1 || hbFails % 5 == 0) {
       Serial.printf("Laptop HB fail x%d http=%d rssi=%d (stay on %s) → %s\n",
@@ -1081,93 +1407,7 @@ void heartbeat(float g) {
     hbFails = 0;
     hbEverOk = true;
   }
-#if EGG_DEVKIT
-  if (c == 200) {
-    if (body.indexOf("\"servoTest\":true") >= 0 || body.indexOf("\"servoTest\": true") >= 0) {
-#if !SERIAL_WEIGHT_ONLY
-      Serial.println("Heartbeat servoTest — GATE P14 now");
 #endif
-      rejectSweep(true);
-    }
-    bool scanning = body.indexOf("\"scanning\":true") >= 0 || body.indexOf("\"scanning\": true") >= 0;
-    if (scanning && !scanNoted) {
-      scanNoted = true;
-      Serial.println("CAMERA scanning — GATE middle");
-    }
-    if (!scanning) scanNoted = false;
-    bool eggSeen = (body.indexOf("\"eggSeen\":true") >= 0 || body.indexOf("\"eggSeen\": true") >= 0);
-    bool cleanEgg = body.indexOf("\"cleanEgg\":true") >= 0 || body.indexOf("\"cleanEgg\": true") >= 0;
-    bool rejectEggHb = body.indexOf("\"rejectEgg\":true") >= 0 || body.indexOf("\"rejectEgg\": true") >= 0;
-    bool noCrack = cleanEgg || body.indexOf("No Crack") >= 0 || body.indexOf("Clean") >= 0 ||
-                   body.indexOf("\"lastLabel\":\"Egg\"") >= 0 || body.indexOf("\"lastLabel\": \"Egg\"") >= 0 ||
-                   body.indexOf("Clean Egg") >= 0 ||
-                   body.indexOf("\"class\":\"clean\"") >= 0 || body.indexOf("\"quality\":\"clean\"") >= 0;
-    bool crack = rejectEggHb ||
-                 (!noCrack && (body.indexOf("Crack") >= 0 || body.indexOf("crack") >= 0 ||
-                               body.indexOf("Dirty") >= 0 || body.indexOf("dirty") >= 0 ||
-                               body.indexOf("\"class\":\"crack\"") >= 0));
-    if (scanning) {
-      strncpy(farmCamResult, "Scanning", sizeof(farmCamResult) - 1);
-      strncpy(farmSortResult, "Good", sizeof(farmSortResult) - 1);
-    } else if (crack || rejectEggHb) {
-      strncpy(farmCamResult, (body.indexOf("Dirty") >= 0 || body.indexOf("dirty") >= 0) ? "Dirty" : "Crack",
-              sizeof(farmCamResult) - 1);
-      strncpy(farmSortResult, "Reject", sizeof(farmSortResult) - 1);
-    } else if (noCrack || cleanEgg) {
-      strncpy(farmCamResult, "Clean", sizeof(farmCamResult) - 1);
-      strncpy(farmSortResult, "Good", sizeof(farmSortResult) - 1);
-    }
-    farmCamResult[sizeof(farmCamResult) - 1] = 0;
-    farmSortResult[sizeof(farmSortResult) - 1] = 0;
-    int wantSide = 0;
-    if (!scanning && eggSeen) {
-      if (crack || rejectEggHb) wantSide = 1;
-      else if (noCrack || cleanEgg) wantSide = -1;
-    }
-    if (scanning) {
-      gateDecisionPulsed = 0;
-      gateReturnAt = 0;
-      if (gateAngle != 0 || gateLatchedSide != 0) {
-        camServoWrite(GATE_CENTER_US);
-        gateAngle = 0;
-        gateLatchedSide = 0;
-        camGateDown = true;
-        Serial.println("GATE P14 middle — scanning");
-      }
-    } else if (eggSeen && wantSide != 0) {
-      if (gateDecisionPulsed != wantSide) {
-        inspectedEgg = true;
-        camRejectDone = true;
-        rejectedEgg = (wantSide > 0);
-        if (wantSide > 0 && motorRun) stopBelt();
-        if (wantSide < 0) {
-          camServoWrite(GATE_LEFT_US);
-          gateAngle = -1;
-          Serial.println("CAMERA clean — GATE full LEFT (hold until egg gone)");
-        } else {
-          camServoWrite(GATE_RIGHT_US);
-          gateAngle = 1;
-          Serial.println("CAMERA crack/dirty — GATE full RIGHT (hold until egg gone)");
-        }
-        gateLatchedSide = wantSide;
-        gateDecisionPulsed = wantSide;
-        camGateDown = false;
-      }
-      gateReturnAt = millis() + GATE_MAX_HOLD_MS;
-      gateHoldUntil = gateReturnAt;
-    } else if (!eggSeen) {
-      gateReturnAt = 0;
-      if (gateAngle != 0 || gateLatchedSide != 0 || gateDecisionPulsed != 0) {
-        camServoWrite(GATE_CENTER_US);
-        gateAngle = 0;
-        gateLatchedSide = 0;
-        gateDecisionPulsed = 0;
-        camGateDown = true;
-        Serial.println("GATE P14 middle — egg left camera");
-      }
-    }
-  }
-#endif  // EGG_DEVKIT — CAM skips body/gate (keeps live push smooth)
 #endif  // ARDUINO_LOCAL && !GATE_FROM_FARM
 }
 
@@ -1283,7 +1523,13 @@ static void servoFrameCb(void* /*arg*/) {
   if (servoFrameBusy || !servoDriverOk) return;
   servoFrameBusy = true;
   if ((long)(millis() - servoDriveUntil) >= 0) {
-    for (int i = 0; i < 4; i++) digitalWrite(servoPins[i], LOW);
+    for (int i = 0; i < 4; i++) {
+#if EGG_DEVKIT
+      // PUSH/SORT only — GATE/ENTRANCE are soft-PWM in the main loop.
+      if (servoPins[i] == ENTRANCE_PIN || servoPins[i] == SERVO_CAM_PIN) continue;
+#endif
+      digitalWrite(servoPins[i], LOW);
+    }
     if (servoTimer && servoTimerRunning) {
       esp_timer_stop(servoTimer);
       servoTimerRunning = false;
@@ -1294,8 +1540,7 @@ static void servoFrameCb(void* /*arg*/) {
   for (int i = 0; i < 4; i++) {
     int pin = servoPins[i];
 #if EGG_DEVKIT
-    // Entrance is driven by LEDC — skip bit-bang so it is not starved.
-    if (pin == ENTRANCE_PIN && entranceLedcOk) continue;
+    if (pin == ENTRANCE_PIN || pin == SERVO_CAM_PIN) continue;
 #endif
     int us = servoTargetUs[i];
     if (us < 500) us = 500;
@@ -1309,28 +1554,63 @@ static void servoFrameCb(void* /*arg*/) {
 }
 
 #if EGG_DEVKIT
+// Short 50 Hz burst. Long blocking bursts caused TG1WDT_SYS_RESET → flash boot loop.
+static void hornForceBurst(int pin, int us, int frames) {
+  if (us < 500) us = 500;
+  if (us > 2500) us = 2500;
+  if (frames > 30) frames = 30;  // max ~0.6s — never starve the watchdog
+  ledcDetach(pin);
+  pinMode(pin, OUTPUT);
+  for (int i = 0; i < frames; i++) {
+    digitalWrite(pin, HIGH);
+    delayMicroseconds(us);
+    digitalWrite(pin, LOW);
+    if (us < 20000) delayMicroseconds(20000 - us);
+    else delayMicroseconds(100);
+    if ((i & 3) == 3) yield();  // feed WDT / Wi‑Fi
+  }
+}
+
 static void entranceServoWrite(int us) {
   if (us < 500) us = 500;
   if (us > 2500) us = 2500;
   int slot = servoSlot(ENTRANCE_PIN);
   if (slot >= 0) servoTargetUs[slot] = us;
-  if (!entranceLedcOk) {
-    claimServoGpio(ENTRANCE_PIN);
-    // 50 Hz servo PWM, 14-bit duty — stays on so the horn actually holds/moves.
-    if (ledcAttach(ENTRANCE_PIN, 50, 14)) {
-      entranceLedcOk = true;
-      Serial.println("ENTRANCE P13 LEDC 50Hz ON");
-    } else {
-      Serial.println("ENTRANCE P13 LEDC attach FAIL — bit-bang fallback");
-    }
+  entrancePwmUs = us;
+  Serial.printf("ENTRANCE P13 → %dus (burst)\n", us);
+  hornForceBurst(ENTRANCE_PIN, us, 25);  // ~0.5s then soft-PWM holds
+}
+
+static void gateServoWrite(int us) {
+  if (us < 500) us = 500;
+  if (us > 2500) us = 2500;
+  int slot = servoSlot(SERVO_CAM_PIN);
+  if (slot >= 0) servoTargetUs[slot] = us;
+  gatePwmUs = us;
+  hornForceBurst(SERVO_CAM_PIN, us, 25);
+}
+
+// ENTRANCE pulsed every 20ms always. GATE only when not in HB.
+void serviceHornPwm() {
+  if (!servoDriverOk) return;
+  unsigned long now = millis();
+  if (now - hornPwmPhaseAt < 20UL) return;
+  hornPwmPhaseAt = now;
+  int eus = entrancePwmUs;
+  if (eus < 500) eus = 500;
+  if (eus > 2500) eus = 2500;
+  digitalWrite(ENTRANCE_PIN, HIGH);
+  delayMicroseconds(eus);
+  digitalWrite(ENTRANCE_PIN, LOW);
+  if (!gatePwmPaused) {
+    int gus = gatePwmUs;
+    if (gus < 500) gus = 500;
+    if (gus > 2500) gus = 2500;
+    digitalWrite(SERVO_CAM_PIN, HIGH);
+    delayMicroseconds(gus);
+    digitalWrite(SERVO_CAM_PIN, LOW);
   }
-  if (entranceLedcOk) {
-    const uint32_t maxDuty = (1u << 14) - 1u;
-    uint32_t duty = (uint32_t)(((uint64_t)us * maxDuty) / 20000u);
-    ledcWrite(ENTRANCE_PIN, duty);
-  } else {
-    servoKickDrive();
-  }
+  yield();
 }
 #endif
 
@@ -1353,10 +1633,16 @@ bool servoDriverInit() {
   servoTimerRunning = false;
   servoDriverOk = true;
 #if EGG_DEVKIT
+  gatePwmPaused = false;
+  entrancePwmUs = ENTRANCE_HOLD_US;
+  gatePwmUs = GATE_CENTER_US;
+  pinMode(ENTRANCE_PIN, OUTPUT);
+  pinMode(SERVO_CAM_PIN, OUTPUT);
   entranceServoWrite(ENTRANCE_HOLD_US);
+  gateServoWrite(GATE_CENTER_US);
 #endif
-  servoKickDrive();  // brief pulse to park horns, then stop
-  Serial.println("SERVO ready — ENTRANCE=LEDC, others=pulse (GATE/PUSH/SORT)");
+  servoKickDrive();
+  Serial.println("SERVO ready — ENTRANCE=softPWM always, GATE=softPWM, PUSH/SORT=pulse");
   return true;
 }
 
@@ -1368,6 +1654,9 @@ void servoRestart() {
   }
   servoTimerRunning = false;
   servoDriverOk = false;
+#if EGG_DEVKIT
+  gatePwmPaused = false;
+#endif
   servoDriverInit();
 }
 
@@ -1438,8 +1727,8 @@ void serviceEntrance() {
   // Beam stably clear — rate-limit the clear message (was every flicker).
   if (clearStreak == 8 && millis() - clearMsgAt > 2000UL) {
     clearMsgAt = millis();
-    entranceAt = millis();  // full 13s after stable clear
-    Serial.println("IR clear — next ENTRANCE UP in 13s (or type entrance now)");
+    entranceAt = millis();  // full 10s after stable clear
+    Serial.println("IR clear — next ENTRANCE UP in 10s (or type entrance now)");
   }
   // During weigh / push / result — hold entrance so egg 2 does not enter mid-cycle.
   if (eggSession || weightShown || announceEggRemoved || eggResultPrinted ||
@@ -1448,9 +1737,12 @@ void serviceEntrance() {
   }
   // Stay UP until IR detects egg — never timeout DOWN.
   if (entranceOpen) {
+#if EGG_DEVKIT
+    entrancePwmUs = ENTRANCE_OPEN_US;  // soft-PWM in loop keeps holding UP
+#endif
     if (ENTRANCE_OPEN_MAX_MS > 0 &&
         millis() - entranceOpenedAt >= ENTRANCE_OPEN_MAX_MS) {
-      entranceForceDown("ENTRANCE P13 DOWN — no IR egg, wait 13s");
+      entranceForceDown("ENTRANCE P13 DOWN — no IR egg, wait 10s");
     }
     return;
   }
@@ -1480,6 +1772,7 @@ void servicePush() {
     // Clear result flags, wait until wood near empty, then Ready (mustSeeEmpty path).
     if (announceEggRemoved || weightShown || eggResultPrinted) {
       gateHoldUntil = 0;
+      gateDecisionPulsed = 0;  // next Clean/Crack may move GATE again
       eggLatched = false;
       weightShown = false;
       announceEggRemoved = false;
@@ -1491,7 +1784,11 @@ void servicePush() {
       liveG = 0;
       scaleG = 0;
       lastStableG = 0;
+#if GATE_FROM_FARM
+      awaitNextEgg = true;  // next Clean egg can auto-weigh after pad clears
+#else
       awaitNextEgg = false;
+#endif
       mustSeeEmpty = true;
       idleShownOk = false;
       clearSinceAt = 0;
@@ -1522,6 +1819,10 @@ void servoWriteUs(int pin, int us) {
 #if EGG_DEVKIT
   if (pin == ENTRANCE_PIN) {
     entranceServoWrite(us);
+    return;
+  }
+  if (pin == SERVO_CAM_PIN) {
+    gateServoWrite(us);
     return;
   }
 #endif
@@ -1607,7 +1908,8 @@ void servoReject() {
 
 #if EGG_DEVKIT
 void serviceGate() {
-  // Safety only — normal return is "egg left camera" from heartbeat.
+  // Safety only — return GATE middle after hold. Do NOT clear gateDecisionPulsed:
+  // farm keeps cleanEgg/awaitingWeight sticky, which would re-fire LEFT every 12s.
   if (gateReturnAt == 0) return;
   if ((long)(millis() - gateReturnAt) < 0) return;
   gateReturnAt = 0;
@@ -1615,10 +1917,9 @@ void serviceGate() {
   camServoWrite(GATE_CENTER_US);
   gateAngle = 0;
   gateLatchedSide = 0;
-  gateDecisionPulsed = 0;
   camGateDown = true;
   laneOpen = false;
-  Serial.println("GATE P14 middle — hold timeout");
+  Serial.println("GATE P14 middle — hold timeout (decision latched)");
   holdSckLow();
 }
 #endif
@@ -1678,16 +1979,46 @@ bool bootComponentCheck(bool hxOk) {
     Serial.println("[OK]   SERVO driver");
   }
 
-  // Rest positions — then prove ENTRANCE moves (UP then DOWN) so wiring is obvious.
-  servoWriteUs(SERVO_CAM_PIN, GATE_CENTER_US);
+  // Rest positions — prove each horn. 5V+G alone is NOT enough — signal wire required.
   servoWriteUs(SERVO_SIZE_PIN, PUSH_HOME_US);
   servoWriteUs(SERVO_REJECT_PIN, SORT_MEDIUM_US);
-  Serial.println("[TEST] ENTRANCE P13 UP (watch the horn)…");
-  servoWriteUs(ENTRANCE_PIN, ENTRANCE_OPEN_US);
-  delay(1200);
-  Serial.println("[TEST] ENTRANCE P13 DOWN…");
-  servoWriteUs(ENTRANCE_PIN, ENTRANCE_HOLD_US);
+
+  Serial.println();
+  Serial.println("*** ENTRANCE WIRING CHECK (most common miss) ***");
+  Serial.println("  red  = LM2596 OUT+ 5V     (you said OK)");
+  Serial.println("  brown= LM2596 OUT- / GND  (you said OK)");
+  Serial.println("  orange/yellow SIGNAL = expansion S13 = ESP32 GPIO13");
+  Serial.println("  If SIGNAL is on S14/S25/S26, ENTRANCE will never move.");
+  Serial.println();
+
+  // Raw blink — proves DevKit GPIO13 is alive (meter/LED on S13).
+  Serial.println("[TEST] GPIO13 HIGH/LOW 1Hz x4 — meter/LED on S13 should toggle");
+  ledcDetach(ENTRANCE_PIN);
+  pinMode(ENTRANCE_PIN, OUTPUT);
+  for (int i = 0; i < 4; i++) {
+    digitalWrite(ENTRANCE_PIN, HIGH);
+    delay(500);
+    digitalWrite(ENTRANCE_PIN, LOW);
+    delay(500);
+  }
+
+  Serial.println("[TEST] ENTRANCE servo FULL LEFT (500us) — watch ENTRANCE horn only");
+  hornForceBurst(ENTRANCE_PIN, 500, 30);
+  Serial.println("[TEST] ENTRANCE servo FULL RIGHT (2500us)");
+  hornForceBurst(ENTRANCE_PIN, 2500, 30);
+  Serial.println("[TEST] ENTRANCE park (closed)");
+  entranceServoWrite(ENTRANCE_HOLD_US);
+
+  Serial.println("[TEST] GATE P14 LEFT…");
+  servoWriteUs(SERVO_CAM_PIN, GATE_LEFT_US);
   delay(800);
+  Serial.println("[TEST] GATE P14 RIGHT…");
+  servoWriteUs(SERVO_CAM_PIN, GATE_RIGHT_US);
+  delay(800);
+  Serial.println("[TEST] GATE P14 MIDDLE…");
+  servoWriteUs(SERVO_CAM_PIN, GATE_CENTER_US);
+  delay(500);
+
   gateAngle = 0;
   gateLatchedSide = 0;
   camGateDown = true;
@@ -1696,8 +2027,9 @@ bool bootComponentCheck(bool hxOk) {
   pushArmed = false;
   pushReturn = false;
   sizeDone = false;
-  Serial.println("[OK]   ENTRANCE down | GATE middle | PUSH home | SORT park");
-  Serial.println("      If P13 did not move: 5V+G on servo, signal→GPIO13, type entrance");
+  Serial.println("[OK]   park done");
+  Serial.println("      ENTRANCE dead + GPIO13 blink OK → bad servo or signal not in S13");
+  Serial.println("      GPIO13 blink dead → wire is NOT on DevKit GPIO13 / S13");
 
   int irPin = digitalRead(IR_PIN);
   bool irClear = irEggWhenLow ? (irPin == HIGH) : (irPin == LOW);
@@ -1714,9 +2046,9 @@ bool bootComponentCheck(bool hxOk) {
   }
 
   Serial.println("When eggs run:");
-  Serial.println("  ENTRANCE UP every 13s; IR egg -> instant DOWN");
-  Serial.println("  Camera Clean -> GATE LEFT; Crack/Dirty -> RIGHT; egg gone -> MIDDLE");
-  Serial.println("  Weigh (egg)  -> SORT 1S/2M/3L/4J then PUSH");
+  Serial.println("  P13 ENTRANCE UP every 10s; IR egg -> instant DOWN");
+  Serial.println("  P14 GATE: Clean=LEFT Crack/Dirty=RIGHT no-egg=MIDDLE");
+  Serial.println("  HX711 weigh -> P26 SORT 1S/2M/3L/4J -> P25 PUSH");
   Serial.println("Type 'all' to test every horn once.");
   Serial.println("=================================");
   return ok;
@@ -2782,18 +3114,24 @@ void runSerialLine(String line) {
     return;
   }
   if (line == "entrance" || line == "ent" || line == "p13") {
+#if EGG_DEVKIT
     if (!servoDriverOk) servoDriverInit();
-    Serial.printf("ENTRANCE TEST P13 — IR P19=%d eggWhen%s\n",
-                  digitalRead(IR_PIN), irEggWhenLow ? "LOW" : "HIGH");
-    Serial.println("  UP 1900us …");
-    servoHold(ENTRANCE_PIN, ENTRANCE_OPEN_US, 900);
-    Serial.println("  DOWN 1000us …");
-    servoHold(ENTRANCE_PIN, ENTRANCE_HOLD_US, 700);
+    Serial.printf("ENTRANCE TEST GPIO%d — IR P19=%d eggWhen%s\n",
+                  ENTRANCE_PIN, digitalRead(IR_PIN), irEggWhenLow ? "LOW" : "HIGH");
+    Serial.printf("  FULL sweep 500 → 2500 → %d (closed)\n", ENTRANCE_HOLD_US);
+    hornForceBurst(ENTRANCE_PIN, 500, 50);
+    delay(200);
+    hornForceBurst(ENTRANCE_PIN, 2500, 50);
+    delay(200);
+    entranceServoWrite(ENTRANCE_HOLD_US);
     entranceOpen = false;
     entranceAt = millis();
     irEgg = false;
     irCount = 0;
-    Serial.println("ENTRANCE TEST done — if no move: check 5V+G on horn + signal on GPIO13");
+    Serial.println("ENTRANCE TEST done — horn must swing. No move = signal not on ESP32 GPIO13");
+#else
+    Serial.println("entrance test is DevKit only — this build is CAM (EGG_DEVKIT 0)");
+#endif
     return;
   }
   if (line == "s" || line == "stop") {
@@ -4476,7 +4814,11 @@ void goOnline() {
   announceEggRemoved = false;
   eggSession = false;
   eggSeenHits = 0;
+#if GATE_FROM_FARM
+  awaitNextEgg = true;
+#else
   awaitNextEgg = false;
+#endif
   mustSeeEmpty = false;
   clearSinceAt = 0;
   eggResultPrinted = false;
@@ -4494,33 +4836,26 @@ void goOnline() {
 #if GATE_FROM_FARM
   applyBackend(FARM_BACKEND_URL);
   if (WiFi.status() != WL_CONNECTED) connectSavedWifi();
+  WiFi.setSleep(false);  // modem sleep + soft-PWM = DevKit HB http=-1 forever
 #endif
   delay(200);
-  // Park horns only (no full-servo demo). HX711 tare after quiet settle.
+  // Park horns, one short tare (triple tare was slow and killed ENTRANCE).
   bootComponentCheck(false);
-  servoPausePulses();
-  delay(2000);  // soft cell settle after park
-  bool tare2 = tareMedianNow("after-servo-test");
-  if (!tare2 || tareSuspect || lastTareSpan > 150) {
-    delay(2500);
-    tare2 = tareMedianNow("after-servo-retry");
-  }
-  if (tare2 && (tareSuspect || lastTareSpan > 150)) {
-    delay(2000);
-    tareMedianNow("after-servo-final");
-    tare2 = true;
-  }
+  delay(800);  // let cell settle after park demo
+  bool tare2 = tareMedianNow("boot");
   hxOk = tare2 && haveIdle;
   if (tare2) {
     saveFactor();
     Serial.printf("[OK]   HX711 idle=%ld factor=%.2f tareSpan=%ld%s\n",
                   idleAdc, factor, lastTareSpan, tareSuspect ? " WEAK" : "");
     if (tareSuspect || lastTareSpan > 120) {
-      Serial.println("*** For accuracy: empty pad, wait 3s, type t, then c50 ***");
+      Serial.println("*** Optional: empty pad, type t, then c50 ***");
     }
   } else {
-    Serial.println("*** HX711 unstable — empty wood, type t ***");
+    Serial.println("*** HX711 weak — empty wood, type t (station still runs) ***");
   }
+  // Re-assert ENTRANCE DOWN after tare (LEDC must stay armed).
+  entranceServoWrite(ENTRANCE_HOLD_US);
   servoKickDrive();
   Serial.println();
   Serial.println("========== STATION READY ==========");
@@ -4529,13 +4864,14 @@ void goOnline() {
   Serial.println("   Clean          -> GATE full LEFT  (hold while egg in view)");
   Serial.println("   Crack/Dirty    -> GATE full RIGHT (hold while egg in view)");
   Serial.println("   Egg leaves cam -> GATE MIDDLE");
-  Serial.println("3) On scale: type egg -> weigh -> SORT lane -> PUSH");
+  Serial.println("3) Clean on pad -> AUTO weigh -> SORT lane -> PUSH (no typing)");
   Serial.println("   SORT P26: 1=SMALL 2=MEDIUM 3=LARGE 4=JUMBO (by grams)");
   Serial.println("   PUSH P25: only after SORT assigns the lane");
   Serial.println("SORT/PUSH never move from camera — only after weigh.");
-  Serial.printf("Scale factor=%.4f  |  empty->t | 50g->c50 | egg\n", factor);
+  Serial.printf("Scale factor=%.4f  | cal optional: empty->t | 50g->c50\n", factor);
 #if GATE_FROM_FARM
   Serial.printf("Farm gate URL %s\n", FARM_BACKEND_URL);
+  Serial.println("IoT continuous — leave Serial Monitor closed if you want");
 #endif
   Serial.println("===================================");
   printIdleScale(0);
@@ -4663,7 +4999,8 @@ void setup() {
   Serial.println("boot ok");
 #if EGG_DEVKIT
   Serial.println("DevKit STATION — GATE from camera, SORT/PUSH from weight");
-  Serial.println("Flow: t (empty) → c50 (50g) → egg on pad → type egg");
+  Serial.println("IoT: camera Clean → auto weigh on pad (no IDE typing)");
+  Serial.println("Cal optional: t (empty) → c50 (50g) | manual: egg");
   Serial.println("Also: all=servos | sim55=fake weight | help");
   Serial.println("pins P13 entr P14 gate P25 push P26 sort P19 IR P32/33 HX711");
 #elif !SERIAL_WEIGHT_ONLY
@@ -4951,6 +5288,7 @@ void loop() {
       }
     }
 #if EGG_DEVKIT
+    serviceHornPwm();
     serviceEntrance();
     servicePush();
     serviceGate();
@@ -4961,6 +5299,7 @@ void loop() {
   }
 
 #if EGG_DEVKIT
+  serviceHornPwm();  // GATE P14 + ENTRANCE P13 — must run every loop
   serviceEntrance();
   servicePush();
   serviceGate();
@@ -5020,15 +5359,22 @@ void loop() {
   }
 
 #if EGG_DEVKIT
-  if (millis() - lastHb >= 2000UL) {  // faster gate updates when egg leaves FOV
+  // Slower steady HB — 1s spam caused OK/fail flicker on weak extender Wi‑Fi.
+  {
+    unsigned long hbGap = 2500UL;
+    if (hbFails >= 2) hbGap = 1800UL;
+    else if (weighArmedClean) hbGap = 2000UL;
+    if (millis() - lastHb >= hbGap) {
+      lastHb = millis();
+      heartbeat(scaleG);
+    }
+  }
 #else
   // Keep pinging laptop forever (faster when failing so we recover ASAP).
   // Skip during camera init — concurrent HTTP + cam DMA was asserting in pbuf_free.
   if (!camReiniting && millis() - lastHb >= (hbFails > 0 ? 1500UL : 3000UL)) {
-#endif
     lastHb = millis();
     heartbeat(scaleG);
-#if !EGG_DEVKIT
     if (hbFails == 0) {
       Serial.printf("ONLINE HB OK  rssi=%d  jpg=%u  cam=%d  ip=%s\n",
                     WiFi.RSSI(), (unsigned)camJpgLen, camState,
@@ -5037,8 +5383,8 @@ void loop() {
       Serial.printf("ONLINE recovering… hbFails=%d jpg=%u\n",
                     hbFails, (unsigned)camJpgLen);
     }
-#endif
   }
+#endif
 
 #if !ARDUINO_LOCAL
   handleSerial();
@@ -5119,7 +5465,7 @@ void loop() {
   float nowGquick = actualGrams(dNow);
   float eggNeedG = TRIGGER_RISE_G;
 
-  // --- Ready / empty cycle. DevKit weigh is Serial "egg" only (no auto FSM). ---
+  // --- Ready / empty cycle. IoT: Clean eggs auto-weigh on the pad (no Serial). ---
   if (!idleShownOk && !eggSession && !weightShown && !announceEggRemoved &&
       !mustSeeEmpty && dNow < EMPTY_BAND_COUNTS) {
     if (hxRawOk(adc)) {
@@ -5149,20 +5495,58 @@ void loop() {
     }
   }
 
-  bool onCell = (dNow >= PLACE_RISE_COUNTS) && (dNow <= HX_MAX_DELTA);
-#if EGG_DEVKIT
-  bool eggLike = false;  // never auto-start weigh on DevKit
-  (void)onCell;
-#else
-  float peekG = 0;
-  (void)peekG;
-  bool stableEgg = onCell;
+  // DevKit+farm: auto-weigh after camera Clean (weighArmedClean / farm weighArm).
+  // Latch survives egg leaving FOV until timeout / weigh / reject.
+  bool farmCleanWeigh = false;
+#if EGG_DEVKIT && GATE_FROM_FARM
+  if (weighArmedClean && millis() >= weighArmedUntil) {
+    weighArmedClean = false;
+    // Keep gateDecisionPulsed latched — sticky cleanEgg must NOT re-swing GATE LEFT.
+    // Pulsed clears only when farm goes idle (no clean/reject) or after weigh/PUSH.
+    Serial.println("Clean weigh arm expired — GATE stays latched until farm idle");
+  }
+  // Only the Clean latch arms the scale — sticky "Clean" string caused false arms.
+  farmCleanWeigh = weighArmedClean && (millis() < weighArmedUntil);
+#endif
+  // Empty floor: must beat measured empty noise by a wide margin (soft cell flickers).
+  // Farm-armed: softer bend floor so under-reading cells still lock real eggs.
+  long autoMinD = farmCleanWeigh ? 28L : AUTO_WEIGH_MIN_D;
+  long placeMinD = farmCleanWeigh ? 28L : PLACE_RISE_COUNTS;
+  long needBend = emptyNoiseD + (farmCleanWeigh ? 18L : 28L);
+  if (needBend < autoMinD) needBend = autoMinD;
+  if (needBend < placeMinD) needBend = placeMinD;
+  bool onCell = (dNow >= needBend) && (dNow <= HX_MAX_DELTA);
+  float peekG = actualGrams(dNow);
+  // Live grams on heartbeat so the dashboard shows pad mass before lock.
+  if (onCell && peekG >= 5.0f && peekG <= MAX_EGG_G) {
+    scaleG = peekG;
+    liveG = peekG;
+  } else if (!eggSession && !weightShown && peekG < 5.0f) {
+    scaleG = 0;
+  }
+  // HARD: real egg grams only — never soft residual on empty wood.
+  // Soft cell often under-reads: allow slightly below SMALL_MIN when farm-armed.
+  float minLockG = farmCleanWeigh ? (MIN_EGG_G * 0.85f) : MIN_EGG_G;
+  if (minLockG < 30.0f) minLockG = 30.0f;
+  bool massOnPad = onCell && (dNow >= needBend) &&
+                   (peekG >= minLockG) && (peekG <= MAX_EGG_G);
+  bool stableEgg = massOnPad && eggStill();
   bool allowWeigh = true;
+#if EGG_DEVKIT
+  // Fewer hits = faster lock; still requires Clean arm + real mass (no empty weigh).
+  int needHits = farmCleanWeigh ? 4 : 99;
+  allowWeigh = farmCleanWeigh && massOnPad && awaitNextEgg;
+#else
   int needHits = EGG_SEEN_HITS_NEED;
+  allowWeigh = massOnPad;
+#endif
   bool eggLike = awaitNextEgg && idleShownOk && !mustSeeEmpty && !eggSession &&
                  !weightShown && !announceEggRemoved && !eggResultPrinted &&
                  !sessionDone && stableEgg && allowWeigh &&
                  (millis() >= weighCooldownUntil);
+  if (!farmCleanWeigh && !eggSession) {
+    eggSeenHits = 0;  // camera not Clean → never accumulate empty-pad hits
+  }
   if (eggLike) {
     if (++eggSeenHits >= needHits) {
       eggSession = true;
@@ -5176,13 +5560,13 @@ void loop() {
       smoothD = (float)dNow;
       holdPeakD = 0;
       holdPeakAt = 0;
-      Serial.printf("Egg on pad — weighing d=%ld\n", dNow);
-      // CAM has no servo bit-bang; DevKit pauses via Serial "egg" path only.
+      Serial.printf("Egg on pad — AUTO weighing d=%ld ~%.1fg (need d≥%ld g≥%.0f)\n",
+                    dNow, peekG, needBend, MIN_EGG_G);
+      // Do NOT pause ENTRANCE/GATE here — that broke P13 every weigh.
     }
   } else if (!eggSession) {
-    if (dNow < 8) eggSeenHits = 0;
+    if (dNow < EMPTY_BAND_COUNTS) eggSeenHits = 0;
   }
-#endif
 
   bool looksEmpty = (dNow < EMPTY_BAND_COUNTS);
 
@@ -5208,7 +5592,6 @@ void loop() {
     liftClearHits = 0;
   }
 
-#if !EGG_DEVKIT
   // Lift cancel only on sustained near-zero.
   if (eggSession && !weightShown && !announceEggRemoved && !eggResultPrinted) {
     if (dNow < 5) {
@@ -5223,13 +5606,18 @@ void loop() {
         awaitNextEgg = true;
         idleShownOk = true;
         weighCooldownUntil = millis() + 300UL;
-        Serial.println("Egg lifted — put egg on pad again");
+#if EGG_DEVKIT
+        // Same Clean egg — re-arm pad auto-weigh after a lift.
+        weighArmedClean = true;
+        weighArmedUntil = millis() + WEIGH_ARMED_MS;
+        servoResumePulses();
+#endif
+        Serial.println("Egg lifted — waiting for egg on pad again");
       }
     } else {
       eggGoneHits = 0;
     }
   }
-#endif
 
   if (dNow < EMPTY_NOISE_COUNTS && !eggSession) {
     smoothD = 0.15f * smoothD + 0.85f * (float)dNow;
@@ -5331,7 +5719,7 @@ void loop() {
   unsigned long bendAge = (eggSessionAt > 0) ? (millis() - eggSessionAt) : 0;
   bool bendReady = eggSessionAt > 0 && bendAge >= WEIGHT_SETTLE_MS;
 
-  // Lock samples (camera/non-DevKit path only — DevKit locks inside Serial "egg").
+  // Lock samples — DevKit IoT auto-weigh uses the same path as CAM (no Serial "egg").
   static int restSampleN = 0;
   static float restSampleSum = 0;
   if (!eggSession) {
@@ -5340,21 +5728,21 @@ void loop() {
   }
 
   if (!weightShown && !eggResultPrinted && !sessionDone && eggSession && eggSessionAt > 0) {
-#if EGG_DEVKIT
-    eggSession = false;  // weigh commits in Serial egg handler
-    (void)bendAge;
-    (void)bendReady;
-#else
     long sampleD = (long)(smoothD + 0.5f);
     if (sampleD < EGG_D_LO && dNow >= EGG_D_LO) sampleD = dNow;
     if (sampleD > REST_D_MAX) sampleD = REST_D_MAX;
-    bool sampleOk = bendReady && sampleD >= REST_D_MIN;
-    int needRest = REST_SAMPLES_NEED;
+    // Reject empty residual samples — do not average noise into a fake egg.
+    // Farm-armed Soft cell: lower bend + gram floors so lock still commits.
+    long restMinD = farmCleanWeigh ? 28L : REST_D_MIN;
+    long restAutoD = farmCleanWeigh ? 28L : AUTO_WEIGH_MIN_D;
+    float minSampleG = farmCleanWeigh ? minLockG : MIN_EGG_G;
+    bool sampleOk = bendReady && sampleD >= restMinD && sampleD >= restAutoD;
+    int needRest = farmCleanWeigh ? REST_SAMPLES_NEED : (REST_SAMPLES_NEED + 2);
     unsigned long giveUpMs = WEIGHT_GIVE_UP_MS;
     if (sampleOk) {
       float g = actualGrams(sampleD);
       float w = displayGrams(g);
-      if (w >= MIN_EGG_G && w <= MAX_EGG_G) {
+      if (w >= minSampleG && w <= MAX_EGG_G) {
         restSampleSum += g;
         restSampleN++;
         sessionBestRestG = (sessionBestRestG < 0.5f) ? g : (0.5f * sessionBestRestG + 0.5f * g);
@@ -5366,10 +5754,18 @@ void loop() {
       if (commitEggResult(restSampleSum / (float)restSampleN)) {
         restSampleN = 0;
         restSampleSum = 0;
+#if EGG_DEVKIT
+        servoResumePulses();
+#endif
       }
     }
     if (!weightShown && !eggResultPrinted && bendAge >= giveUpMs) {
-      if (restSampleN >= needRest) commitEggResult(restSampleSum / (float)restSampleN);
+      if (restSampleN >= needRest) {
+        commitEggResult(restSampleSum / (float)restSampleN);
+#if EGG_DEVKIT
+        servoResumePulses();
+#endif
+      }
       if (!eggResultPrinted) {
         eggSession = false;
         eggSessionAt = 0;
@@ -5378,11 +5774,15 @@ void loop() {
         sessionDone = true;
         awaitNextEgg = false;
         mustSeeEmpty = true;
+#if EGG_DEVKIT
+        weighArmedClean = false;
+        weighArmedUntil = 0;
+        servoResumePulses();
+#endif
         idleShownOk = false;
         clearSinceAt = 0;
       }
     }
-#endif
   }
 
   if (liveG >= EGG_G) {

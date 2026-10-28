@@ -1,10 +1,13 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:html' as html;
 import 'dart:typed_data';
 import 'dart:ui_web' as ui_web;
 
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
+
+import 'api_config.dart';
 
 class LiveCamMjpeg extends StatefulWidget {
   const LiveCamMjpeg({
@@ -15,8 +18,7 @@ class LiveCamMjpeg extends StatefulWidget {
 
   final String streamUrl;
 
-  /// Worker dashboard: refresh /live.jpg. The multipart /stream stays blank
-  /// inside a Flutter web view when frames arrive slower than the browser paint.
+  /// Prefer true on hosted web — multipart /stream dies on Cloudflare tunnels.
   final bool pollSnapshots;
 
   @override
@@ -27,14 +29,75 @@ class _LiveCamMjpegState extends State<LiveCamMjpeg> {
   late final String _viewType;
   html.ImageElement? _image;
   Uint8List? _jpg;
+  String? _netUrl;
   bool _run = true;
+  int _urlIndex = 0;
 
-  String get _snapshotUrl {
-    final String base = widget.streamUrl.replaceFirst(
-      RegExp(r'/stream/?$'),
-      '/live.jpg',
-    );
-    return '$base?t=${DateTime.now().millisecondsSinceEpoch}';
+  List<String> get _snapshotBases {
+    final String primary = widget.streamUrl
+        .replaceFirst(RegExp(r'/stream/?$'), '/live.jpg')
+        .replaceFirst(RegExp(r'\?.*$'), '');
+    final LinkedHashSet<String> bases = LinkedHashSet<String>();
+    bases.add(primary);
+    if (ApiConfig.isHostedHttpsWeb) {
+      bases.add('${ApiConfig.farmTunnelUrl}/live.jpg');
+      bases.add('${ApiConfig.workersFarmUrl}/live.jpg');
+    }
+    return bases.toList();
+  }
+
+  String _bust(String base) =>
+      '$base?t=${DateTime.now().millisecondsSinceEpoch}';
+
+  Future<void> _pollSnapshots() async {
+    Duration gap = const Duration(milliseconds: 800);
+    while (_run && mounted && widget.pollSnapshots) {
+      final List<String> bases = _snapshotBases;
+      if (bases.isEmpty) {
+        await Future<void>.delayed(gap);
+        continue;
+      }
+      final String base = bases[_urlIndex % bases.length];
+      final String url = _bust(base);
+      bool gotFrame = false;
+      try {
+        // No custom headers — Cache-Control triggers CORS preflight and
+        // fails against the farm tunnel (only Authorization/Content-Type allowed).
+        final http.Response res = await http
+            .get(Uri.parse(url))
+            .timeout(const Duration(seconds: 8));
+        final Uint8List jpg = res.bodyBytes;
+        if (res.statusCode == 429) {
+          _urlIndex = (_urlIndex + 1) % bases.length;
+          gap = const Duration(seconds: 2);
+        } else if (res.statusCode == 200 &&
+            jpg.length > 2 &&
+            jpg[0] == 0xFF &&
+            jpg[1] == 0xD8 &&
+            mounted) {
+          setState(() {
+            _jpg = jpg;
+            _netUrl = null;
+          });
+          gotFrame = true;
+          gap = const Duration(milliseconds: 800);
+        } else {
+          _urlIndex = (_urlIndex + 1) % bases.length;
+          gap = const Duration(seconds: 1);
+        }
+      } catch (_) {
+        // Fallback: show via Image.network (display-only, no byte CORS).
+        if (mounted) {
+          setState(() => _netUrl = url);
+        }
+        _urlIndex = (_urlIndex + 1) % bases.length;
+        gap = const Duration(seconds: 1);
+      }
+      if (!gotFrame && _jpg == null && _netUrl == null && mounted) {
+        setState(() => _netUrl = url);
+      }
+      await Future<void>.delayed(gap);
+    }
   }
 
   void _paintStream() {
@@ -43,27 +106,6 @@ class _LiveCamMjpegState extends State<LiveCamMjpeg> {
       return;
     }
     image.src = widget.streamUrl;
-  }
-
-  Future<void> _pollSnapshots() async {
-    while (_run && mounted && widget.pollSnapshots) {
-      try {
-        final http.Response res = await http
-            .get(Uri.parse(_snapshotUrl))
-            .timeout(const Duration(seconds: 4));
-        final Uint8List jpg = res.bodyBytes;
-        if (res.statusCode == 200 &&
-            jpg.length > 2 &&
-            jpg[0] == 0xFF &&
-            jpg[1] == 0xD8 &&
-            mounted) {
-          setState(() => _jpg = jpg);
-        }
-      } catch (_) {
-        // Keep the last good frame and try again.
-      }
-      await Future<void>.delayed(const Duration(milliseconds: 350));
-    }
   }
 
   @override
@@ -109,19 +151,41 @@ class _LiveCamMjpegState extends State<LiveCamMjpeg> {
   Widget build(BuildContext context) {
     if (widget.pollSnapshots) {
       final Uint8List? jpg = _jpg;
-      if (jpg == null) {
-        return const Center(
-          child: Text(
-            'Live camera offline',
-            style: TextStyle(color: Color(0xFF9A8F88), fontSize: 12),
+      if (jpg != null) {
+        return SizedBox.expand(
+          child: Image.memory(
+            jpg,
+            fit: BoxFit.contain,
+            gaplessPlayback: true,
           ),
         );
       }
-      return SizedBox.expand(
-        child: Image.memory(
-          jpg,
-          fit: BoxFit.contain,
-          gaplessPlayback: true,
+      final String? net = _netUrl;
+      if (net != null) {
+        return SizedBox.expand(
+          child: Image.network(
+            net,
+            fit: BoxFit.contain,
+            gaplessPlayback: true,
+            errorBuilder: (
+              BuildContext context,
+              Object error,
+              StackTrace? stackTrace,
+            ) {
+              return const Center(
+                child: Text(
+                  'Live camera offline',
+                  style: TextStyle(color: Color(0xFF9A8F88), fontSize: 12),
+                ),
+              );
+            },
+          ),
+        );
+      }
+      return const Center(
+        child: Text(
+          'Connecting camera…',
+          style: TextStyle(color: Color(0xFF9A8F88), fontSize: 12),
         ),
       );
     }

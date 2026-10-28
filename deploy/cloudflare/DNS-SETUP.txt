@@ -1,0 +1,66 @@
+FULL PROCESS: eggsorting.site (Namecheap → Cloudflare → farm)
+
+Use this new domain. Ignore eggsorting.com if it stayed Invalid.
+
+============================================================
+1) BUY / OWN eggsorting.site ON NAMECHEAP
+============================================================
+- Domain List → eggsorting.site is in your account
+
+============================================================
+2) ADD DOMAIN IN CLOUDFLARE
+============================================================
+1. dash.cloudflare.com → Domains → Add a domain
+2. Enter: eggsorting.site
+3. Choose Free plan → Continue
+4. Cloudflare scans DNS → Continue
+5. On Overview, COPY the 2 nameservers Cloudflare shows
+   (example shape: xxxx.ns.cloudflare.com)
+
+============================================================
+3) POINT NAMECHEAP AT NAMESERVERS TO CLOUDFLARE
+============================================================
+1. namecheap.com → Domain List → Manage → eggsorting.site
+2. Domain tab → NAMESERVERS → Custom DNS
+3. Paste ONLY the 2 Cloudflare nameservers → Save
+4. If DNSSEC is ON → turn OFF → Save
+5. Wait 15 min–few hours (up to 24h)
+6. Cloudflare → eggsorting.site → Overview → Check nameservers now
+7. Status must become Active (green)
+
+Check from PC:
+  nslookup -type=NS eggsorting.site 8.8.8.8
+
+============================================================
+4) LINK FARM TUNNEL HOSTNAME
+============================================================
+Cloudflare → eggsorting.site → DNS → Records → Add:
+
+  Type:   CNAME   (or Tunnel if the UI offers it)
+  Name:   egg-farm
+  Target: 596c500f-08b4-44e8-980e-156aed033469.cfargotunnel.com
+          (or pick tunnel: egg-farm-backend)
+  Proxy:  Proxied (orange cloud)
+
+Stable farm URL becomes:
+  https://egg-farm.eggsorting.site
+
+============================================================
+5) START FARM + POINT WORKER
+============================================================
+1. Double-click: c:\Egg System\start-egg-farm.bat
+2. When Active, smart tunnel uses the named URL
+3. Or set Worker secret manually:
+   cd c:\Egg System\deploy\cloudflare
+   echo https://egg-farm.eggsorting.site| npx wrangler secret put FARM_ORIGIN
+
+============================================================
+6) TEST
+============================================================
+  https://egg-farm.eggsorting.site/health
+  https://egg-system.paghasianjustine.workers.dev
+
+Never bookmark :8000 or trycloudflare.com.
+
+Optional LAN (same Wi-Fi):
+  http://192.168.11.212:8000/watch

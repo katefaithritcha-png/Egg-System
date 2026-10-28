@@ -1,16 +1,21 @@
-"""In-memory egg records for the live farm backend.
+"""Firebase-only egg history (no SQLite).
 
-No SQLite file and no Firestore upload — live counts stay in RAM
-(and in live_inspection_backend detection_records) only.
+Camera/weight events write straight to Firestore egg_readings.
+A small in-memory queue retries failed uploads until the process restarts.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 _ID_RE = re.compile(r'^[A-Za-z0-9_-]{8,80}$')
@@ -19,7 +24,6 @@ _STORE: 'EggRecordStore | None' = None
 
 
 def sorting_result_for(category: str | None) -> str:
-    """Map inspection category to the quality label shown on the dashboard."""
     if category == 'goodEggs':
         return 'Good'
     if category == 'crackedEggs':
@@ -34,22 +38,225 @@ def valid_record_id(value: str) -> bool:
 
 
 def internet_available() -> bool:
-    """Cloud sync disabled — always offline for Firestore."""
-    return False
+    import socket
+
+    try:
+        with socket.create_connection(('firestore.googleapis.com', 443), 3):
+            return True
+    except OSError:
+        return False
+
+
+def _timestamp(value: str) -> str:
+    text = (value or '').strip()
+    if not text:
+        return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+    if ' ' in text and 'T' not in text:
+        text = text.replace(' ', 'T')
+    if text.endswith('Z') or '+' in text[10:]:
+        return text
+    return text + 'Z'
+
+
+def _project_key() -> tuple[str, str] | None:
+    if os.environ.get('AUTH_TESTING') == '1':
+        return None
+    project = os.environ.get('FIREBASE_PROJECT_ID', '').strip()
+    key = os.environ.get('FIREBASE_WEB_API_KEY', '').strip()
+    if not project or not key:
+        return None
+    return project, key
+
+
+def _egg_fields(row: dict) -> dict:
+    measurement = str(row.get('measurement_status') or 'uncalibrated')[:40]
+    device = str(row.get('device_id') or 'egg-station')[:64]
+    return {
+        'recordId': {'stringValue': str(row['id'])},
+        'weight': {'doubleValue': float(row.get('weight') or 0.0)},
+        'grade': {'stringValue': str(row['sorting_result'])[:80]},
+        'sizeClass': {'stringValue': str(row.get('size_class') or 'pending')[:40]},
+        'deviceId': {'stringValue': device},
+        'createdAt': {'timestampValue': _timestamp(str(row['created_at']))},
+        'cameraResult': {'stringValue': str(row.get('camera_result') or '')[:80]},
+        'sortingResult': {'stringValue': str(row['sorting_result'])[:80]},
+        'measurementStatus': {'stringValue': measurement},
+        'verifiedWeight': {'booleanValue': measurement == 'calibrated'},
+        'app': {'stringValue': 'egg_system'},
+    }
+
+
+def _firestore_headers() -> dict[str, str]:
+    try:
+        import farm_store
+        return farm_store.firestore_http_headers(content_type=True)
+    except Exception:
+        return {'Content-Type': 'application/json'}
 
 
 def firestore_put_egg(row: dict) -> bool:
-    """Disabled: project does not use Firebase egg history."""
-    return False
+    """Create egg_readings/{id}. HTTP 409 = already stored (still success)."""
+    creds = _project_key()
+    if not creds:
+        print('[egg-sync] FIREBASE_PROJECT_ID / FIREBASE_WEB_API_KEY missing', flush=True)
+        return False
+    project, key = creds
+    doc_id = urllib.parse.quote(str(row['id']), safe='')
+    url = (
+        f'https://firestore.googleapis.com/v1/projects/{project}'
+        f'/databases/(default)/documents/egg_readings?documentId={doc_id}'
+        f'&key={urllib.parse.quote(key)}'
+    )
+    request = urllib.request.Request(
+        url,
+        data=json.dumps({'fields': _egg_fields(row)}).encode('utf-8'),
+        headers=_firestore_headers(),
+        method='POST',
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            response.read()
+        print(f'[egg-sync] Firestore create ok id={row.get("id", "")[:8]}...', flush=True)
+        return True
+    except urllib.error.HTTPError as exc:
+        if exc.code == 409:
+            return True
+        detail = ''
+        try:
+            detail = exc.read().decode('utf-8', errors='replace')[:240]
+        except Exception:
+            detail = str(exc)
+        print(f'[egg-sync] Firestore create HTTP {exc.code}: {detail}', flush=True)
+        return False
+    except urllib.error.URLError as exc:
+        print(f'[egg-sync] Firestore create network: {exc}', flush=True)
+        return False
+
+
+def firestore_patch_egg(row: dict) -> bool:
+    """Update weight/size on an existing camera egg."""
+    creds = _project_key()
+    if not creds:
+        return False
+    project, key = creds
+    doc_id = urllib.parse.quote(str(row['id']), safe='')
+    mask = (
+        'updateMask.fieldPaths=weight'
+        '&updateMask.fieldPaths=sizeClass'
+        '&updateMask.fieldPaths=measurementStatus'
+        '&updateMask.fieldPaths=verifiedWeight'
+        '&updateMask.fieldPaths=grade'
+        '&updateMask.fieldPaths=sortingResult'
+        '&updateMask.fieldPaths=cameraResult'
+    )
+    url = (
+        f'https://firestore.googleapis.com/v1/projects/{project}'
+        f'/databases/(default)/documents/egg_readings/{doc_id}'
+        f'?key={urllib.parse.quote(key)}&{mask}'
+    )
+    request = urllib.request.Request(
+        url,
+        data=json.dumps({'fields': _egg_fields(row)}).encode('utf-8'),
+        headers=_firestore_headers(),
+        method='PATCH',
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            response.read()
+        return True
+    except urllib.error.HTTPError as exc:
+        # Missing doc — create instead.
+        if exc.code == 404:
+            return firestore_put_egg(row)
+        return False
+    except urllib.error.URLError:
+        return False
+
+
+def firestore_delete_egg(record_id: str) -> bool:
+    creds = _project_key()
+    if not creds:
+        return False
+    project, key = creds
+    doc_id = urllib.parse.quote(str(record_id), safe='')
+    url = (
+        f'https://firestore.googleapis.com/v1/projects/{project}'
+        f'/databases/(default)/documents/egg_readings/{doc_id}'
+        f'?key={urllib.parse.quote(key)}'
+    )
+    request = urllib.request.Request(
+        url,
+        headers=_firestore_headers(),
+        method='DELETE',
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            response.read()
+        return True
+    except urllib.error.HTTPError as exc:
+        return exc.code == 404
+    except urllib.error.URLError:
+        return False
+
+
+def firestore_list_egg_ids(limit: int = 300) -> list[tuple[str, str]]:
+    """Return [(id, createdAtIso), ...] newest pages (no query index required)."""
+    creds = _project_key()
+    if not creds:
+        return []
+    project, key = creds
+    url = (
+        f'https://firestore.googleapis.com/v1/projects/{project}'
+        f'/databases/(default)/documents/egg_readings'
+        f'?key={urllib.parse.quote(key)}&pageSize={max(1, min(limit, 300))}'
+    )
+    request = urllib.request.Request(
+        url,
+        headers=_firestore_headers(),
+        method='GET',
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            payload = json.loads(response.read().decode('utf-8'))
+    except (urllib.error.URLError, json.JSONDecodeError):
+        return []
+    out: list[tuple[str, str]] = []
+    for doc in payload.get('documents') or []:
+        name = str(doc.get('name') or '')
+        rid = name.rsplit('/', 1)[-1] if name else ''
+        fields = doc.get('fields') or {}
+        created = ''
+        raw = fields.get('createdAt') or {}
+        if isinstance(raw, dict):
+            created = str(raw.get('timestampValue') or raw.get('stringValue') or '')
+        if rid:
+            out.append((rid, created))
+    return out
+
+
+def delete_eggs_for_utc_day(day: datetime | None = None) -> int:
+    """Delete Firestore egg_readings whose createdAt falls on the UTC calendar day."""
+    day = day or datetime.now(timezone.utc)
+    start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+    end = start.replace(hour=23, minute=59, second=59, microsecond=999999)
+    deleted = 0
+    for rid, created in firestore_list_egg_ids(300):
+        try:
+            ts = datetime.fromisoformat(created.replace('Z', '+00:00'))
+        except ValueError:
+            continue
+        if start <= ts <= end:
+            if firestore_delete_egg(rid):
+                deleted += 1
+    return deleted
 
 
 class EggRecordStore:
-    """RAM-only egg log (same API as the old SQLite store, no disk/cloud)."""
+    """RAM retry queue + immediate Firestore upload (no disk database)."""
 
     def __init__(self, path=None, uploader=None, internet=None, clock=None):
         self.path = Path(path) if path else Path('.')
-        # Default: never upload. Tests may pass a custom uploader.
-        self.uploader = uploader
+        self.uploader = uploader or firestore_put_egg
         self.internet = internet or internet_available
         self.clock = clock or time.time
         self._lock = threading.Lock()
@@ -78,8 +285,6 @@ class EggRecordStore:
         with self._lock:
             if record_id in self._rows:
                 return dict(self._rows[record_id])
-            # No cloud sync — mark local immediately.
-            sync = 'local' if self.uploader is None else 'pending'
             row = {
                 'id': record_id,
                 'created_at': created_at,
@@ -87,21 +292,34 @@ class EggRecordStore:
                 'size_class': size_class,
                 'camera_result': (camera_result or '')[:80],
                 'sorting_result': (sorting_result or '')[:80],
-                'sync_status': sync,
+                'sync_status': 'pending',
                 'attempts': 0,
                 'next_attempt_at': float(self.clock()),
                 'measurement_status': status,
                 'device_id': device,
             }
             self._rows[record_id] = row
-            return dict(row)
+            snapshot = dict(row)
+        # Upload immediately (outside lock).
+        if self.internet() and self.uploader is not None:
+            try:
+                ok = bool(self.uploader(snapshot))
+            except Exception:
+                ok = False
+            if ok:
+                self.mark_synced(record_id)
+                snapshot['sync_status'] = 'synced'
+            else:
+                self.backoff(record_id)
+                refreshed = self.get(record_id)
+                if refreshed is not None:
+                    snapshot = refreshed
+        return snapshot
 
     def counts(self) -> dict:
         with self._lock:
             pending = sum(1 for r in self._rows.values() if r['sync_status'] == 'pending')
-            synced = sum(
-                1 for r in self._rows.values() if r['sync_status'] in ('synced', 'local')
-            )
+            synced = sum(1 for r in self._rows.values() if r['sync_status'] == 'synced')
         return {'pending': int(pending), 'synced': int(synced)}
 
     def get(self, record_id: str) -> dict | None:
@@ -132,8 +350,6 @@ class EggRecordStore:
         ]
 
     def due(self, limit: int = 20) -> list[dict]:
-        if self.uploader is None:
-            return []
         now = self.clock()
         with self._lock:
             rows = [
@@ -161,7 +377,6 @@ class EggRecordStore:
             row['next_attempt_at'] = float(self.clock()) + delay
 
     def sync_once(self) -> int:
-        """No Firebase in production. Optional uploader kept for unit tests only."""
         if self.uploader is None or not self.internet():
             return 0
         done = 0
@@ -177,20 +392,16 @@ class EggRecordStore:
                 self.backoff(row['id'])
         return done
 
-
-def _db_path() -> Path:
-    # Kept for API compatibility; no file is created.
-    raw = os.environ.get('EGG_SYNC_DB', '').strip()
-    if raw:
-        return Path(raw)
-    return Path(__file__).resolve().parent / 'data' / 'egg_records.memory'
+    def clear_memory(self) -> None:
+        with self._lock:
+            self._rows.clear()
 
 
 def get_store() -> EggRecordStore:
     global _STORE
     with _LOCK:
         if _STORE is None:
-            _STORE = EggRecordStore(_db_path())
+            _STORE = EggRecordStore()
         return _STORE
 
 
@@ -213,7 +424,7 @@ def remember_sorted_egg(
         record_id=rid,
         created_at=created,
         weight=weight,
-        size_class=size_class or 'medium',
+        size_class=size_class or 'pending',
         camera_result=camera_result or '',
         sorting_result=sorting_result or 'UNSORTED',
         measurement_status=measurement_status,
@@ -229,7 +440,6 @@ def attach_weight_to_egg(
     size_class: str,
     measurement_status: str = 'uncalibrated',
 ) -> bool:
-    """Fill grams/size on an egg that was already counted by the camera."""
     rid = (record_id or '').strip()
     if not valid_record_id(rid):
         return False
@@ -244,13 +454,17 @@ def attach_weight_to_egg(
         row['weight'] = float(weight)
         row['size_class'] = (size_class or 'medium')[:40]
         row['measurement_status'] = status
-        if store.uploader is not None:
-            row['sync_status'] = 'pending'
-            row['attempts'] = 0
-            row['next_attempt_at'] = float(store.clock())
-        else:
-            row['sync_status'] = 'local'
-        return True
+        row['sync_status'] = 'pending'
+        row['attempts'] = 0
+        row['next_attempt_at'] = float(store.clock())
+        snapshot = dict(row)
+    try:
+        ok = firestore_patch_egg(snapshot)
+    except Exception:
+        ok = False
+    if ok:
+        store.mark_synced(rid)
+    return True
 
 
 def ingest_body(body: dict) -> tuple[dict, int]:
@@ -261,7 +475,7 @@ def ingest_body(body: dict) -> tuple[dict, int]:
         weight = float(body.get('weight'))
     except (TypeError, ValueError):
         return {'ok': False, 'error': 'weight required'}, 400
-    if not 0 < weight < 500:
+    if not 0 <= weight < 500:
         return {'ok': False, 'error': 'weight out of range'}, 400
     size = str(body.get('size') or body.get('sizeClass') or '').strip()[:40]
     camera = str(body.get('cameraResult') or '').strip()[:80]
@@ -287,5 +501,5 @@ def ingest_body(body: dict) -> tuple[dict, int]:
     return {
         'ok': True,
         'id': rid,
-        'syncStatus': row.get('sync_status', 'local'),
+        'syncStatus': row.get('sync_status', 'pending'),
     }, 200

@@ -1,12 +1,12 @@
-import 'package:flutter/foundation.dart';
-import 'package:image/image.dart' as img;
-import 'package:flutter/services.dart';
+import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'tflite_interpreter.dart';
 
+import 'api_config.dart';
 import 'app_state.dart';
 import 'auth_api.dart';
+import 'csv_download.dart';
 import 'iot_egg_reading.dart';
 import 'flutter_conversion.dart';
 import 'live_cam_mjpeg.dart';
@@ -27,7 +27,6 @@ class AppRouter {
     AppPaths.reports,
     AppPaths.profile,
     AppPaths.accounts,
-    AppPaths.classification,
     AppPaths.sales,
   };
 
@@ -85,22 +84,47 @@ class AppRouter {
       return _page(settings, AuthRequiredScreen(requestedPath: path));
     }
 
+    // Seller desk: only sales routes (plus profile).
     if (appState.isSales &&
         path != AppPaths.sales &&
-        path != AppPaths.profile) {
+        path != AppPaths.profile &&
+        path != AppPaths.reports) {
       return _page(
         settings,
         RedirectScreen(from: path, to: AppPaths.sales),
       );
     }
 
-    if (path == AppPaths.sales && !appState.isSales && !appState.isAdmin) {
+    // Egg Sales desk is seller-only; admin uses dashboard sales widgets.
+    if (path == AppPaths.sales && !appState.isSales) {
       return _page(
         settings,
         AccessDeniedScreen(appState: appState, requestedPath: path),
       );
     }
 
+    // Worker floor: production/QC/dashboard/profile only.
+    if (appState.isWorker &&
+        (path == AppPaths.sales ||
+            path == AppPaths.accounts ||
+            path == AppPaths.inventory ||
+            path == AppPaths.reports)) {
+      return _page(
+        settings,
+        AccessDeniedScreen(appState: appState, requestedPath: path),
+      );
+    }
+
+    if (path == AppPaths.reports &&
+        !appState.isAdmin &&
+        !appState.isSales) {
+      return _page(
+        settings,
+        AccessDeniedScreen(appState: appState, requestedPath: path),
+      );
+    }
+
+    // Accounts + inventory: sole admin Gmail only.
     if (FlutterConversion.adminOnlyRoutes.contains(path) && !appState.isAdmin) {
       return _page(
         settings,
@@ -123,8 +147,6 @@ class AppRouter {
         return _page(settings, ProfileScreen(appState: appState));
       case AppPaths.accounts:
         return _page(settings, AccountScreen(appState: appState));
-      case AppPaths.classification:
-        return _page(settings, EggClassificationScreen(appState: appState));
       case AppPaths.sales:
         return _page(settings, EggSalesScreen(appState: appState));
       default:
@@ -498,23 +520,18 @@ class _AuthScreenState extends State<AuthScreen> {
           Navigator.of(context).pushReplacementNamed(_homeRoute(widget.appState));
           return;
         }
-        final String? code = result.verificationCode?.trim();
-        if (code != null && code.isNotEmpty) {
-          _openVerifyEmail(
-            email: email,
-            password: password,
-            message: 'Check ${email} for the 6-digit code.',
-          );
-          return;
-        }
-        setState(() {
-          _workerSignUp = false;
-          _error = null;
-          _passwordController.clear();
-        });
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(result.message)),
+        // Codes are emailed to the real Gmail — always open verify after signup.
+        _openVerifyEmail(
+          email: email,
+          password: password,
+          message:
+              'We sent a verification code to $email. Check your Gmail inbox (and Spam).',
         );
+        if (result.message.isNotEmpty && mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text(result.message)),
+          );
+        }
         return;
       }
       await widget.appState.login(email: email, password: password);
@@ -527,11 +544,13 @@ class _AuthScreenState extends State<AuthScreen> {
       if (!mounted) {
         return;
       }
-      if (error.isUnverified) {
+      if (error.isUnverified || error.code == 'email_delivery_failed') {
         _openVerifyEmail(
           email: email,
           password: password,
-          message: 'Check $email for the 6-digit code.',
+          message: error.code == 'email_delivery_failed'
+              ? 'Account saved. Fix farm email settings, then tap Resend to get your Gmail code.'
+              : 'Check $email for the 6-digit code.',
         );
         return;
       }
@@ -546,16 +565,6 @@ class _AuthScreenState extends State<AuthScreen> {
         setState(() => _submitting = false);
       }
     }
-  }
-
-  void _continueWithGoogle() {
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text(
-          'Google sign-in is not available. Contact your administrator.',
-        ),
-      ),
-    );
   }
 
   String? _validateNewPassword(String password) {
@@ -576,8 +585,16 @@ class _AuthScreenState extends State<AuthScreen> {
     if (trimmed.isEmpty) {
       return 'Email is required';
     }
-    if (!trimmed.contains('@') || !trimmed.contains('.')) {
-      return 'Enter a valid email';
+    final String normalized = trimmed.toLowerCase();
+    if (normalized.contains(' ') ||
+        normalized.split('@').length != 2 ||
+        !(normalized.endsWith('@gmail.com') ||
+            normalized.endsWith('@googlemail.com'))) {
+      return 'Use a real Gmail account (@gmail.com)';
+    }
+    if (normalized.endsWith('.local') ||
+        normalized.contains('@eggsystem.local')) {
+      return 'Local emails are not allowed';
     }
     return null;
   }
@@ -897,53 +914,6 @@ class _AuthScreenState extends State<AuthScreen> {
                             )
                           : Text(_workerSignUp ? 'Sign up' : 'Log In'),
                     ),
-                    const SizedBox(height: 22),
-                    const Row(
-                      children: <Widget>[
-                        Expanded(child: Divider(color: _line, thickness: 1)),
-                        Padding(
-                          padding: EdgeInsets.symmetric(horizontal: 14),
-                          child: Text(
-                            'OR',
-                            style: TextStyle(
-                              color: Color(0xFF9CA3AF),
-                              fontSize: 12,
-                              fontWeight: FontWeight.w600,
-                              letterSpacing: 1.2,
-                            ),
-                          ),
-                        ),
-                        Expanded(child: Divider(color: _line, thickness: 1)),
-                      ],
-                    ),
-                    const SizedBox(height: 18),
-                    OutlinedButton(
-                      onPressed: _submitting ? null : _continueWithGoogle,
-                      style: OutlinedButton.styleFrom(
-                        foregroundColor: _ink,
-                        backgroundColor: const Color(0xFF3A322B),
-                        padding: const EdgeInsets.symmetric(vertical: 14),
-                        side: const BorderSide(color: _line),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(10),
-                        ),
-                      ),
-                      child: const Row(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: <Widget>[
-                          _GoogleMark(),
-                          SizedBox(width: 10),
-                          Text(
-                            'Continue with Google',
-                            style: TextStyle(
-                              color: Colors.white,
-                              fontSize: 15,
-                              fontWeight: FontWeight.w600,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
                     const SizedBox(height: 28),
                     Wrap(
                       alignment: WrapAlignment.center,
@@ -1217,7 +1187,52 @@ class _VerifyEmailScreenState extends State<VerifyEmailScreen> {
         return;
       }
       _tokenController.clear();
-      setState(() => _message = 'A new code was sent to $email.');
+      setState(() {
+        _message = result.emailSent || result.message.isNotEmpty
+            ? 'A new code was sent to $email. Check Gmail (and Spam).'
+            : 'A new code was sent to $email.';
+      });
+    } on AuthException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() => _error = error.message);
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+      setState(() => _error = 'Unable to reach the authentication server.');
+    } finally {
+      if (mounted) {
+        setState(() => _submitting = false);
+      }
+    }
+  }
+
+  Future<void> _confirmGmailLink() async {
+    final String email = widget.email?.trim() ?? '';
+    final String password = widget.password ?? '';
+    if (email.isEmpty || password.isEmpty) {
+      setState(() {
+        _error =
+            'Return to sign up, then open the Gmail verification link and try again.';
+      });
+      return;
+    }
+    setState(() {
+      _submitting = true;
+      _error = null;
+      _message = null;
+    });
+    try {
+      await widget.appState.confirmFirebaseEmail(
+        email: email,
+        password: password,
+      );
+      if (!mounted) {
+        return;
+      }
+      Navigator.of(context).pushReplacementNamed(_homeRoute(widget.appState));
     } on AuthException catch (error) {
       if (!mounted) {
         return;
@@ -1282,8 +1297,8 @@ class _VerifyEmailScreenState extends State<VerifyEmailScreen> {
                   _verified
                       ? 'Your account is verified. You can sign in and start using Egg System.'
                       : widget.email == null
-                      ? 'Open the Gmail message from Egg System and type the 6-digit code. It stays valid for one hour.'
-                      : 'We sent the code to ${widget.email}. Type the 6 digits from that Gmail message. It stays valid for one hour.',
+                      ? 'Open your Gmail for the Egg System message. Enter the 6-digit code, or open the verification link then tap Continue below.'
+                      : 'We emailed ${widget.email}. Enter the 6-digit code from Gmail, or open the verification link in that message then tap “I opened the Gmail link”.',
                   textAlign: TextAlign.center,
                   style: const TextStyle(
                     color: _AuthPalette.mutedForeground,
@@ -1346,8 +1361,15 @@ class _VerifyEmailScreenState extends State<VerifyEmailScreen> {
             TextButton(
               onPressed: _submitting ? null : _resend,
               child: const Text(
-                'Resend 6-digit code',
+                'Resend code to Gmail',
                 style: TextStyle(color: _AuthPalette.mutedForeground),
+              ),
+            ),
+            TextButton(
+              onPressed: _submitting ? null : _confirmGmailLink,
+              child: const Text(
+                'I opened the Gmail link',
+                style: TextStyle(color: _AuthPalette.primary),
               ),
             ),
           ],
@@ -1611,61 +1633,6 @@ class _AuthFormScaffold extends StatelessWidget {
   }
 }
 
-class _GoogleMark extends StatelessWidget {
-  const _GoogleMark();
-
-  @override
-  Widget build(BuildContext context) {
-    return const SizedBox(
-      width: 18,
-      height: 18,
-      child: CustomPaint(painter: _GoogleLogoPainter()),
-    );
-  }
-}
-
-class _GoogleLogoPainter extends CustomPainter {
-  const _GoogleLogoPainter();
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final double stroke = size.width * 0.18;
-    final Rect ring = Rect.fromLTWH(
-      stroke / 2,
-      stroke / 2,
-      size.width - stroke,
-      size.height - stroke,
-    );
-    final Paint paint = Paint()
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = stroke
-      ..strokeCap = StrokeCap.butt;
-
-    paint.color = const Color(0xFFEA4335);
-    canvas.drawArc(ring, -1.35, 1.15, false, paint);
-    paint.color = const Color(0xFFFBBC05);
-    canvas.drawArc(ring, -0.15, 1.05, false, paint);
-    paint.color = const Color(0xFF34A853);
-    canvas.drawArc(ring, 0.95, 1.15, false, paint);
-    paint.color = const Color(0xFF4285F4);
-    canvas.drawArc(ring, 2.15, 1.55, false, paint);
-
-    paint
-      ..style = PaintingStyle.fill
-      ..color = const Color(0xFF4285F4);
-    canvas.drawRRect(
-      RRect.fromRectAndRadius(
-        Rect.fromLTWH(size.width * 0.46, size.height * 0.40, size.width * 0.5, stroke),
-        const Radius.circular(1),
-      ),
-      paint,
-    );
-  }
-
-  @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
-}
-
 class _AuthTextField extends StatelessWidget {
   const _AuthTextField({
     required this.controller,
@@ -1735,140 +1702,6 @@ class _AuthTextField extends StatelessWidget {
   }
 }
 
-class EggClassificationScreen extends StatefulWidget {
-  const EggClassificationScreen({super.key, required this.appState});
-
-  final AppState appState;
-
-  @override
-  State<EggClassificationScreen> createState() =>
-      _EggClassificationScreenState();
-}
-
-class _EggClassificationScreenState extends State<EggClassificationScreen> {
-  Interpreter? _interpreter;
-  String _prediction = 'No prediction yet';
-  bool _isLoading = true;
-
-  @override
-  void initState() {
-    super.initState();
-    _loadModel();
-  }
-
-  Future<void> _loadModel() async {
-    try {
-      if (kIsWeb) {
-        setState(() {
-          _prediction = 'Model loading is not supported on web.';
-          _isLoading = false;
-        });
-        return;
-      }
-
-      final interpreter = await Interpreter.fromAsset(
-        'models/egg_model.tflite',
-      );
-      setState(() {
-        _interpreter = interpreter;
-        _isLoading = false;
-      });
-    } catch (e) {
-      setState(() {
-        _prediction = 'Failed to load model';
-        _isLoading = false;
-      });
-    }
-  }
-
-  Future<void> _classifySampleImage() async {
-    if (_interpreter == null) {
-      setState(() => _prediction = 'Interpreter unavailable on this platform.');
-      return;
-    }
-
-    final data = await rootBundle.load('assets/models/labels.txt');
-    final labels = String.fromCharCodes(data.buffer.asUint8List()).split('\n');
-
-    final bytes = await rootBundle.load('assets/egg-logo.png');
-    final original = img.decodeImage(bytes.buffer.asUint8List());
-    if (original == null) {
-      setState(() => _prediction = 'Failed to decode image');
-      return;
-    }
-
-    final resized = img.copyResize(original, width: 224, height: 224);
-    final input = List.generate(
-      1,
-      (_) => List.generate(
-        224,
-        (_) => List.generate(224, (_) => List.filled(3, 0.0)),
-      ),
-    );
-    for (var y = 0; y < 224; y++) {
-      for (var x = 0; x < 224; x++) {
-        final pixel = resized.getPixel(x, y);
-        final int px = pixel as int;
-        input[0][y][x][0] = ((px >> 16) & 0xFF) / 255.0;
-        input[0][y][x][1] = ((px >> 8) & 0xFF) / 255.0;
-        input[0][y][x][2] = (px & 0xFF) / 255.0;
-      }
-    }
-
-    final output = List<List<double>>.generate(
-      1,
-      (_) => List<double>.filled(labels.length, 0.0),
-    );
-    _interpreter!.run(input, output);
-
-    final List<double> scores = List<double>.from(output[0]);
-    final maxIndex = scores.indexOf(scores.reduce((a, b) => a > b ? a : b));
-    setState(() {
-      _prediction =
-          '${labels[maxIndex]} (score ${scores[maxIndex].toStringAsFixed(2)})';
-    });
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final bool webUnsupported = kIsWeb;
-    return Scaffold(
-      appBar: AppBar(title: const Text('Egg Classifier')),
-      body: Padding(
-        padding: const EdgeInsets.all(24.0),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: <Widget>[
-            if (_isLoading) ...[
-              const LinearProgressIndicator(),
-              const SizedBox(height: 24),
-              const Text('Loading model...'),
-            ] else ...[
-              Text(_prediction, style: Theme.of(context).textTheme.titleLarge),
-              const SizedBox(height: 16),
-              if (webUnsupported) ...[
-                const Text(
-                  'This classifier is not supported in Chrome/web. Use Android, iOS, Windows, or Linux instead.',
-                  style: TextStyle(fontSize: 16),
-                ),
-                const SizedBox(height: 24),
-              ],
-              ElevatedButton(
-                onPressed: webUnsupported ? null : _classifySampleImage,
-                child: Text(
-                  webUnsupported
-                      ? 'Unavailable on Web'
-                      : 'Classify sample egg image',
-                ),
-              ),
-            ],
-          ],
-        ),
-      ),
-    );
-  }
-}
-
 class _AuthPalette {
   static const Color foreground = Color(0xFFF6F1E7);
   static const Color mutedForeground = Color(0xFFB4A79A);
@@ -1879,8 +1712,6 @@ class _AuthPalette {
   static const Color tabBackground = Color(0x663D342D);
   static const Color glassBackground = Color(0xF22F2721);
   static const Color glassBorder = Color(0x26F6F1E7);
-  static const Color featureBackground = Color(0x7F3B312B);
-  static const Color featureBorder = Color(0x19F6F1E7);
   static const Color overlayTop = Color(0xB81D140F);
   static const Color overlayBottom = Color(0xD1261B14);
 }
@@ -1973,21 +1804,50 @@ class _SeriesPoint {
   final double value;
 }
 
-class _SalesLossPoint {
-  const _SalesLossPoint(this.label, this.sales, this.losses);
-  final String label;
-  final double sales;
-  final double losses;
-}
-
-class DashboardScreen extends StatelessWidget {
+class DashboardScreen extends StatefulWidget {
   const DashboardScreen({super.key, required this.appState});
 
   final AppState appState;
 
   @override
+  State<DashboardScreen> createState() => _DashboardScreenState();
+}
+
+class _DashboardScreenState extends State<DashboardScreen> {
+  @override
+  void initState() {
+    super.initState();
+    widget.appState.addListener(_onAppState);
+  }
+
+  @override
+  void didUpdateWidget(DashboardScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.appState != widget.appState) {
+      oldWidget.appState.removeListener(_onAppState);
+      widget.appState.addListener(_onAppState);
+    }
+  }
+
+  @override
+  void dispose() {
+    widget.appState.removeListener(_onAppState);
+    super.dispose();
+  }
+
+  void _onAppState() {
+    if (mounted) {
+      setState(() {});
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final DemoUser user = appState.currentUser!;
+    final AppState appState = widget.appState;
+    final DemoUser? user = appState.currentUser;
+    if (user == null || !appState.isAuthenticated) {
+      return AuthRequiredScreen(requestedPath: AppPaths.dashboard);
+    }
     final bool isWorker = !appState.isAdmin;
 
     // ── Worker stat cards — driven by live AppState data ──────────────────
@@ -1995,7 +1855,10 @@ class DashboardScreen extends StatelessWidget {
         ? <_DashboardStat>[
             _DashboardStat(
               label: 'Today\'s Collection',
-              value: appState.workerTodayCollection.toString(),
+              value: (appState.workerTodayCollection > 0
+                      ? appState.workerTodayCollection
+                      : appState.todayProductionTotal)
+                  .toString(),
               unit: 'Eggs Collected',
               icon: Icons.trending_up_rounded,
               accent: _DashboardPalette.success,
@@ -2004,7 +1867,7 @@ class DashboardScreen extends StatelessWidget {
             _DashboardStat(
               label: 'Grading Progress',
               value:
-                  '${appState.liveGoodEggs > 0 ? ((appState.liveGoodEggs / (appState.liveGoodEggs + appState.liveCrackedEggs + appState.liveDirtyEggs).clamp(1, 999999)) * 100).toStringAsFixed(0) : '0'}%',
+                  '${appState.liveGoodEggs > 0 ? ((appState.liveGoodEggs / (appState.liveGoodEggs + appState.liveCrackedEggs).clamp(1, 999999)) * 100).toStringAsFixed(0) : '0'}%',
               unit: 'Good Quality',
               icon: Icons.fact_check_outlined,
               accent: _DashboardPalette.primary,
@@ -2018,16 +1881,6 @@ class DashboardScreen extends StatelessWidget {
               accent: _DashboardPalette.warning,
               route: AppPaths.grading,
             ),
-            _DashboardStat(
-              label: 'Pending Tasks',
-              value: appState.workerPendingTaskCount.toString(),
-              unit: 'To complete',
-              icon: Icons.list_alt_rounded,
-              accent: appState.workerPendingTaskCount > 0
-                  ? _DashboardPalette.warning
-                  : _DashboardPalette.success,
-              route: AppPaths.dashboard,
-            ),
           ]
         : <_DashboardStat>[
             _DashboardStat(
@@ -2040,15 +1893,19 @@ class DashboardScreen extends StatelessWidget {
             ),
             _DashboardStat(
               label: 'Today\'s Sales',
-              value: '₱0',
-              unit: 'Eggs Sold',
+              value: appState.todaySalesEggCount > 0
+                  ? '₱${appState.todaySalesRevenue.toStringAsFixed(0)}'
+                  : '₱0',
+              unit: appState.todaySalesEggCount > 0
+                  ? '${appState.todaySalesEggCount} eggs sold'
+                  : 'Eggs Sold',
               icon: Icons.payments_outlined,
               accent: _DashboardPalette.primary,
               route: AppPaths.inventory,
             ),
             _DashboardStat(
               label: 'Damaged / Rejected',
-              value: '${appState.liveCrackedEggs + appState.liveDirtyEggs}',
+              value: '${appState.liveCrackedEggs}',
               unit: 'Eggs Today',
               icon: Icons.warning_amber_rounded,
               accent: _DashboardPalette.warning,
@@ -2135,25 +1992,23 @@ class DashboardScreen extends StatelessWidget {
               const SizedBox(height: 16),
               const _DashboardHeading('Modules'),
               links,
-              if (isWorker) ...<Widget>[
+              const SizedBox(height: 16),
+              if (split)
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    Expanded(flex: 7, child: inspect),
+                    const SizedBox(width: 16),
+                    Expanded(
+                      flex: 5,
+                      child: _WorkerNotificationCard(appState: appState),
+                    ),
+                  ],
+                )
+              else ...<Widget>[
+                inspect,
                 const SizedBox(height: 16),
-                if (split)
-                  Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: <Widget>[
-                      Expanded(flex: 7, child: inspect),
-                      const SizedBox(width: 16),
-                      Expanded(
-                        flex: 5,
-                        child: _WorkerDashboardPanels(appState: appState),
-                      ),
-                    ],
-                  )
-                else ...<Widget>[
-                  inspect,
-                  const SizedBox(height: 16),
-                  _WorkerDashboardPanels(appState: appState),
-                ],
+                _WorkerNotificationCard(appState: appState),
               ],
               const SizedBox(height: 10),
               zoneLine,
@@ -2233,15 +2088,19 @@ class _AdminDashboardBodyState extends State<_AdminDashboardBody> {
       ),
       _DashboardStat(
         label: 'Today\'s Sales',
-        value: '₱0',
-        unit: 'Eggs Sold',
+        value: appState.todaySalesEggCount > 0
+            ? '₱${appState.todaySalesRevenue.toStringAsFixed(0)}'
+            : '₱0',
+        unit: appState.todaySalesEggCount > 0
+            ? '${appState.todaySalesEggCount} eggs sold'
+            : 'Eggs Sold',
         icon: Icons.payments_outlined,
         accent: _DashboardPalette.primary,
         route: AppPaths.inventory,
       ),
       _DashboardStat(
         label: 'Damaged / Rejected',
-        value: '${appState.liveCrackedEggs + appState.liveDirtyEggs}',
+        value: '${appState.liveCrackedEggs}',
         unit: 'Eggs Today',
         icon: Icons.warning_amber_rounded,
         accent: _DashboardPalette.warning,
@@ -2271,7 +2130,11 @@ class _AdminDashboardBodyState extends State<_AdminDashboardBody> {
         const SizedBox(height: 16),
         Align(
           alignment: Alignment.centerLeft,
-          child: _LiveCameraStream(appState: appState),
+          child: _LiveCameraStream(
+            appState: appState,
+            // Cloudflare cancels long /stream MJPEG; poll /live.jpg instead.
+            pollSnapshots: true,
+          ),
         ),
       ],
     );
@@ -4337,43 +4200,115 @@ class InventoryScreen extends StatefulWidget {
 }
 
 class _InventoryScreenState extends State<InventoryScreen> {
-  static const int _maxMovementQuantity = 100000;
-  static const int _maxDeviceIdLength = 64;
-  static const int _maxDeviceNameLength = 100;
-
-  final TextEditingController _movementQtyController = TextEditingController();
-  final TextEditingController _deviceIdController = TextEditingController();
-  final TextEditingController _deviceNameController = TextEditingController();
+  final TextEditingController _todayTraysController = TextEditingController();
 
   late List<InventoryItem> _items;
   late List<InventoryZone> _zones;
   late List<InventoryMovement> _movements;
-  late List<InventoryDevice> _devices;
-  InventoryItem? _selectedItem;
-  String _movementType = 'stock_out';
   String _zoneFilter = 'all';
-  String _deviceZone = 'none';
-  bool _showDeviceForm = false;
-  String? _issuedSecret;
-  Map<String, String> _movementErrors = <String, String>{};
-  Map<String, String> _deviceErrors = <String, String>{};
 
   @override
   void initState() {
     super.initState();
+    widget.appState.addListener(_onAppState);
+    _reloadFromAppState();
+    if (widget.appState.hasTodayTrayStock) {
+      _todayTraysController.text = '${widget.appState.todayTrayStockSet}';
+    } else if (widget.appState.availableTrays > 0) {
+      _todayTraysController.text = '${widget.appState.availableTrays}';
+    }
+  }
+
+  void _onAppState() {
+    if (!mounted) {
+      return;
+    }
+    setState(_reloadFromAppState);
+  }
+
+  void _reloadFromAppState() {
     _items = List<InventoryItem>.from(widget.appState.inventoryItems);
     _zones = List<InventoryZone>.from(widget.appState.inventoryZones);
     _movements = List<InventoryMovement>.from(
       widget.appState.inventoryMovements,
     );
-    _devices = List<InventoryDevice>.from(widget.appState.inventoryDevices);
+  }
+
+  void _saveTodayTrays() {
+    final int? trays = int.tryParse(_todayTraysController.text.trim());
+    if (trays == null || trays < 0) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Enter how many trays are available today.')),
+      );
+      return;
+    }
+    widget.appState.setTodayTrayStock(trays);
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          'Saved $trays tray(s) for today (${trays * 30} eggs). Sellers will see this stock.',
+        ),
+      ),
+    );
+  }
+
+  Future<void> _deleteTodayTrays() async {
+    final bool hasStock = widget.appState.availableTrays > 0 ||
+        widget.appState.availableSellableEggs > 0 ||
+        widget.appState.hasTodayTrayStock;
+    if (!hasStock) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('No tray stock to delete.')),
+      );
+      return;
+    }
+    final bool? confirmed = await showDialog<bool>(
+      context: context,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          backgroundColor: const Color(0xFF241C16),
+          title: const Text(
+            'Delete today\'s trays permanently?',
+            style: TextStyle(color: _DashboardPalette.foreground),
+          ),
+          content: Text(
+            'This hard-deletes today\'s tray stock '
+            '(${widget.appState.availableTrays} trays / '
+            '${widget.appState.availableSellableEggs} eggs) from the app and farm database. '
+            'Sellers will see 0 available.',
+            style: const TextStyle(color: _DashboardPalette.mutedForeground),
+          ),
+          actions: <Widget>[
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              style: FilledButton.styleFrom(
+                backgroundColor: const Color(0xFFDC2626),
+                foregroundColor: Colors.white,
+              ),
+              child: const Text('Delete'),
+            ),
+          ],
+        );
+      },
+    );
+    if (confirmed != true || !mounted) {
+      return;
+    }
+    widget.appState.deleteTodayTrayStock();
+    _todayTraysController.clear();
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Today\'s trays permanently deleted.')),
+    );
   }
 
   @override
   void dispose() {
-    _movementQtyController.dispose();
-    _deviceIdController.dispose();
-    _deviceNameController.dispose();
+    widget.appState.removeListener(_onAppState);
+    _todayTraysController.dispose();
     super.dispose();
   }
 
@@ -4397,15 +4332,6 @@ class _InventoryScreenState extends State<InventoryScreen> {
         .where(
           (InventoryMovement movement) => itemIds.contains(movement.itemId),
         )
-        .toList();
-  }
-
-  List<InventoryDevice> get _visibleDevices {
-    if (_zoneFilter == 'all') {
-      return _devices;
-    }
-    return _devices
-        .where((InventoryDevice device) => device.zoneId == _zoneFilter)
         .toList();
   }
 
@@ -4433,18 +4359,6 @@ class _InventoryScreenState extends State<InventoryScreen> {
     return ((used / max) * 100).round();
   }
 
-  int get _activeDeviceCount =>
-      _visibleDevices.where((InventoryDevice device) => device.isActive).length;
-
-  InventoryZone? _zoneById(String? zoneId) {
-    for (final InventoryZone zone in _zones) {
-      if (zone.id == zoneId) {
-        return zone;
-      }
-    }
-    return null;
-  }
-
   InventoryItem? _itemById(String itemId) {
     for (final InventoryItem item in _items) {
       if (item.id == itemId) {
@@ -4454,214 +4368,8 @@ class _InventoryScreenState extends State<InventoryScreen> {
     return null;
   }
 
-  void _openMovement(InventoryItem item, String type) {
-    setState(() {
-      _selectedItem = item;
-      _movementType = type;
-      _movementQtyController.clear();
-      _movementErrors = <String, String>{};
-    });
-  }
-
-  void _closeMovement() {
-    setState(() {
-      _selectedItem = null;
-      _movementErrors = <String, String>{};
-      _movementQtyController.clear();
-    });
-  }
-
-  void _submitMovement() {
-    final InventoryItem? item = _selectedItem;
-    if (item == null) {
-      return;
-    }
-
-    final Map<String, String> errors = <String, String>{};
-    final int? quantity = int.tryParse(_movementQtyController.text.trim());
-
-    if (quantity == null || quantity <= 0) {
-      errors['quantity'] = 'Enter a valid quantity';
-    } else if (quantity > _maxMovementQuantity) {
-      errors['quantity'] = 'Max $_maxMovementQuantity';
-    }
-
-    final bool incoming =
-        _movementType == 'stock_in' || _movementType == 'refill';
-    if (quantity != null && !incoming && quantity > item.quantity) {
-      errors['quantity'] = 'Not enough stock available';
-    }
-    if (quantity != null &&
-        incoming &&
-        item.quantity + quantity > item.maxCapacity) {
-      errors['quantity'] = 'Exceeds max capacity of ${item.maxCapacity}';
-    }
-
-    if (errors.isNotEmpty) {
-      setState(() => _movementErrors = errors);
-      return;
-    }
-
-    final int delta = incoming ? quantity! : -quantity!;
-    final int nextQuantity = item.quantity + delta;
-    final DateTime now = DateTime.now();
-    final InventoryItem updatedItem = InventoryItem(
-      id: item.id,
-      name: item.name,
-      sku: item.sku,
-      category: item.category,
-      zoneId: item.zoneId,
-      quantity: nextQuantity,
-      minThreshold: item.minThreshold,
-      maxCapacity: item.maxCapacity,
-      unit: item.unit,
-    );
-    final InventoryMovement movement = InventoryMovement(
-      id: 'mov-${now.microsecondsSinceEpoch}',
-      itemId: item.id,
-      movementType: _movementType,
-      source: 'user',
-      quantityDelta: delta,
-      quantityAfter: nextQuantity,
-      timestamp: _formatInventoryTimestamp(now),
-      note: incoming
-          ? 'Manual ${_movementTypeLabel(_movementType).toLowerCase()} recorded'
-          : 'Manual ${_movementTypeLabel(_movementType).toLowerCase()} dispatched',
-    );
-
-    setState(() {
-      _items = _items
-          .map(
-            (InventoryItem entry) => entry.id == item.id ? updatedItem : entry,
-          )
-          .toList();
-      _movements = <InventoryMovement>[movement, ..._movements];
-      _selectedItem = null;
-      _movementQtyController.clear();
-      _movementErrors = <String, String>{};
-    });
-    _persistInventory();
-  }
-
-  void _simulateIot(InventoryItem item) {
-    final int quantity = item.quantity >= 25 ? 25 : item.quantity;
-    if (quantity == 0) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Item is empty and cannot simulate release'),
-        ),
-      );
-      return;
-    }
-
-    final int nextQuantity = item.quantity - quantity;
-    final DateTime now = DateTime.now();
-    final InventoryItem updatedItem = InventoryItem(
-      id: item.id,
-      name: item.name,
-      sku: item.sku,
-      category: item.category,
-      zoneId: item.zoneId,
-      quantity: nextQuantity,
-      minThreshold: item.minThreshold,
-      maxCapacity: item.maxCapacity,
-      unit: item.unit,
-    );
-    final InventoryMovement movement = InventoryMovement(
-      id: 'mov-${now.microsecondsSinceEpoch}',
-      itemId: item.id,
-      movementType: 'release',
-      source: 'iot_device',
-      quantityDelta: -quantity,
-      quantityAfter: nextQuantity,
-      timestamp: _formatInventoryTimestamp(now),
-      note: 'Simulated IoT release event',
-    );
-
-    setState(() {
-      _items = _items
-          .map(
-            (InventoryItem entry) => entry.id == item.id ? updatedItem : entry,
-          )
-          .toList();
-      _movements = <InventoryMovement>[movement, ..._movements];
-    });
-    _persistInventory();
-
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('Simulated IoT release for ${item.name}')),
-    );
-  }
-
-  void _toggleDeviceForm() {
-    setState(() {
-      _showDeviceForm = !_showDeviceForm;
-      if (!_showDeviceForm) {
-        _deviceErrors = <String, String>{};
-        _issuedSecret = null;
-      }
-    });
-  }
-
-  void _registerDevice() {
-    final Map<String, String> errors = <String, String>{};
-    final String deviceId = _deviceIdController.text.trim();
-    final String deviceName = _deviceNameController.text.trim();
-
-    if (deviceId.isEmpty) {
-      errors['deviceId'] = 'Enter a unique device ID';
-    } else if (deviceId.length > _maxDeviceIdLength) {
-      errors['deviceId'] = 'Max $_maxDeviceIdLength characters';
-    } else if (_devices.any(
-      (InventoryDevice item) => item.deviceId == deviceId,
-    )) {
-      errors['deviceId'] = 'Device ID already exists';
-    }
-
-    if (deviceName.isEmpty) {
-      errors['deviceName'] = 'Enter a display name';
-    } else if (deviceName.length > _maxDeviceNameLength) {
-      errors['deviceName'] = 'Max $_maxDeviceNameLength characters';
-    }
-
-    if (errors.isNotEmpty) {
-      setState(() => _deviceErrors = errors);
-      return;
-    }
-
-    final DateTime now = DateTime.now();
-    final InventoryDevice device = InventoryDevice(
-      id: 'device-${now.microsecondsSinceEpoch}',
-      deviceId: deviceId,
-      name: deviceName,
-      zoneId: _deviceZone == 'none' ? null : _deviceZone,
-      isActive: true,
-      lastSeenLabel: 'Just now',
-    );
-
-    setState(() {
-      _devices = <InventoryDevice>[device, ..._devices];
-      _issuedSecret = _generateDeviceSecret(deviceId, now);
-      _deviceErrors = <String, String>{};
-      _deviceIdController.clear();
-      _deviceNameController.clear();
-      _deviceZone = 'none';
-    });
-    _persistInventory();
-  }
-
-  void _persistInventory() {
-    widget.appState.replaceInventoryState(
-      items: _items,
-      movements: _movements,
-      devices: _devices,
-      zones: _zones,
-    );
-  }
-
   @override
   Widget build(BuildContext context) {
-    final bool narrow = MediaQuery.sizeOf(context).width < 860;
     final List<_ProductionStat> stats = <_ProductionStat>[
       _ProductionStat(
         icon: Icons.inventory_2_outlined,
@@ -4735,6 +4443,186 @@ class _InventoryScreenState extends State<InventoryScreen> {
           ),
           const SizedBox(height: 18),
           _ProductionStatGrid(stats: stats),
+          const SizedBox(height: 18),
+          _GlassSection(
+            title: 'Trays available for sale today',
+            titleIcon: Icons.egg_alt_outlined,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: <Widget>[
+                const Text(
+                  'Enter how many trays the seller can sell today. '
+                  '1 tray = 30 eggs. This updates inventory and shows on the seller screen.',
+                  style: TextStyle(
+                    color: _DashboardPalette.mutedForeground,
+                    height: 1.4,
+                  ),
+                ),
+                const SizedBox(height: 14),
+                LayoutBuilder(
+                  builder: (BuildContext context, BoxConstraints constraints) {
+                    final bool stacked = constraints.maxWidth < 560;
+                    final Widget field = TextField(
+                      controller: _todayTraysController,
+                      keyboardType: TextInputType.number,
+                      style: const TextStyle(
+                        color: _DashboardPalette.foreground,
+                      ),
+                      cursorColor: _DashboardPalette.primary,
+                      decoration: InputDecoration(
+                        labelText: 'Trays for today',
+                        labelStyle: const TextStyle(
+                          color: _DashboardPalette.mutedForeground,
+                        ),
+                        hintText: 'e.g. 10',
+                        hintStyle: const TextStyle(color: Color(0xFFB7AA9A)),
+                        filled: true,
+                        fillColor: const Color(0xFF3A322B),
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(12),
+                          borderSide: const BorderSide(color: Color(0xFF4A4038)),
+                        ),
+                        enabledBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(12),
+                          borderSide: const BorderSide(color: Color(0xFF4A4038)),
+                        ),
+                      ),
+                    );
+                    final Widget saveButton = FilledButton.icon(
+                      onPressed: _saveTodayTrays,
+                      icon: const Icon(Icons.save_outlined),
+                      label: const Text('Save for sellers'),
+                      style: FilledButton.styleFrom(
+                        backgroundColor: _DashboardPalette.primary,
+                        foregroundColor: const Color(0xFF2A2118),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 18,
+                          vertical: 16,
+                        ),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                      ),
+                    );
+                    final Widget deleteButton = OutlinedButton.icon(
+                      onPressed: _deleteTodayTrays,
+                      icon: const Icon(Icons.delete_outline_rounded),
+                      label: const Text('Delete trays'),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: const Color(0xFFDC2626),
+                        side: const BorderSide(color: Color(0xFFDC2626)),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 18,
+                          vertical: 16,
+                        ),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                      ),
+                    );
+                    if (stacked) {
+                      return Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: <Widget>[
+                          field,
+                          const SizedBox(height: 12),
+                          saveButton,
+                          const SizedBox(height: 10),
+                          deleteButton,
+                        ],
+                      );
+                    }
+                    return Row(
+                      children: <Widget>[
+                        Expanded(child: field),
+                        const SizedBox(width: 12),
+                        saveButton,
+                        const SizedBox(width: 10),
+                        deleteButton,
+                      ],
+                    );
+                  },
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  widget.appState.hasTodayTrayStock
+                      ? 'Today: ${widget.appState.todayTrayStockSet} trays set · '
+                          '${widget.appState.availableTrays} trays left · '
+                          '${widget.appState.availableSellableEggs} eggs left'
+                      : 'No trays set for today yet. '
+                          'Current stock: ${widget.appState.availableTrays} trays · '
+                          '${widget.appState.availableSellableEggs} sellable eggs.',
+                  style: const TextStyle(
+                    color: _DashboardPalette.foreground,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 18),
+          _GlassSection(
+            title: 'Stock on hand',
+            titleIcon: Icons.inventory_2_outlined,
+            child: _items.isEmpty
+                ? const Text(
+                    'No inventory items.',
+                    style: TextStyle(color: _DashboardPalette.mutedForeground),
+                  )
+                : Column(
+                    children: <Widget>[
+                      for (final InventoryItem item in _visibleItems)
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 10),
+                          child: Container(
+                            padding: const EdgeInsets.all(14),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF241C16),
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(
+                                color: const Color(0xFF4A4038),
+                              ),
+                            ),
+                            child: Row(
+                              children: <Widget>[
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: <Widget>[
+                                      Text(
+                                        item.name,
+                                        style: const TextStyle(
+                                          color: _DashboardPalette.foreground,
+                                          fontWeight: FontWeight.w700,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 2),
+                                      Text(
+                                        '${item.sku} · ${item.category}',
+                                        style: const TextStyle(
+                                          color:
+                                              _DashboardPalette.mutedForeground,
+                                          fontSize: 12,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                Text(
+                                  '${item.quantity} ${item.unit}',
+                                  style: const TextStyle(
+                                    color: _DashboardPalette.primary,
+                                    fontWeight: FontWeight.w800,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
+          ),
           const SizedBox(height: 18),
           _GlassSection(
             title: 'Zone Scope',
@@ -4959,20 +4847,6 @@ Color _movementTypeColor(String movementType) {
   }
 }
 
-String _formatInventoryTimestamp(DateTime value) {
-  final String year = value.year.toString().padLeft(4, '0');
-  final String month = value.month.toString().padLeft(2, '0');
-  final String day = value.day.toString().padLeft(2, '0');
-  final String hour = value.hour.toString().padLeft(2, '0');
-  final String minute = value.minute.toString().padLeft(2, '0');
-  return '$year-$month-$day $hour:$minute';
-}
-
-String _generateDeviceSecret(String deviceId, DateTime value) {
-  final String stamp = value.microsecondsSinceEpoch.toRadixString(16);
-  return 'egg-$deviceId-$stamp';
-}
-
 enum _ReportPeriod { daily, weekly, monthly }
 
 class ReportsScreen extends StatefulWidget {
@@ -4990,13 +4864,33 @@ class _ReportsScreenState extends State<ReportsScreen> {
   String? _lastExportFileName;
 
   String get _periodLabel {
+    final DateTime now = DateTime.now();
+    String mon(int m) {
+      const List<String> names = <String>[
+        'Jan',
+        'Feb',
+        'Mar',
+        'Apr',
+        'May',
+        'Jun',
+        'Jul',
+        'Aug',
+        'Sep',
+        'Oct',
+        'Nov',
+        'Dec',
+      ];
+      return names[m - 1];
+    }
+
     switch (_selectedPeriod) {
       case _ReportPeriod.daily:
-        return 'April 15, 2026';
+        return '${mon(now.month)} ${now.day}, ${now.year}';
       case _ReportPeriod.weekly:
-        return 'Apr 09 - Apr 15, 2026';
+        final DateTime start = now.subtract(const Duration(days: 6));
+        return '${mon(start.month)} ${start.day} - ${mon(now.month)} ${now.day}, ${now.year}';
       case _ReportPeriod.monthly:
-        return 'April 2026';
+        return '${mon(now.month)} ${now.year}';
     }
   }
 
@@ -5025,7 +4919,72 @@ class _ReportsScreenState extends State<ReportsScreen> {
     }
   }
 
+  bool get _sellerMode => widget.appState.isSales;
+
+  DateTime get _periodStart {
+    final DateTime now = DateTime.now();
+    final DateTime today = DateTime(now.year, now.month, now.day);
+    switch (_selectedPeriod) {
+      case _ReportPeriod.daily:
+        return today;
+      case _ReportPeriod.weekly:
+        return today.subtract(const Duration(days: 6));
+      case _ReportPeriod.monthly:
+        return DateTime(now.year, now.month, 1);
+    }
+  }
+
+  List<EggSale> get _salesInPeriod {
+    final DateTime start = _periodStart;
+    return widget.appState.eggSales.where((EggSale sale) {
+      final DateTime? parsed = DateTime.tryParse(sale.createdAt);
+      if (parsed == null) {
+        return false;
+      }
+      final DateTime local = parsed.toLocal();
+      final DateTime day = DateTime(local.year, local.month, local.day);
+      return !day.isBefore(start);
+    }).toList();
+  }
+
+  String _csvEscape(String value) {
+    final String safe = value.replaceAll('"', '""');
+    if (safe.contains(',') || safe.contains('"') || safe.contains('\n')) {
+      return '"$safe"';
+    }
+    return safe;
+  }
+
   String get _exportPreview {
+    if (_sellerMode) {
+      final List<String> lines = <String>[
+        'Date,Time,SoldBy,Size,Quantity,EggCount,UnitPrice,Total,Buyer,Seller',
+        ..._salesInPeriod.map((EggSale sale) {
+          final DateTime? parsed = DateTime.tryParse(sale.createdAt)?.toLocal();
+          final String date = parsed == null
+              ? ''
+              : '${parsed.year}-${parsed.month.toString().padLeft(2, '0')}-${parsed.day.toString().padLeft(2, '0')}';
+          final String time = parsed == null
+              ? ''
+              : '${parsed.hour.toString().padLeft(2, '0')}:${parsed.minute.toString().padLeft(2, '0')}';
+          return <String>[
+            date,
+            time,
+            sale.perTray ? 'tray' : 'piece',
+            _csvEscape(sale.size),
+            '${sale.quantity}',
+            '${sale.eggCount}',
+            sale.unitPrice.toStringAsFixed(2),
+            sale.total.toStringAsFixed(2),
+            _csvEscape(sale.buyer),
+            _csvEscape(
+              sale.sellerName.isNotEmpty ? sale.sellerName : sale.sellerEmail,
+            ),
+          ].join(',');
+        }),
+      ];
+      return lines.join('\n');
+    }
     final List<ReportTrendPoint> rows = _trendPoints;
     final List<String> csvLines = <String>[
       'Date,Production,Sales,Losses,Graded,Collected',
@@ -5039,10 +4998,31 @@ class _ReportsScreenState extends State<ReportsScreen> {
   }
 
   void _exportCsv() {
-    final String fileName = 'egg-report-$_periodName-2026-04-15.csv';
+    final DateTime now = DateTime.now();
+    final String stamp =
+        '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
+    final String fileName = _sellerMode
+        ? 'egg-sales-report-$_periodName-$stamp.csv'
+        : 'egg-report-$_periodName-$stamp.csv';
+    final String csv = _exportPreview;
+    final bool empty = _sellerMode
+        ? _salesInPeriod.isEmpty
+        : _trendPoints.isEmpty;
     setState(() => _lastExportFileName = fileName);
+    if (!empty) {
+      downloadTextFile(fileName, '$csv\n');
+    }
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('Prepared local export preview: $fileName')),
+      SnackBar(
+        content: Text(
+          empty
+              ? (_sellerMode
+                  ? 'No sales in this period yet — record a sale first.'
+                  : 'No rows to export yet — log production or wait for live eggs.')
+              : 'Downloaded $fileName'
+                  '${_sellerMode ? ' (${_salesInPeriod.length} sale(s))' : ' (${_trendPoints.length} day(s))'}.',
+        ),
+      ),
     );
   }
 
@@ -5136,7 +5116,9 @@ class _ReportsScreenState extends State<ReportsScreen> {
                     ),
                     const SizedBox(height: 4),
                     Text(
-                      'Exportable daily, weekly, and monthly admin summaries',
+                      _sellerMode
+                          ? 'Generate and download daily, weekly, or monthly sales reports'
+                          : 'Exportable daily, weekly, and monthly admin summaries',
                       style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                         color: _DashboardPalette.mutedForeground,
                       ),
@@ -5158,7 +5140,7 @@ class _ReportsScreenState extends State<ReportsScreen> {
                   ),
                 ),
                 icon: const Icon(Icons.download_rounded),
-                label: const Text('Export CSV'),
+                label: Text(_sellerMode ? 'Generate / Download' : 'Export CSV'),
               ),
             ],
           ),
@@ -5258,9 +5240,10 @@ class _ReportsScreenState extends State<ReportsScreen> {
                       title: 'Export Preview',
                       titleIcon: Icons.description_outlined,
                       child: _ReportsExportPreview(
-                        fileName:
-                            _lastExportFileName ??
-                            'egg-report-$_periodName-2026-04-15.csv',
+                        fileName: _lastExportFileName ??
+                            (_sellerMode
+                                ? 'egg-sales-report-$_periodName.csv'
+                                : 'egg-report-$_periodName.csv'),
                         csvPreview: _exportPreview,
                       ),
                     ),
@@ -5894,13 +5877,11 @@ class _EggSalesScreenState extends State<EggSalesScreen> {
     'Large',
     'Extra Large',
   ];
-  static const List<String> _payments = <String>['Cash', 'GCash', 'Credit'];
   static const List<int> _quickAmounts = <int>[1, 2, 5, 10];
 
   bool _perTray = true;
   String _size = 'Extra Large';
   int _quantity = 1;
-  String _payment = 'Cash';
   String? _error;
   final TextEditingController _priceController = TextEditingController();
   final TextEditingController _buyerController = TextEditingController();
@@ -5953,6 +5934,22 @@ class _EggSalesScreenState extends State<EggSalesScreen> {
       setState(() => _error = 'Enter the price.');
       return;
     }
+    final int needEggs = _eggCount;
+    final int needTrays = _perTray ? _quantity : 0;
+    if (needTrays > widget.appState.availableTrays) {
+      setState(() {
+        _error =
+            'Only ${widget.appState.availableTrays} tray(s) left in inventory. Ask admin to add trays for today.';
+      });
+      return;
+    }
+    if (needEggs > widget.appState.availableSellableEggs) {
+      setState(() {
+        _error =
+            'Only ${widget.appState.availableSellableEggs} egg(s) left in inventory. Ask admin to add trays for today.';
+      });
+      return;
+    }
     final DemoUser? user = widget.appState.currentUser;
     widget.appState.addEggSale(
       EggSale(
@@ -5963,7 +5960,7 @@ class _EggSalesScreenState extends State<EggSalesScreen> {
         quantity: _quantity,
         unitPrice: price,
         buyer: _buyerController.text.trim(),
-        payment: _payment,
+        payment: '',
         sellerName: user?.name ?? '',
         sellerEmail: user?.email ?? '',
       ),
@@ -5998,6 +5995,7 @@ class _EggSalesScreenState extends State<EggSalesScreen> {
       appState: widget.appState,
       title: 'Egg Monitoring System',
       selectedRoute: AppPaths.sales,
+      useLoginBackground: true,
       body: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: <Widget>[
@@ -6038,6 +6036,70 @@ class _EggSalesScreenState extends State<EggSalesScreen> {
             ],
           ),
           const SizedBox(height: 16),
+          _GlassSection(
+            title: 'Inventory for sale',
+            titleIcon: Icons.inventory_2_outlined,
+            child: LayoutBuilder(
+              builder: (BuildContext context, BoxConstraints constraints) {
+                final int columns = constraints.maxWidth >= 700 ? 3 : 1;
+                final double width =
+                    (constraints.maxWidth - 12 * (columns - 1)) / columns;
+                final int availableTrays = widget.appState.availableTrays;
+                final int availableEggs = widget.appState.availableSellableEggs;
+                final List<Widget> stockCards = <Widget>[
+                  _SalesMetric(
+                    icon: Icons.inventory_2_outlined,
+                    label: 'Trays available',
+                    value: '$availableTrays',
+                    accent: availableTrays > 0
+                        ? _DashboardPalette.primary
+                        : _DashboardPalette.warning,
+                  ),
+                  _SalesMetric(
+                    icon: Icons.egg_alt_outlined,
+                    label: 'Eggs available',
+                    value: '$availableEggs',
+                    accent: availableEggs > 0
+                        ? _DashboardPalette.success
+                        : _DashboardPalette.warning,
+                  ),
+                  _SalesMetric(
+                    icon: Icons.today_outlined,
+                    label: 'Admin set today',
+                    value: widget.appState.hasTodayTrayStock
+                        ? '${widget.appState.todayTrayStockSet} trays'
+                        : 'Not set',
+                  ),
+                ];
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: <Widget>[
+                    Text(
+                      availableTrays > 0 || availableEggs > 0
+                          ? 'Stock from admin Inventory. Sales reduce these numbers automatically.'
+                          : 'No stock yet. Ask the admin to open Inventory and enter trays for today.',
+                      style: const TextStyle(
+                        color: _DashboardPalette.mutedForeground,
+                        height: 1.35,
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Wrap(
+                      spacing: 12,
+                      runSpacing: 12,
+                      children: stockCards
+                          .map(
+                            (Widget card) =>
+                                SizedBox(width: width, child: card),
+                          )
+                          .toList(),
+                    ),
+                  ],
+                );
+              },
+            ),
+          ),
+          const SizedBox(height: 16),
           LayoutBuilder(
             builder: (BuildContext context, BoxConstraints constraints) {
               final int columns = constraints.maxWidth >= 900
@@ -6048,7 +6110,7 @@ class _EggSalesScreenState extends State<EggSalesScreen> {
               final double width = (constraints.maxWidth - 12 * (columns - 1)) / columns;
               final List<Widget> cards = <Widget>[
                 _SalesMetric(icon: Icons.egg_alt_outlined, label: 'Eggs sold today', value: '$eggsSold'),
-                _SalesMetric(icon: Icons.inventory_2_outlined, label: 'Trays today', value: '$trays'),
+                _SalesMetric(icon: Icons.inventory_2_outlined, label: 'Trays sold today', value: '$trays'),
                 _SalesMetric(icon: Icons.egg_outlined, label: 'Loose pieces today', value: '$pieces'),
                 _SalesMetric(
                   icon: Icons.payments_outlined,
@@ -6211,48 +6273,14 @@ class _EggSalesScreenState extends State<EggSalesScreen> {
                   },
                 ),
                 const SizedBox(height: 16),
-                LayoutBuilder(
-                  builder: (BuildContext context, BoxConstraints constraints) {
-                    final bool stacked = constraints.maxWidth < 720;
-                    final Widget buyer = _SalesField(
-                      label: 'Buyer (optional)',
-                      child: TextField(
-                        controller: _buyerController,
-                        style: const TextStyle(color: _DashboardPalette.foreground),
-                        cursorColor: _DashboardPalette.primary,
-                        decoration: _salesInput("e.g. Aling Nena's Store"),
-                      ),
-                    );
-                    final Widget payment = _SalesField(
-                      label: 'Payment',
-                      child: Wrap(
-                        spacing: 8,
-                        runSpacing: 8,
-                        children: _payments
-                            .map(
-                              (String method) => _SaleChoiceChip(
-                                label: method,
-                                selected: _payment == method,
-                                onTap: () => setState(() => _payment = method),
-                              ),
-                            )
-                            .toList(),
-                      ),
-                    );
-                    if (stacked) {
-                      return Column(
-                        children: <Widget>[buyer, const SizedBox(height: 12), payment],
-                      );
-                    }
-                    return Row(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: <Widget>[
-                        Expanded(child: buyer),
-                        const SizedBox(width: 16),
-                        Expanded(child: payment),
-                      ],
-                    );
-                  },
+                _SalesField(
+                  label: 'Buyer (optional)',
+                  child: TextField(
+                    controller: _buyerController,
+                    style: const TextStyle(color: _DashboardPalette.foreground),
+                    cursorColor: _DashboardPalette.primary,
+                    decoration: _salesInput("e.g. Aling Nena's Store"),
+                  ),
                 ),
                 if (_error != null) ...<Widget>[
                   const SizedBox(height: 12),
@@ -6332,12 +6360,57 @@ class _EggSalesScreenState extends State<EggSalesScreen> {
                 : Column(
                     children: <Widget>[
                       for (final EggSale sale in widget.appState.eggSales)
-                        _SaleHistoryRow(sale: sale),
+                        _SaleHistoryRow(
+                          sale: sale,
+                          onDelete: () => _confirmDeleteSale(sale),
+                        ),
                     ],
                   ),
           ),
         ],
       ),
+    );
+  }
+
+  Future<void> _confirmDeleteSale(EggSale sale) async {
+    final bool? confirmed = await showDialog<bool>(
+      context: context,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          backgroundColor: const Color(0xFF241C16),
+          title: const Text(
+            'Delete sale permanently?',
+            style: TextStyle(color: _DashboardPalette.foreground),
+          ),
+          content: Text(
+            'This hard-deletes the ${sale.size} sale '
+            '(${sale.perTray ? '${sale.quantity} tray(s)' : '${sale.quantity} piece(s)'}) '
+            'from the app and the farm database. Stock will be restored.',
+            style: const TextStyle(color: _DashboardPalette.mutedForeground),
+          ),
+          actions: <Widget>[
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              style: FilledButton.styleFrom(
+                backgroundColor: const Color(0xFFDC2626),
+                foregroundColor: Colors.white,
+              ),
+              child: const Text('Delete'),
+            ),
+          ],
+        );
+      },
+    );
+    if (confirmed != true || !mounted) {
+      return;
+    }
+    widget.appState.deleteEggSale(sale.id);
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Sale permanently deleted.')),
     );
   }
 }
@@ -6546,9 +6619,10 @@ class _SalesField extends StatelessWidget {
 }
 
 class _SaleHistoryRow extends StatelessWidget {
-  const _SaleHistoryRow({required this.sale});
+  const _SaleHistoryRow({required this.sale, required this.onDelete});
 
   final EggSale sale;
+  final VoidCallback onDelete;
 
   @override
   Widget build(BuildContext context) {
@@ -6582,7 +6656,11 @@ class _SaleHistoryRow extends StatelessWidget {
                 ),
                 const SizedBox(height: 2),
                 Text(
-                  '$amount · ${sale.payment}${sale.buyer.isEmpty ? '' : ' · ${sale.buyer}'}',
+                  [
+                    amount,
+                    if (sale.payment.trim().isNotEmpty) sale.payment.trim(),
+                    if (sale.buyer.isNotEmpty) sale.buyer,
+                  ].join(' · '),
                   style: const TextStyle(color: _DashboardPalette.mutedForeground, fontSize: 12),
                 ),
                 if (when.isNotEmpty)
@@ -6597,46 +6675,14 @@ class _SaleHistoryRow extends StatelessWidget {
               fontWeight: FontWeight.w800,
             ),
           ),
+          const SizedBox(width: 4),
+          IconButton(
+            onPressed: onDelete,
+            tooltip: 'Delete permanently',
+            icon: const Icon(Icons.delete_outline_rounded),
+            color: const Color(0xFFDC2626),
+          ),
         ],
-      ),
-    );
-  }
-}
-
-class _AccountRoleChoice extends StatelessWidget {
-  const _AccountRoleChoice({
-    required this.label,
-    required this.selected,
-    required this.onTap,
-  });
-
-  final String label;
-  final bool selected;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    return InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(12),
-      child: Container(
-        padding: const EdgeInsets.symmetric(vertical: 12),
-        alignment: Alignment.center,
-        decoration: BoxDecoration(
-          color: selected ? const Color(0x332A2118) : const Color(0xFF241C16),
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(
-            color: selected ? _DashboardPalette.primary : const Color(0xFF4A4038),
-            width: selected ? 1.4 : 1,
-          ),
-        ),
-        child: Text(
-          label,
-          style: TextStyle(
-            color: selected ? _DashboardPalette.primary : _DashboardPalette.foreground,
-            fontWeight: FontWeight.w800,
-          ),
-        ),
       ),
     );
   }
@@ -6657,11 +6703,24 @@ class _AccountScreenState extends State<AccountScreen> {
   final TextEditingController _emailController = TextEditingController();
   final TextEditingController _passwordController = TextEditingController();
   final TextEditingController _confirmController = TextEditingController();
+  final TextEditingController _searchController = TextEditingController();
+
   bool _obscurePassword = true;
   bool _saving = false;
+  bool _loading = true;
   bool _salesAccount = false;
+  String _roleFilter = 'all';
   String? _error;
   String? _success;
+  String? _listError;
+  String? _busyEmail;
+  List<DemoUser> _accounts = <DemoUser>[];
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_loadAccounts());
+  }
 
   @override
   void dispose() {
@@ -6669,7 +6728,41 @@ class _AccountScreenState extends State<AccountScreen> {
     _emailController.dispose();
     _passwordController.dispose();
     _confirmController.dispose();
+    _searchController.dispose();
     super.dispose();
+  }
+
+  Future<void> _loadAccounts() async {
+    setState(() {
+      _loading = true;
+      _listError = null;
+    });
+    try {
+      final List<DemoUser> users = await widget.appState.listFarmAccounts();
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _accounts = users;
+        _loading = false;
+      });
+    } on AuthException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _listError = error.message;
+        _loading = false;
+      });
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _listError = 'Unable to load accounts from Firebase.';
+        _loading = false;
+      });
+    }
   }
 
   String? _validatePassword(String? value) {
@@ -6686,7 +6779,7 @@ class _AccountScreenState extends State<AccountScreen> {
     return null;
   }
 
-  Future<void> _createWorker() async {
+  Future<void> _createAccount() async {
     final FormState? form = _formKey.currentState;
     if (form == null || !form.validate()) {
       return;
@@ -6697,17 +6790,18 @@ class _AccountScreenState extends State<AccountScreen> {
       _success = null;
     });
     try {
-      final String message = _salesAccount
-          ? await widget.appState.createSalesAccount(
-              name: _nameController.text.trim(),
-              email: _emailController.text.trim(),
-              password: _passwordController.text,
-            )
-          : await widget.appState.createWorkerAccount(
-              name: _nameController.text.trim(),
-              email: _emailController.text.trim(),
-              password: _passwordController.text,
-            );
+      final ({String message, String? verificationCode, bool emailSent})
+          created = _salesAccount
+              ? await widget.appState.createSalesAccount(
+                  name: _nameController.text.trim(),
+                  email: _emailController.text.trim(),
+                  password: _passwordController.text,
+                )
+              : await widget.appState.createWorkerAccount(
+                  name: _nameController.text.trim(),
+                  email: _emailController.text.trim(),
+                  password: _passwordController.text,
+                );
       if (!mounted) {
         return;
       }
@@ -6715,7 +6809,11 @@ class _AccountScreenState extends State<AccountScreen> {
       _emailController.clear();
       _passwordController.clear();
       _confirmController.clear();
-      setState(() => _success = message);
+      final String emailed = created.emailSent
+          ? ' Verification code sent to their Gmail.'
+          : '';
+      setState(() => _success = '${created.message}$emailed');
+      await _loadAccounts();
     } on AuthException catch (error) {
       if (!mounted) {
         return;
@@ -6733,154 +6831,729 @@ class _AccountScreenState extends State<AccountScreen> {
     }
   }
 
-  InputDecoration _decoration(String hint) {
+  Future<void> _setRole(DemoUser user, String role) async {
+    if (user.email.trim().toLowerCase() == kSoleAdminEmail) {
+      return;
+    }
+    setState(() => _busyEmail = user.email);
+    try {
+      final DemoUser updated = await widget.appState.updateFarmAccount(
+        email: user.email,
+        role: role,
+      );
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _accounts = _accounts
+            .map((DemoUser row) => row.email == updated.email ? updated : row)
+            .toList();
+      });
+    } on AuthException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(error.message)),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _busyEmail = null);
+      }
+    }
+  }
+
+  Future<void> _setDisabled(DemoUser user, bool disabled) async {
+    if (user.email.trim().toLowerCase() == kSoleAdminEmail) {
+      return;
+    }
+    setState(() => _busyEmail = user.email);
+    try {
+      final DemoUser updated = await widget.appState.updateFarmAccount(
+        email: user.email,
+        disabled: disabled,
+      );
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _accounts = _accounts
+            .map((DemoUser row) => row.email == updated.email ? updated : row)
+            .toList();
+      });
+    } on AuthException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(error.message)),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _busyEmail = null);
+      }
+    }
+  }
+
+  InputDecoration _decoration(String hint, {Widget? suffixIcon}) {
+    final OutlineInputBorder border = OutlineInputBorder(
+      borderRadius: BorderRadius.circular(10),
+      borderSide: const BorderSide(color: Color(0xFF4A4038)),
+    );
     return InputDecoration(
       hintText: hint,
-      hintStyle: const TextStyle(color: Color(0xFFB7AA9A)),
+      hintStyle: const TextStyle(color: Color(0xFFB7AA9A), fontSize: 14),
       filled: true,
       fillColor: const Color(0xFF3A322B),
-      border: OutlineInputBorder(
-        borderRadius: BorderRadius.circular(10),
-        borderSide: const BorderSide(color: Color(0xFF4A4038)),
-      ),
-      enabledBorder: OutlineInputBorder(
-        borderRadius: BorderRadius.circular(10),
-        borderSide: const BorderSide(color: Color(0xFF4A4038)),
+      suffixIcon: suffixIcon,
+      contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
+      border: border,
+      enabledBorder: border,
+      focusedBorder: border.copyWith(
+        borderSide: const BorderSide(color: _DashboardPalette.primary, width: 1.4),
       ),
     );
   }
 
+  List<DemoUser> get _filteredAccounts {
+    final String query = _searchController.text.trim().toLowerCase();
+    return _accounts.where((DemoUser user) {
+      if (_roleFilter == 'admin' && user.role != AppRole.admin) {
+        return false;
+      }
+      if (_roleFilter == 'worker' && user.role != AppRole.worker) {
+        return false;
+      }
+      if (_roleFilter == 'sales' && user.role != AppRole.sales) {
+        return false;
+      }
+      if (_roleFilter == 'disabled' && !user.disabled) {
+        return false;
+      }
+      if (query.isEmpty) {
+        return true;
+      }
+      return user.name.toLowerCase().contains(query) ||
+          user.email.toLowerCase().contains(query);
+    }).toList();
+  }
+
+  String _roleLabel(AppRole role) {
+    switch (role) {
+      case AppRole.admin:
+        return 'Admin';
+      case AppRole.sales:
+        return 'Seller';
+      case AppRole.worker:
+        return 'Worker';
+    }
+  }
+
+  Color _roleColor(AppRole role) {
+    switch (role) {
+      case AppRole.admin:
+        return _DashboardPalette.primary;
+      case AppRole.sales:
+        return _DashboardPalette.warning;
+      case AppRole.worker:
+        return const Color(0xFF8BB4E8);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
+    final int adminCount =
+        _accounts.where((DemoUser u) => u.role == AppRole.admin).length;
+    final int workerCount =
+        _accounts.where((DemoUser u) => u.role == AppRole.worker).length;
+    final int sellerCount =
+        _accounts.where((DemoUser u) => u.role == AppRole.sales).length;
+    final int disabledCount =
+        _accounts.where((DemoUser u) => u.disabled).length;
+    final List<DemoUser> visible = _filteredAccounts;
+
     return EggScaffold(
       appState: widget.appState,
-      title: 'Account',
+      title: 'Account Management',
       selectedRoute: AppPaths.accounts,
-      body: Form(
-        key: _formKey,
-        child: _GlassSection(
-          title: _salesAccount ? 'Create sales account' : 'Create worker account',
-          titleIcon: Icons.person_add_alt_1_outlined,
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
+      body: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: <Widget>[
-              const Text(
-                'Add a worker for production and quality control, or a sales account that can only record egg sales. This stays on your admin account.',
-                style: TextStyle(
-                  color: _DashboardPalette.mutedForeground,
-                  height: 1.4,
-                ),
-              ),
-              const SizedBox(height: 16),
-              Row(
-                children: <Widget>[
-                  Expanded(
-                    child: _AccountRoleChoice(
-                      label: 'Worker',
-                      selected: !_salesAccount,
-                      onTap: () => setState(() => _salesAccount = false),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    Text(
+                      'ACCOUNT MANAGEMENT',
+                      style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+                            color: _DashboardPalette.foreground,
+                            fontWeight: FontWeight.w800,
+                            letterSpacing: 1.1,
+                          ),
                     ),
-                  ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: _AccountRoleChoice(
-                      label: 'Sales',
-                      selected: _salesAccount,
-                      onTap: () => setState(() => _salesAccount = true),
+                    const SizedBox(height: 4),
+                    const Text(
+                      'Create staff, change roles, and disable access',
+                      style: TextStyle(
+                        color: _DashboardPalette.mutedForeground,
+                        height: 1.35,
+                      ),
                     ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 16),
-              TextFormField(
-                controller: _nameController,
-                style: const TextStyle(color: _DashboardPalette.foreground),
-                decoration: _decoration(_salesAccount ? 'Sales name' : 'Worker name'),
-                validator: (String? value) =>
-                    (value ?? '').trim().isEmpty ? 'Name is required' : null,
-              ),
-              const SizedBox(height: 12),
-              TextFormField(
-                controller: _emailController,
-                keyboardType: TextInputType.emailAddress,
-                style: const TextStyle(color: _DashboardPalette.foreground),
-                decoration: _decoration('Email'),
-                validator: (String? value) {
-                  final String email = (value ?? '').trim();
-                  if (email.isEmpty || !email.contains('@') || !email.contains('.')) {
-                    return 'Enter a valid email';
-                  }
-                  return null;
-                },
-              ),
-              const SizedBox(height: 12),
-              TextFormField(
-                controller: _passwordController,
-                obscureText: _obscurePassword,
-                style: const TextStyle(color: _DashboardPalette.foreground),
-                decoration: _decoration('Password').copyWith(
-                  suffixIcon: IconButton(
-                    onPressed: () =>
-                        setState(() => _obscurePassword = !_obscurePassword),
-                    icon: Icon(
-                      _obscurePassword
-                          ? Icons.visibility_outlined
-                          : Icons.visibility_off_outlined,
-                      color: const Color(0xFFB7AA9A),
-                    ),
-                  ),
+                  ],
                 ),
-                validator: _validatePassword,
               ),
-              const SizedBox(height: 12),
-              TextFormField(
-                controller: _confirmController,
-                obscureText: _obscurePassword,
-                style: const TextStyle(color: _DashboardPalette.foreground),
-                decoration: _decoration('Confirm password'),
-                validator: (String? value) {
-                  if ((value ?? '') != _passwordController.text) {
-                    return 'Passwords do not match';
-                  }
-                  return null;
-                },
-              ),
-              if (_error != null) ...<Widget>[
-                const SizedBox(height: 12),
-                Text(
-                  _error!,
-                  style: const TextStyle(color: Color(0xFFDC2626)),
-                ),
-              ],
-              if (_success != null) ...<Widget>[
-                const SizedBox(height: 12),
-                Text(
-                  _success!,
-                  style: const TextStyle(color: _DashboardPalette.success),
-                ),
-              ],
-              const SizedBox(height: 16),
-              FilledButton(
-                onPressed: _saving ? null : _createWorker,
-                style: FilledButton.styleFrom(
-                  backgroundColor: _DashboardPalette.primary,
-                  foregroundColor: const Color(0xFF2A2118),
-                  padding: const EdgeInsets.symmetric(vertical: 16),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(10),
-                  ),
-                ),
-                child: _saving
+              IconButton(
+                tooltip: 'Refresh',
+                onPressed: _loading ? null : _loadAccounts,
+                icon: _loading
                     ? const SizedBox(
-                        width: 22,
-                        height: 22,
-                        child: CircularProgressIndicator(strokeWidth: 2.4),
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
                       )
-                    : Text(_salesAccount ? 'Create sales account' : 'Create worker account'),
+                    : const Icon(
+                        Icons.refresh_rounded,
+                        color: _DashboardPalette.mutedForeground,
+                      ),
               ),
             ],
           ),
+          const SizedBox(height: 18),
+          _ProductionStatGrid(
+            stats: <_ProductionStat>[
+              _ProductionStat(
+                icon: Icons.groups_outlined,
+                iconColor: _DashboardPalette.primary,
+                label: 'Total',
+                value: '${_accounts.length}',
+                suffix: 'accounts',
+              ),
+              _ProductionStat(
+                icon: Icons.engineering_outlined,
+                iconColor: const Color(0xFF8BB4E8),
+                label: 'Workers',
+                value: '$workerCount',
+                suffix: 'floor',
+              ),
+              _ProductionStat(
+                icon: Icons.storefront_outlined,
+                iconColor: _DashboardPalette.warning,
+                label: 'Sellers',
+                value: '$sellerCount',
+                suffix: 'sales',
+              ),
+              _ProductionStat(
+                icon: Icons.person_off_outlined,
+                iconColor: _DashboardPalette.danger,
+                label: 'Disabled',
+                value: '$disabledCount',
+                suffix: 'locked',
+              ),
+              _ProductionStat(
+                icon: Icons.shield_outlined,
+                iconColor: _DashboardPalette.primary,
+                label: 'Admin',
+                value: '$adminCount',
+                suffix: 'owner',
+              ),
+            ],
+          ),
+          const SizedBox(height: 18),
+          LayoutBuilder(
+            builder: (BuildContext context, BoxConstraints constraints) {
+              final bool wide = constraints.maxWidth >= 980;
+              final double listWidth =
+                  wide ? constraints.maxWidth * 0.62 : constraints.maxWidth;
+              final double formWidth = wide
+                  ? constraints.maxWidth - listWidth - 16
+                  : constraints.maxWidth;
+
+              return Wrap(
+                spacing: 16,
+                runSpacing: 16,
+                children: <Widget>[
+                  SizedBox(
+                    width: listWidth,
+                    child: _GlassSection(
+                      title: 'All accounts',
+                      titleIcon: Icons.badge_outlined,
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: <Widget>[
+                          TextField(
+                            controller: _searchController,
+                            onChanged: (_) => setState(() {}),
+                            style: const TextStyle(
+                              color: _DashboardPalette.foreground,
+                            ),
+                            decoration: _decoration(
+                              'Search name or Gmail',
+                              suffixIcon: const Icon(
+                                Icons.search_rounded,
+                                color: Color(0xFFB7AA9A),
+                                size: 20,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                          Wrap(
+                            spacing: 8,
+                            runSpacing: 8,
+                            children: <Widget>[
+                              for (final MapEntry<String, String> entry
+                                  in const <MapEntry<String, String>>[
+                                MapEntry<String, String>('all', 'All'),
+                                MapEntry<String, String>('admin', 'Admin'),
+                                MapEntry<String, String>('worker', 'Worker'),
+                                MapEntry<String, String>('sales', 'Seller'),
+                                MapEntry<String, String>('disabled', 'Disabled'),
+                              ])
+                                _AccountFilterChip(
+                                  label: entry.value,
+                                  selected: _roleFilter == entry.key,
+                                  onTap: () => setState(
+                                    () => _roleFilter = entry.key,
+                                  ),
+                                ),
+                            ],
+                          ),
+                          const SizedBox(height: 14),
+                          if (_listError != null)
+                            Text(
+                              _listError!,
+                              style: const TextStyle(
+                                color: _DashboardPalette.danger,
+                                height: 1.35,
+                              ),
+                            )
+                          else if (_loading)
+                            const Padding(
+                              padding: EdgeInsets.symmetric(vertical: 28),
+                              child: Center(
+                                child: CircularProgressIndicator(strokeWidth: 2.4),
+                              ),
+                            )
+                          else if (visible.isEmpty)
+                            const Padding(
+                              padding: EdgeInsets.symmetric(vertical: 28),
+                              child: Text(
+                                'No accounts match this filter.',
+                                textAlign: TextAlign.center,
+                                style: TextStyle(
+                                  color: _DashboardPalette.mutedForeground,
+                                ),
+                              ),
+                            )
+                          else
+                            Column(
+                              children: <Widget>[
+                                for (int i = 0; i < visible.length; i++) ...<Widget>[
+                                  _AccountManageRow(
+                                    user: visible[i],
+                                    roleLabel: _roleLabel(visible[i].role),
+                                    roleColor: _roleColor(visible[i].role),
+                                    busy: _busyEmail == visible[i].email,
+                                    isLast: i == visible.length - 1,
+                                    onRoleChanged: (String role) =>
+                                        unawaited(_setRole(visible[i], role)),
+                                    onDisabledChanged: (bool value) =>
+                                        unawaited(
+                                      _setDisabled(visible[i], value),
+                                    ),
+                                  ),
+                                ],
+                              ],
+                            ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  SizedBox(
+                    width: formWidth,
+                    child: Form(
+                      key: _formKey,
+                      child: _GlassSection(
+                        title: 'Add staff',
+                        titleIcon: Icons.person_add_alt_1_outlined,
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: <Widget>[
+                            const Text(
+                              'Invite a real Gmail. Worker uses production/QC; Seller uses the sales desk only.',
+                              style: TextStyle(
+                                color: _DashboardPalette.mutedForeground,
+                                height: 1.4,
+                                fontSize: 13.5,
+                              ),
+                            ),
+                            const SizedBox(height: 14),
+                            Row(
+                              children: <Widget>[
+                                Expanded(
+                                  child: _AccountFilterChip(
+                                    label: 'Worker',
+                                    selected: !_salesAccount,
+                                    expanded: true,
+                                    onTap: () =>
+                                        setState(() => _salesAccount = false),
+                                  ),
+                                ),
+                                const SizedBox(width: 8),
+                                Expanded(
+                                  child: _AccountFilterChip(
+                                    label: 'Seller',
+                                    selected: _salesAccount,
+                                    expanded: true,
+                                    onTap: () =>
+                                        setState(() => _salesAccount = true),
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 14),
+                            TextFormField(
+                              controller: _nameController,
+                              style: const TextStyle(
+                                color: _DashboardPalette.foreground,
+                              ),
+                              decoration: _decoration('Full name'),
+                              validator: (String? value) =>
+                                  (value ?? '').trim().isEmpty
+                                      ? 'Name is required'
+                                      : null,
+                            ),
+                            const SizedBox(height: 10),
+                            TextFormField(
+                              controller: _emailController,
+                              keyboardType: TextInputType.emailAddress,
+                              style: const TextStyle(
+                                color: _DashboardPalette.foreground,
+                              ),
+                              decoration: _decoration('Gmail address'),
+                              validator: (String? value) {
+                                final String email =
+                                    (value ?? '').trim().toLowerCase();
+                                if (!AppState.isRealGmail(email)) {
+                                  return 'Use a real @gmail.com address';
+                                }
+                                return null;
+                              },
+                            ),
+                            const SizedBox(height: 10),
+                            TextFormField(
+                              controller: _passwordController,
+                              obscureText: _obscurePassword,
+                              style: const TextStyle(
+                                color: _DashboardPalette.foreground,
+                              ),
+                              decoration: _decoration(
+                                'Temporary password',
+                                suffixIcon: IconButton(
+                                  onPressed: () => setState(
+                                    () => _obscurePassword = !_obscurePassword,
+                                  ),
+                                  icon: Icon(
+                                    _obscurePassword
+                                        ? Icons.visibility_outlined
+                                        : Icons.visibility_off_outlined,
+                                    color: const Color(0xFFB7AA9A),
+                                  ),
+                                ),
+                              ),
+                              validator: _validatePassword,
+                            ),
+                            const SizedBox(height: 10),
+                            TextFormField(
+                              controller: _confirmController,
+                              obscureText: _obscurePassword,
+                              style: const TextStyle(
+                                color: _DashboardPalette.foreground,
+                              ),
+                              decoration: _decoration('Confirm password'),
+                              validator: (String? value) {
+                                if ((value ?? '') != _passwordController.text) {
+                                  return 'Passwords do not match';
+                                }
+                                return null;
+                              },
+                            ),
+                            if (_error != null) ...<Widget>[
+                              const SizedBox(height: 12),
+                              Text(
+                                _error!,
+                                style: const TextStyle(
+                                  color: _DashboardPalette.danger,
+                                  height: 1.35,
+                                ),
+                              ),
+                            ],
+                            if (_success != null) ...<Widget>[
+                              const SizedBox(height: 12),
+                              Text(
+                                _success!,
+                                style: const TextStyle(
+                                  color: _DashboardPalette.success,
+                                  height: 1.35,
+                                ),
+                              ),
+                            ],
+                            const SizedBox(height: 16),
+                            FilledButton(
+                              onPressed: _saving ? null : _createAccount,
+                              style: FilledButton.styleFrom(
+                                backgroundColor: _DashboardPalette.primary,
+                                foregroundColor: const Color(0xFF2A2118),
+                                padding:
+                                    const EdgeInsets.symmetric(vertical: 15),
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(10),
+                                ),
+                              ),
+                              child: _saving
+                                  ? const SizedBox(
+                                      width: 22,
+                                      height: 22,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2.4,
+                                      ),
+                                    )
+                                  : Text(
+                                      _salesAccount
+                                          ? 'Create seller'
+                                          : 'Create worker',
+                                      style: const TextStyle(
+                                        fontWeight: FontWeight.w700,
+                                      ),
+                                    ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              );
+            },
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _AccountFilterChip extends StatelessWidget {
+  const _AccountFilterChip({
+    required this.label,
+    required this.selected,
+    required this.onTap,
+    this.expanded = false,
+  });
+
+  final String label;
+  final bool selected;
+  final VoidCallback onTap;
+  final bool expanded;
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(10),
+      child: Container(
+        width: expanded ? double.infinity : null,
+        padding: EdgeInsets.symmetric(
+          horizontal: expanded ? 12 : 14,
+          vertical: 10,
         ),
+        alignment: Alignment.center,
+        decoration: BoxDecoration(
+          color: selected
+              ? _DashboardPalette.primary.withValues(alpha: 0.16)
+              : const Color(0xFF2A221C),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(
+            color: selected
+                ? _DashboardPalette.primary
+                : const Color(0xFF4A4038),
+          ),
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+            color: selected
+                ? _DashboardPalette.primary
+                : _DashboardPalette.foreground,
+            fontWeight: FontWeight.w700,
+            fontSize: 13,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _AccountManageRow extends StatelessWidget {
+  const _AccountManageRow({
+    required this.user,
+    required this.roleLabel,
+    required this.roleColor,
+    required this.busy,
+    required this.isLast,
+    required this.onRoleChanged,
+    required this.onDisabledChanged,
+  });
+
+  final DemoUser user;
+  final String roleLabel;
+  final Color roleColor;
+  final bool busy;
+  final bool isLast;
+  final ValueChanged<String> onRoleChanged;
+  final ValueChanged<bool> onDisabledChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final bool isSoleAdmin =
+        user.email.trim().toLowerCase() == kSoleAdminEmail;
+    final String initial = user.name.trim().isNotEmpty
+        ? user.name.trim()[0].toUpperCase()
+        : (user.email.isNotEmpty ? user.email[0].toUpperCase() : '?');
+    final String roleValue =
+        user.role == AppRole.sales ? 'sales' : 'worker';
+
+    return Container(
+      padding: const EdgeInsets.symmetric(vertical: 12),
+      decoration: BoxDecoration(
+        border: isLast
+            ? null
+            : const Border(
+                bottom: BorderSide(color: Color(0x334A4038)),
+              ),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: <Widget>[
+          Container(
+            width: 40,
+            height: 40,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              color: roleColor.withValues(alpha: 0.16),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: roleColor.withValues(alpha: 0.35)),
+            ),
+            child: Text(
+              initial,
+              style: TextStyle(
+                color: roleColor,
+                fontWeight: FontWeight.w800,
+              ),
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Text(
+                  user.name.isEmpty ? user.email.split('@').first : user.name,
+                  style: TextStyle(
+                    color: user.disabled
+                        ? _DashboardPalette.mutedForeground
+                        : _DashboardPalette.foreground,
+                    fontWeight: FontWeight.w700,
+                    fontSize: 14.5,
+                    decoration:
+                        user.disabled ? TextDecoration.lineThrough : null,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  user.email,
+                  style: const TextStyle(
+                    color: _DashboardPalette.mutedForeground,
+                    fontSize: 12.5,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  user.disabled
+                      ? 'Disabled'
+                      : (user.emailVerified ? 'Verified' : 'Pending verify'),
+                  style: TextStyle(
+                    color: user.disabled
+                        ? _DashboardPalette.danger
+                        : (user.emailVerified
+                            ? _DashboardPalette.success
+                            : _DashboardPalette.warning),
+                    fontSize: 11.5,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 8),
+          if (busy)
+            const SizedBox(
+              width: 22,
+              height: 22,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            )
+          else if (isSoleAdmin)
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              decoration: BoxDecoration(
+                color: roleColor.withValues(alpha: 0.14),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Text(
+                roleLabel,
+                style: TextStyle(
+                  color: roleColor,
+                  fontWeight: FontWeight.w700,
+                  fontSize: 12,
+                ),
+              ),
+            )
+          else ...<Widget>[
+            DropdownButtonHideUnderline(
+              child: DropdownButton<String>(
+                value: roleValue,
+                dropdownColor: const Color(0xFF2A221C),
+                style: const TextStyle(
+                  color: _DashboardPalette.foreground,
+                  fontWeight: FontWeight.w600,
+                  fontSize: 13,
+                ),
+                items: const <DropdownMenuItem<String>>[
+                  DropdownMenuItem<String>(
+                    value: 'worker',
+                    child: Text('Worker'),
+                  ),
+                  DropdownMenuItem<String>(
+                    value: 'sales',
+                    child: Text('Seller'),
+                  ),
+                ],
+                onChanged: (String? value) {
+                  if (value != null) {
+                    onRoleChanged(value);
+                  }
+                },
+              ),
+            ),
+            const SizedBox(width: 4),
+            Switch.adaptive(
+              value: !user.disabled,
+              activeThumbColor: _DashboardPalette.success,
+              onChanged: (bool enabled) => onDisabledChanged(!enabled),
+            ),
+          ],
+        ],
       ),
     );
   }
@@ -6990,50 +7663,22 @@ class _ProfileScreenState extends State<ProfileScreen> {
     ).pushNamedAndRemoveUntil(AppPaths.auth, (Route<dynamic> route) => false);
   }
 
+  String _roleTitle() {
+    if (widget.appState.isAdmin) {
+      return 'Admin';
+    }
+    if (widget.appState.isSales) {
+      return 'Seller';
+    }
+    return 'Worker';
+  }
+
   @override
   Widget build(BuildContext context) {
     final DemoUser user = widget.appState.currentUser!;
-    final bool isAdmin = widget.appState.isAdmin;
-    final String passwordUpdated = user.passwordChangedAt == null
-        ? 'Never'
-        : user.passwordChangedAt!.replaceFirst('T', ' ').replaceFirst('Z', ' UTC');
-    final String sessionLabel = widget.appState.sessionExpiresAt == null
-        ? 'Active on this device'
-        : 'Expires ${widget.appState.sessionExpiresAt!.toLocal()}';
-    final List<_ProductionStat> stats = <_ProductionStat>[
-      _ProductionStat(
-        icon: Icons.badge_outlined,
-        iconColor: _DashboardPalette.primary,
-        label: 'Role',
-        value: isAdmin
-            ? 'Admin'
-            : widget.appState.isSales
-            ? 'Sales'
-            : 'Worker',
-        suffix: 'access',
-      ),
-      _ProductionStat(
-        icon: Icons.verified_user_outlined,
-        iconColor: _DashboardPalette.success,
-        label: 'Status',
-        value: user.emailVerified ? 'Verified' : 'Unverified',
-        suffix: 'account',
-      ),
-      _ProductionStat(
-        icon: Icons.location_on_outlined,
-        iconColor: _DashboardPalette.primary,
-        label: 'Zone',
-        value: user.assignedZone,
-        suffix: 'assigned',
-      ),
-      _ProductionStat(
-        icon: Icons.schedule_outlined,
-        iconColor: _DashboardPalette.warning,
-        label: 'Last Update',
-        value: user.passwordChangedAt == null ? 'Never' : 'Updated',
-        suffix: 'password',
-      ),
-    ];
+    final String initial = user.name.trim().isNotEmpty
+        ? user.name.trim()[0].toUpperCase()
+        : (user.email.isNotEmpty ? user.email[0].toUpperCase() : '?');
 
     return EggScaffold(
       appState: widget.appState,
@@ -7042,208 +7687,179 @@ class _ProfileScreenState extends State<ProfileScreen> {
       body: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
-          Row(
-            children: <Widget>[
-              Container(
-                width: 48,
-                height: 48,
-                decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(16),
-                  border: Border.all(color: _DashboardPalette.primary.withValues(alpha: 0.35)),
+          Text(
+            'PROFILE',
+            style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+                  color: _DashboardPalette.foreground,
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: 1.2,
                 ),
-                clipBehavior: Clip.antiAlias,
-                child: Image.asset(
-                  'assets/app-icon.png',
-                  fit: BoxFit.cover,
-                ),
-              ),
-              const SizedBox(width: 14),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
+          ),
+          const SizedBox(height: 4),
+          const Text(
+            'Your personal information for this farm account',
+            style: TextStyle(
+              color: _DashboardPalette.mutedForeground,
+              height: 1.35,
+            ),
+          ),
+          const SizedBox(height: 18),
+          _GlassSection(
+            title: 'Personal information',
+            titleIcon: Icons.person_outline_rounded,
+            child: Column(
+              children: <Widget>[
+                Row(
                   children: <Widget>[
-                    Text(
-                      'MY PROFILE',
-                      style: Theme.of(context).textTheme.headlineSmall
-                          ?.copyWith(
-                            color: _DashboardPalette.foreground,
-                            fontWeight: FontWeight.w800,
-                            letterSpacing: 1.2,
-                          ),
+                    Container(
+                      width: 64,
+                      height: 64,
+                      alignment: Alignment.center,
+                      decoration: BoxDecoration(
+                        color: _DashboardPalette.primary.withValues(alpha: 0.16),
+                        borderRadius: BorderRadius.circular(18),
+                        border: Border.all(
+                          color: _DashboardPalette.primary.withValues(alpha: 0.35),
+                        ),
+                      ),
+                      child: Text(
+                        initial,
+                        style: const TextStyle(
+                          color: _DashboardPalette.primary,
+                          fontSize: 26,
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
                     ),
-                    const SizedBox(height: 4),
-                    Text(
-                      'Account details and security settings',
-                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                        color: _DashboardPalette.mutedForeground,
+                    const SizedBox(width: 16),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: <Widget>[
+                          Text(
+                            user.name.isEmpty
+                                ? user.email.split('@').first
+                                : user.name,
+                            style: const TextStyle(
+                              color: _DashboardPalette.foreground,
+                              fontSize: 20,
+                              fontWeight: FontWeight.w800,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            user.email,
+                            style: const TextStyle(
+                              color: _DashboardPalette.mutedForeground,
+                              fontSize: 13.5,
+                            ),
+                          ),
+                          const SizedBox(height: 10),
+                          Wrap(
+                            spacing: 8,
+                            runSpacing: 8,
+                            children: <Widget>[
+                              _ProfileBadge(
+                                label: _roleTitle(),
+                                color: _DashboardPalette.primary,
+                              ),
+                              _ProfileBadge(
+                                label: user.emailVerified
+                                    ? 'Verified'
+                                    : 'Unverified',
+                                color: user.emailVerified
+                                    ? _DashboardPalette.success
+                                    : _DashboardPalette.warning,
+                              ),
+                            ],
+                          ),
+                        ],
                       ),
                     ),
                   ],
                 ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 18),
-          _ProductionStatGrid(stats: stats),
-          const SizedBox(height: 18),
-          LayoutBuilder(
-            builder: (BuildContext context, BoxConstraints constraints) {
-              final bool medium = constraints.maxWidth >= 920;
-              final double width = medium
-                  ? (constraints.maxWidth - 16) / 2
-                  : constraints.maxWidth;
-
-              return Wrap(
-                spacing: 16,
-                runSpacing: 16,
-                children: <Widget>[
-                  SizedBox(
-                    width: width,
-                    child: _GlassSection(
-                      title: 'Account',
-                      titleIcon: Icons.account_circle_outlined,
-                      child: Column(
-                        children: <Widget>[
-                          _ProfileInfoRow(
-                            icon: Icons.person_outline_rounded,
-                            label: 'Full Name',
-                            value: user.name,
-                          ),
-                          _ProfileInfoRow(
-                            icon: Icons.mail_outline_rounded,
-                            label: 'Email',
-                            value: user.email,
-                          ),
-                          _ProfileInfoRow(
-                            icon: Icons.shield_outlined,
-                            label: 'Role',
-                            value: user.role.name.toUpperCase(),
-                          ),
-                          _ProfileInfoRow(
-                            icon: Icons.verified_outlined,
-                            label: 'Status',
-                            value: user.emailVerified || widget.appState.isSales
-                                ? 'Active'
-                                : 'Email not verified',
-                          ),
-                          _ProfileInfoRow(
-                            icon: Icons.location_on_outlined,
-                            label: 'Assigned Zone',
-                            value: user.assignedZone,
-                            isLast: true,
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                  SizedBox(
-                    width: width,
-                    child: _GlassSection(
-                      title: 'Session',
-                      titleIcon: Icons.devices_outlined,
-                      child: Column(
-                        children: <Widget>[
-                          _ProfileInfoRow(
-                            icon: Icons.lock_clock_outlined,
-                            label: 'Session State',
-                            value: sessionLabel,
-                          ),
-                          _ProfileInfoRow(
-                            icon: Icons.calendar_today_outlined,
-                            label: 'Profile Synced',
-                            value: _formatDashboardDate(),
-                          ),
-                          _ProfileInfoRow(
-                            icon: Icons.manage_accounts_outlined,
-                            label: 'Access Scope',
-                            value: isAdmin
-                                ? 'Admin control room'
-                                : widget.appState.isSales
-                                ? 'Sales desk'
-                                : 'Worker workflow',
-                          ),
-                          _ProfileInfoRow(
-                            icon: Icons.key_outlined,
-                            label: 'Password Status',
-                            value: user.passwordChangedAt == null
-                                ? 'Pending first update'
-                                : 'Updated on $passwordUpdated',
-                            isLast: true,
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                ],
-              );
-            },
+                const SizedBox(height: 8),
+                const Divider(color: Color(0x334A4038), height: 28),
+                _ProfileInfoRow(
+                  icon: Icons.badge_outlined,
+                  label: 'Full name',
+                  value: user.name.isEmpty ? '—' : user.name,
+                ),
+                _ProfileInfoRow(
+                  icon: Icons.mail_outline_rounded,
+                  label: 'Gmail',
+                  value: user.email,
+                ),
+                _ProfileInfoRow(
+                  icon: Icons.shield_outlined,
+                  label: 'Assigned role',
+                  value: _roleTitle(),
+                  isLast: true,
+                ),
+              ],
+            ),
           ),
           const SizedBox(height: 18),
           _GlassSection(
-            title: 'Change Password',
-            titleIcon: Icons.key_outlined,
+            title: 'Security',
+            titleIcon: Icons.lock_outline_rounded,
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: <Widget>[
-                Text(
-                  'Use at least $_minPasswordLength characters with a letter and a number. Other sessions will be signed out.',
-                  style: const TextStyle(
+                const Text(
+                  'Update the password for your own Gmail login. Other sessions will be signed out.',
+                  style: TextStyle(
                     color: _DashboardPalette.mutedForeground,
-                    height: 1.5,
+                    height: 1.45,
+                    fontSize: 13.5,
                   ),
                 ),
-                const SizedBox(height: 18),
+                const SizedBox(height: 16),
+                _ProductionField(
+                  label: 'Current password',
+                  errorText: _errors['current'],
+                  child: _ProductionTextField(
+                    controller: _currentPasswordController,
+                    hintText: 'Enter current password',
+                    obscureText: !_showCurrentPassword,
+                    suffixIcon: IconButton(
+                      onPressed: () {
+                        setState(
+                          () => _showCurrentPassword = !_showCurrentPassword,
+                        );
+                      },
+                      icon: Icon(
+                        _showCurrentPassword
+                            ? Icons.visibility_off_outlined
+                            : Icons.visibility_outlined,
+                        color: _DashboardPalette.mutedForeground,
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 12),
                 LayoutBuilder(
                   builder: (BuildContext context, BoxConstraints constraints) {
-                    final bool medium = constraints.maxWidth >= 760;
+                    final bool medium = constraints.maxWidth >= 700;
                     final double width = medium
                         ? (constraints.maxWidth - 12) / 2
                         : constraints.maxWidth;
-
                     return Wrap(
                       spacing: 12,
                       runSpacing: 12,
                       children: <Widget>[
                         SizedBox(
-                          width: constraints.maxWidth,
-                          child: _ProductionField(
-                            label: 'Current Password',
-                            errorText: _errors['current'],
-                            child: _ProductionTextField(
-                              controller: _currentPasswordController,
-                              hintText: 'Enter current password',
-                              obscureText: !_showCurrentPassword,
-                              suffixIcon: IconButton(
-                                onPressed: () {
-                                  setState(
-                                    () => _showCurrentPassword =
-                                        !_showCurrentPassword,
-                                  );
-                                },
-                                icon: Icon(
-                                  _showCurrentPassword
-                                      ? Icons.visibility_off_outlined
-                                      : Icons.visibility_outlined,
-                                  color: _DashboardPalette.mutedForeground,
-                                ),
-                              ),
-                            ),
-                          ),
-                        ),
-                        SizedBox(
                           width: width,
                           child: _ProductionField(
-                            label: 'New Password',
+                            label: 'New password',
                             errorText: _errors['password'],
                             child: _ProductionTextField(
                               controller: _passwordController,
-                              hintText: 'Enter new password',
+                              hintText: 'At least $_minPasswordLength characters',
                               obscureText: !_showPassword,
                               suffixIcon: IconButton(
                                 onPressed: () {
-                                  setState(
-                                    () => _showPassword = !_showPassword,
-                                  );
+                                  setState(() => _showPassword = !_showPassword);
                                 },
                                 icon: Icon(
                                   _showPassword
@@ -7258,11 +7874,11 @@ class _ProfileScreenState extends State<ProfileScreen> {
                         SizedBox(
                           width: width,
                           child: _ProductionField(
-                            label: 'Confirm Password',
+                            label: 'Confirm password',
                             errorText: _errors['confirm'],
                             child: _ProductionTextField(
                               controller: _confirmPasswordController,
-                              hintText: 'Confirm new password',
+                              hintText: 'Repeat new password',
                               obscureText: !_showConfirmPassword,
                               suffixIcon: IconButton(
                                 onPressed: () {
@@ -7285,7 +7901,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                     );
                   },
                 ),
-                const SizedBox(height: 18),
+                const SizedBox(height: 16),
                 FilledButton.icon(
                   onPressed: _saving ? null : _submitPasswordChange,
                   style: FilledButton.styleFrom(
@@ -7296,7 +7912,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                       vertical: 14,
                     ),
                     shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(14),
+                      borderRadius: BorderRadius.circular(12),
                     ),
                   ),
                   icon: _saving
@@ -7309,59 +7925,109 @@ class _ProfileScreenState extends State<ProfileScreen> {
                           ),
                         )
                       : const Icon(Icons.save_outlined),
-                  label: const Text('Update Password'),
+                  label: const Text('Update password'),
                 ),
               ],
             ),
           ),
           const SizedBox(height: 18),
-          _GlassSection(
-            title: 'Sign Out',
-            titleIcon: Icons.logout_rounded,
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(18),
+            decoration: BoxDecoration(
+              color: _DashboardPalette.danger.withValues(alpha: 0.08),
+              borderRadius: BorderRadius.circular(16),
+              border: Border.all(
+                color: _DashboardPalette.danger.withValues(alpha: 0.28),
+              ),
+            ),
             child: Row(
               children: <Widget>[
-                Expanded(
+                Container(
+                  width: 44,
+                  height: 44,
+                  alignment: Alignment.center,
+                  decoration: BoxDecoration(
+                    color: _DashboardPalette.danger.withValues(alpha: 0.14),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: const Icon(
+                    Icons.logout_rounded,
+                    color: _DashboardPalette.danger,
+                  ),
+                ),
+                const SizedBox(width: 14),
+                const Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: <Widget>[
                       Text(
-                        'End your session on this device.',
-                        style: Theme.of(context).textTheme.titleMedium
-                            ?.copyWith(
-                              color: _DashboardPalette.foreground,
-                              fontWeight: FontWeight.w700,
-                            ),
+                        'Sign out',
+                        style: TextStyle(
+                          color: _DashboardPalette.foreground,
+                          fontWeight: FontWeight.w800,
+                          fontSize: 15,
+                        ),
                       ),
-                      const SizedBox(height: 6),
-                      const Text(
-                        'Use this when switching staff members or leaving a shared workstation.',
+                      SizedBox(height: 4),
+                      Text(
+                        'End this session on this device.',
                         style: TextStyle(
                           color: _DashboardPalette.mutedForeground,
-                          height: 1.5,
+                          height: 1.35,
+                          fontSize: 13,
                         ),
                       ),
                     ],
                   ),
                 ),
-                const SizedBox(width: 16),
-                FilledButton.tonalIcon(
+                const SizedBox(width: 12),
+                FilledButton(
                   onPressed: _signOut,
                   style: FilledButton.styleFrom(
-                    foregroundColor: _DashboardPalette.danger,
-                    backgroundColor: _DashboardPalette.danger.withValues(
-                      alpha: 0.12,
+                    backgroundColor: _DashboardPalette.danger,
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 18,
+                      vertical: 14,
                     ),
                     shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(14),
+                      borderRadius: BorderRadius.circular(12),
                     ),
                   ),
-                  icon: const Icon(Icons.logout_rounded),
-                  label: const Text('Logout'),
+                  child: const Text('Logout'),
                 ),
               ],
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+class _ProfileBadge extends StatelessWidget {
+  const _ProfileBadge({required this.label, required this.color});
+
+  final String label;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.14),
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: color.withValues(alpha: 0.35)),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(
+          color: color,
+          fontWeight: FontWeight.w700,
+          fontSize: 11.5,
+        ),
       ),
     );
   }
@@ -7432,6 +8098,11 @@ class _Sidebar extends StatelessWidget {
               label: 'Egg Sales',
               route: AppPaths.sales,
               icon: Icons.shopping_cart_outlined,
+            ),
+            const _NavItem(
+              label: 'Reports',
+              route: AppPaths.reports,
+              icon: Icons.assessment_outlined,
             ),
           ]
         : <_NavItem>[
@@ -7588,9 +8259,9 @@ class _Sidebar extends StatelessWidget {
                       const SizedBox(height: 8),
                       _SidebarTile(
                         item: const _NavItem(
-                          label: 'Account',
+                          label: 'Account Management',
                           route: AppPaths.accounts,
-                          icon: Icons.person_add_alt_1_outlined,
+                          icon: Icons.manage_accounts_outlined,
                         ),
                         selected: selectedRoute == AppPaths.accounts,
                         onTap: () {
@@ -7618,44 +8289,165 @@ class _Sidebar extends StatelessWidget {
 }
 
 void _showNotificationPanel(BuildContext context, AppState appState) {
-  final List<WorkerNotification> notes = appState.workerNotifications;
-  showDialog<void>(
-    context: context,
-    builder: (BuildContext dialogContext) {
-      return AlertDialog(
-        backgroundColor: const Color(0xFF1C1612),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: const Text(
-          'Notifications',
-          style: TextStyle(color: _DashboardPalette.foreground),
-        ),
-        content: SizedBox(
-          width: 360,
-          child: notes.isEmpty
-              ? const Text(
-                  'No notifications.',
-                  style: TextStyle(color: _DashboardPalette.mutedForeground),
-                )
-              : Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: notes
-                      .map(
-                        (WorkerNotification note) => Padding(
-                          padding: const EdgeInsets.only(bottom: 8),
-                          child: _WorkerNotificationTile(notification: note),
-                        ),
-                      )
-                      .toList(),
-                ),
-        ),
-        actions: <Widget>[
+  appState.refreshOperationalNotifications();
+  final bool wide = MediaQuery.sizeOf(context).width >= 700;
+  final Widget panel = AnimatedBuilder(
+    animation: appState,
+    builder: (BuildContext context, Widget? child) {
+      final List<WorkerNotification> notes = appState.workerNotifications;
+      final Widget list = notes.isEmpty
+          ? const Padding(
+              padding: EdgeInsets.symmetric(vertical: 24),
+              child: Text(
+                'No notifications yet. Live farm status will appear here.',
+                style: TextStyle(color: _DashboardPalette.mutedForeground),
+              ),
+            )
+          : ListView.separated(
+              shrinkWrap: true,
+              physics: const ClampingScrollPhysics(),
+              itemCount: notes.length,
+              separatorBuilder: (BuildContext context, int index) =>
+                  const SizedBox(height: 8),
+              itemBuilder: (BuildContext context, int index) {
+                final WorkerNotification note = notes[index];
+                return _WorkerNotificationTile(
+                  notification: note,
+                  onTap: note.read
+                      ? null
+                      : () => appState.markNotificationRead(note.id),
+                );
+              },
+            );
+      final List<Widget> actions = <Widget>[
+        if (appState.workerUnreadCount > 0)
           TextButton(
-            onPressed: () => Navigator.of(dialogContext).pop(),
-            child: const Text('Close'),
+            onPressed: appState.markAllNotificationsRead,
+            child: const Text('Mark all read'),
           ),
-        ],
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Close'),
+        ),
+      ];
+      if (wide) {
+        return AlertDialog(
+          backgroundColor: const Color(0xFF1C1612),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          title: Row(
+            children: <Widget>[
+              const Expanded(
+                child: Text(
+                  'Notifications',
+                  style: TextStyle(color: _DashboardPalette.foreground),
+                ),
+              ),
+              if (appState.workerUnreadCount > 0)
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                  decoration: BoxDecoration(
+                    color: _DashboardPalette.warning.withValues(alpha: 0.2),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Text(
+                    '${appState.workerUnreadCount} new',
+                    style: const TextStyle(
+                      color: _DashboardPalette.warning,
+                      fontSize: 11,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+            ],
+          ),
+          content: SizedBox(width: 420, height: 360, child: list),
+          actions: actions,
+        );
+      }
+      return SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: <Widget>[
+              Center(
+                child: Container(
+                  width: 42,
+                  height: 4,
+                  margin: const EdgeInsets.only(bottom: 12),
+                  decoration: BoxDecoration(
+                    color: _DashboardPalette.mutedForeground.withValues(alpha: 0.4),
+                    borderRadius: BorderRadius.circular(99),
+                  ),
+                ),
+              ),
+              Row(
+                children: <Widget>[
+                  const Expanded(
+                    child: Text(
+                      'Notifications',
+                      style: TextStyle(
+                        color: _DashboardPalette.foreground,
+                        fontSize: 18,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                  ),
+                  ...actions,
+                ],
+              ),
+              const SizedBox(height: 12),
+              ConstrainedBox(
+                constraints: BoxConstraints(
+                  maxHeight: MediaQuery.sizeOf(context).height * 0.55,
+                ),
+                child: list,
+              ),
+            ],
+          ),
+        ),
       );
     },
+  );
+
+  if (wide) {
+    showDialog<void>(context: context, builder: (_) => panel);
+  } else {
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: const Color(0xFF1C1612),
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (_) => panel,
+    );
+  }
+}
+
+Widget _notificationBellButton(BuildContext context, AppState appState) {
+  final int unread = appState.workerUnreadCount;
+  return IconButton(
+    tooltip: 'Notifications',
+    onPressed: () => _showNotificationPanel(context, appState),
+    style: IconButton.styleFrom(
+      backgroundColor: _DashboardPalette.tabBackground,
+    ),
+    icon: Badge(
+      isLabelVisible: unread > 0,
+      label: Text(
+        unread > 9 ? '9+' : '$unread',
+        style: const TextStyle(fontSize: 9),
+      ),
+      backgroundColor: _DashboardPalette.warning,
+      child: Icon(
+        unread > 0
+            ? Icons.notifications_active_outlined
+            : Icons.notifications_none_outlined,
+        color: _DashboardPalette.foreground,
+      ),
+    ),
   );
 }
 
@@ -7787,12 +8579,14 @@ class EggScaffold extends StatefulWidget {
     required this.title,
     required this.selectedRoute,
     required this.body,
+    this.useLoginBackground = false,
   });
 
   final AppState appState;
   final String title;
   final String selectedRoute;
   final Widget body;
+  final bool useLoginBackground;
 
   @override
   State<EggScaffold> createState() => _EggScaffoldState();
@@ -7826,7 +8620,7 @@ class _EggScaffoldState extends State<EggScaffold> {
     }
   }
 
-  // Worker bottom-nav items (mobile only, non-admin).
+  // Mobile bottom-nav — workers and admins (drawer still has full list).
   static const List<_NavItem> _workerBottomItems = <_NavItem>[
     _NavItem(
       label: 'Home',
@@ -7839,7 +8633,7 @@ class _EggScaffoldState extends State<EggScaffold> {
       icon: Icons.egg_alt_outlined,
     ),
     _NavItem(
-      label: 'Grading',
+      label: 'QC',
       route: AppPaths.grading,
       icon: Icons.fact_check_outlined,
     ),
@@ -7850,11 +8644,44 @@ class _EggScaffoldState extends State<EggScaffold> {
     ),
   ];
 
+  static const List<_NavItem> _adminBottomItems = <_NavItem>[
+    _NavItem(
+      label: 'Home',
+      route: AppPaths.dashboard,
+      icon: Icons.dashboard_outlined,
+    ),
+    _NavItem(
+      label: 'Production',
+      route: AppPaths.production,
+      icon: Icons.egg_alt_outlined,
+    ),
+    _NavItem(
+      label: 'QC',
+      route: AppPaths.grading,
+      icon: Icons.fact_check_outlined,
+    ),
+    _NavItem(
+      label: 'Inventory',
+      route: AppPaths.inventory,
+      icon: Icons.inventory_2_outlined,
+    ),
+    _NavItem(
+      label: 'Reports',
+      route: AppPaths.reports,
+      icon: Icons.assessment_outlined,
+    ),
+  ];
+
   static const List<_NavItem> _salesBottomItems = <_NavItem>[
     _NavItem(
       label: 'Sales',
       route: AppPaths.sales,
       icon: Icons.shopping_cart_outlined,
+    ),
+    _NavItem(
+      label: 'Reports',
+      route: AppPaths.reports,
+      icon: Icons.assessment_outlined,
     ),
     _NavItem(
       label: 'Profile',
@@ -7881,6 +8708,11 @@ class _EggScaffoldState extends State<EggScaffold> {
               icon: Icons.shopping_cart_outlined,
             ),
             const _NavItem(
+              label: 'Reports',
+              route: AppPaths.reports,
+              icon: Icons.assessment_outlined,
+            ),
+            const _NavItem(
               label: 'Profile',
               route: AppPaths.profile,
               icon: Icons.person_outline,
@@ -7898,7 +8730,7 @@ class _EggScaffoldState extends State<EggScaffold> {
         icon: Icons.egg_alt_outlined,
       ),
       const _NavItem(
-        label: 'Grading',
+        label: 'Quality Control',
         route: AppPaths.grading,
         icon: Icons.fact_check_outlined,
       ),
@@ -7979,6 +8811,8 @@ class _EggScaffoldState extends State<EggScaffold> {
             ],
           ),
         ),
+        const SizedBox(width: 8),
+        _notificationBellButton(context, appState),
       ],
     );
 
@@ -8037,9 +8871,11 @@ class _EggScaffoldState extends State<EggScaffold> {
       ],
     );
 
-    final List<_NavItem> bottomItems =
-        appState.isSales ? _salesBottomItems : _workerBottomItems;
-    final bool showBottomNav = !wide && !appState.isAdmin;
+    final List<_NavItem> bottomItems = appState.isSales
+        ? _salesBottomItems
+        : (appState.isAdmin ? _adminBottomItems : _workerBottomItems);
+    // Phone / narrow tablet: always show bottom nav so modules stay one tap away.
+    final bool showBottomNav = !wide;
     final int bottomIndex = showBottomNav
         ? bottomItems
               .indexWhere((item) => item.route == selectedRoute)
@@ -8047,7 +8883,9 @@ class _EggScaffoldState extends State<EggScaffold> {
         : 0;
 
     return Scaffold(
-      backgroundColor: const Color(0xFF100C0A),
+      backgroundColor: widget.useLoginBackground
+          ? const Color(0xFF1A120C)
+          : const Color(0xFF100C0A),
       bottomNavigationBar: showBottomNav
           ? Theme(
               data: Theme.of(context).copyWith(
@@ -8199,8 +9037,19 @@ class _EggScaffoldState extends State<EggScaffold> {
                                 ),
                                 selected: false,
                                 onTap: () {
+                                  final NavigatorState rootNav =
+                                      Navigator.of(context, rootNavigator: true);
                                   Navigator.of(context).pop();
-                                  _showNotificationPanel(context, appState);
+                                  WidgetsBinding.instance.addPostFrameCallback((_) {
+                                    final BuildContext panelContext =
+                                        rootNav.context;
+                                    if (panelContext.mounted) {
+                                      _showNotificationPanel(
+                                        panelContext,
+                                        appState,
+                                      );
+                                    }
+                                  });
                                 },
                               ),
                             ),
@@ -8234,25 +9083,52 @@ class _EggScaffoldState extends State<EggScaffold> {
             ),
       body: Stack(
         children: <Widget>[
-          Positioned.fill(
-            child: ColoredBox(
-              color: const Color(0xFF140F0C),
+          if (widget.useLoginBackground) ...<Widget>[
+            const Positioned.fill(
+              child: ColoredBox(color: Color(0xFF1A120C)),
             ),
-          ),
-          Positioned.fill(
-            child: DecoratedBox(
-              decoration: BoxDecoration(
-                gradient: LinearGradient(
-                  begin: Alignment.topCenter,
-                  end: Alignment.bottomCenter,
-                  colors: <Color>[
-                    _DashboardPalette.overlayTop,
-                    _DashboardPalette.overlayBottom,
-                  ],
+            Positioned.fill(
+              child: Image.asset(
+                'assets/egg-factory-bg.jpg',
+                fit: BoxFit.cover,
+              ),
+            ),
+            const Positioned.fill(
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: <Color>[
+                      Color(0xCC3A2A12),
+                      Color(0xB31A120C),
+                      Color(0xE6140E0A),
+                    ],
+                  ),
                 ),
               ),
             ),
-          ),
+          ] else ...<Widget>[
+            const Positioned.fill(
+              child: ColoredBox(
+                color: Color(0xFF140F0C),
+              ),
+            ),
+            Positioned.fill(
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: <Color>[
+                      _DashboardPalette.overlayTop,
+                      _DashboardPalette.overlayBottom,
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ],
           SafeArea(
             child: wide
                 ? Row(
@@ -8274,7 +9150,7 @@ class _EggScaffoldState extends State<EggScaffold> {
   /// Build a badge-aware icon for the bottom nav bar.
   Widget _buildNavIcon(_NavItem item, bool selected, AppState appState) {
     Widget icon = Icon(item.icon);
-    // Badge unread count on Notifications (Home tab proxies to dashboard).
+    // Badge unread farm alerts on Home.
     if (item.route == AppPaths.dashboard && appState.workerUnreadCount > 0) {
       icon = Badge(
         label: Text(
@@ -8282,18 +9158,6 @@ class _EggScaffoldState extends State<EggScaffold> {
           style: const TextStyle(fontSize: 9),
         ),
         backgroundColor: _DashboardPalette.warning,
-        child: icon,
-      );
-    }
-    // Badge pending task count on Production tab.
-    if (item.route == AppPaths.production &&
-        appState.workerPendingTaskCount > 0) {
-      icon = Badge(
-        label: Text(
-          appState.workerPendingTaskCount.toString(),
-          style: const TextStyle(fontSize: 9),
-        ),
-        backgroundColor: _DashboardPalette.danger,
         child: icon,
       );
     }
@@ -8613,8 +9477,7 @@ class _EggAnalyticsBoard extends StatelessWidget {
   Widget build(BuildContext context) {
     final int good = appState.liveGoodEggs;
     final int cracked = appState.liveCrackedEggs;
-    final int dirty = appState.liveDirtyEggs;
-    final int inspected = good + cracked + dirty;
+    final int inspected = good + cracked;
     final int produced = appState.productionRecords.fold<int>(
       0,
       (int sum, ProductionRecord record) => sum + record.count,
@@ -8667,8 +9530,6 @@ class _EggAnalyticsBoard extends StatelessWidget {
           _GradeBar(label: 'Good', count: good, total: base, color: _DashboardPalette.success),
           const SizedBox(height: 8),
           _GradeBar(label: 'Cracked', count: cracked, total: base, color: _DashboardPalette.primary),
-          const SizedBox(height: 8),
-          _GradeBar(label: 'Dirty / rejected', count: dirty, total: base, color: _DashboardPalette.danger),
           if (recentDates.isNotEmpty) ...<Widget>[
             const SizedBox(height: 16),
             const Text(
@@ -8811,16 +9672,14 @@ class _PeriodGradeCounts {
   const _PeriodGradeCounts({
     required this.good,
     required this.cracked,
-    required this.dirty,
     required this.produced,
   });
 
   final int good;
   final int cracked;
-  final int dirty;
   final int produced;
 
-  int get inspected => good + cracked + dirty;
+  int get inspected => good + cracked;
 }
 
 _PeriodGradeCounts _gradesBetween(
@@ -8831,7 +9690,26 @@ _PeriodGradeCounts _gradesBetween(
 }) {
   int good = 0;
   int cracked = 0;
-  int dirty = 0;
+  // 1) Live Egg Records board (camera Clean/Crack) — primary for the week chart.
+  for (final DetectionRecord record in appState.detectionRecords) {
+    final DateTime? parsed = DateTime.tryParse(record.timestamp);
+    if (parsed == null) {
+      continue;
+    }
+    final DateTime day = _dashboardDay(parsed);
+    if (day.isBefore(start) || day.isAfter(end)) {
+      continue;
+    }
+    final String cat = record.category.toLowerCase();
+    final String lab = record.label.toLowerCase();
+    if (cat == 'crackedeggs' ||
+        (lab.contains('crack') && !lab.contains('no crack'))) {
+      cracked += 1;
+    } else {
+      good += 1;
+    }
+  }
+  // 2) Firestore IoT readings (if any).
   for (final IotEggReading reading in appState.iotReadings) {
     final DateTime day = _dashboardDay(reading.createdAt);
     if (day.isBefore(start) || day.isAfter(end)) {
@@ -8840,34 +9718,28 @@ _PeriodGradeCounts _gradesBetween(
     final String grade = reading.displayGrade.toLowerCase();
     if (grade.contains('crack')) {
       cracked += 1;
-    } else if (grade.contains('dirt')) {
-      dirty += 1;
-    } else if (grade.contains('good')) {
+    } else if (grade.contains('good') ||
+        grade.contains('dirt') ||
+        grade.contains('clean')) {
       good += 1;
     }
   }
-  if (useLiveFallback && good + cracked + dirty == 0) {
-    good = appState.liveGoodEggs;
-    cracked = appState.liveCrackedEggs;
-    dirty = appState.liveDirtyEggs;
+  // 3) Live counters as floor for "today" when board/IoT briefly lag.
+  if (useLiveFallback) {
+    if (appState.liveGoodEggs > good) {
+      good = appState.liveGoodEggs;
+    }
+    if (appState.liveCrackedEggs > cracked) {
+      cracked = appState.liveCrackedEggs;
+    }
   }
+  final int produced = _productionBetween(appState, start, end);
+  final int inspected = good + cracked;
   return _PeriodGradeCounts(
     good: good,
     cracked: cracked,
-    dirty: dirty,
-    produced: _productionBetween(appState, start, end),
+    produced: inspected > produced ? inspected : produced,
   );
-}
-
-int _todayTotalEggs(AppState appState) {
-  final DateTime today = _dashboardDay(DateTime.now());
-  final _PeriodGradeCounts counts = _gradesBetween(
-    appState,
-    today,
-    today,
-    useLiveFallback: true,
-  );
-  return counts.inspected > 0 ? counts.inspected : counts.produced;
 }
 
 const List<String> _weekDayLabels = <String>[
@@ -8903,7 +9775,7 @@ int _eggsOnDay(AppState appState, DateTime day) {
   }
   int live = 0;
   if (date == _dashboardDay(DateTime.now())) {
-    live = appState.liveGoodEggs + appState.liveCrackedEggs + appState.liveDirtyEggs;
+    live = appState.liveGoodEggs + appState.liveCrackedEggs;
   }
   int best = produced;
   if (detected > best) {
@@ -8937,9 +9809,11 @@ void _countGrade(String raw, int qty, List<int> counts) {
   final int amount = qty <= 0 ? 1 : qty;
   if (grade.contains('crack')) {
     counts[1] += amount;
-  } else if (grade.contains('dirt') || grade.contains('reject')) {
-    counts[2] += amount;
-  } else if (grade.contains('good') || grade.contains('clean')) {
+  } else if (grade.contains('good') ||
+      grade.contains('clean') ||
+      grade.contains('dirt') ||
+      grade.contains('reject')) {
+    // Dirty/dust is not a system grade — count as Good.
     counts[0] += amount;
   }
 }
@@ -8981,16 +9855,22 @@ _DayHarvest _harvestOnDay(AppState appState, DateTime day) {
     sources.add(<int>[
       appState.liveGoodEggs,
       appState.liveCrackedEggs,
-      appState.liveDirtyEggs,
+      0,
     ]);
   }
 
   List<int> best = <int>[0, 0, 0];
   int bestTotal = 0;
   for (final List<int> source in sources) {
-    final int total = source[0] + source[1] + source[2];
+    // Index 2 was Dirty — fold into Good; Crack only is reject.
+    final List<int> folded = <int>[
+      source[0] + source[2],
+      source[1],
+      0,
+    ];
+    final int total = folded[0] + folded[1];
     if (total > bestTotal) {
-      best = source;
+      best = folded;
       bestTotal = total;
     }
   }
@@ -9000,7 +9880,7 @@ _DayHarvest _harvestOnDay(AppState appState, DateTime day) {
     harvested: logged > bestTotal ? logged : bestTotal,
     good: best[0],
     crack: best[1],
-    rejected: best[2],
+    rejected: 0,
   );
 }
 
@@ -9194,12 +10074,6 @@ class _InventoryStatusCardState extends State<_InventoryStatusCard> {
               value: '${grades.cracked}',
               color: _DashboardPalette.warning,
             ),
-            const SizedBox(height: 8),
-            _InventoryStatusRow(
-              label: 'Dirty / rejected',
-              value: '${grades.dirty}',
-              color: _DashboardPalette.danger,
-            ),
           ],
           if (_showCalendar) ...<Widget>[
             const SizedBox(height: 12),
@@ -9344,6 +10218,12 @@ class _DayCell extends StatelessWidget {
 // ── Live Inspection section ────────────────────────────────────────────────
 
 String _friendlyInspectionStatus(String raw, bool ok) {
+  final String low = raw.toLowerCase();
+  if (low.contains('permission-denied')) {
+    return ok
+        ? 'Camera records on farm PC. Cloud Firestore sync needs rules (permission-denied).'
+        : 'Firestore permission-denied — farm Live Inspection still works from the PC.';
+  }
   if (ok) {
     return raw;
   }
@@ -9373,15 +10253,24 @@ class _LiveCameraStream extends StatelessWidget {
 
   final AppState appState;
 
-  /// Worker dashboard only. Admin keeps the multipart stream.
+  /// Prefer true on hosted web — Cloudflare/QUIC cancels long /stream MJPEG.
   final bool pollSnapshots;
 
   @override
   Widget build(BuildContext context) {
     final bool live = appState.liveInspectionConnected;
-    final String streamUrl = pollSnapshots
-        ? '${appState.liveInspectionBackendUrl}/live.jpg'
-        : '${appState.liveInspectionBackendUrl}/stream';
+    // Prefer relative paths on workers.dev so the camera never hits LAN http
+    // (mixed-content block). liveInspectionBackendUrl is already same-origin
+    // when hosted; keep absolute for native / LAN builds.
+    final String base = appState.liveInspectionBackendUrl;
+    // Hosted tunnel cannot keep multipart /stream open — poll still JPEGs.
+    // Prefer the farm tunnel for snapshots: workers.dev returns 429 when the
+    // dashboard polls /live.jpg too often through the Worker proxy.
+    final bool usePoll = pollSnapshots || ApiConfig.isHostedHttpsWeb;
+    final String camBase = ApiConfig.isHostedHttpsWeb
+        ? ApiConfig.farmTunnelUrl
+        : base;
+    final String streamUrl = usePoll ? '$camBase/live.jpg' : '$camBase/stream';
 
     return SizedBox(
       width: 280,
@@ -9435,9 +10324,9 @@ class _LiveCameraStream extends StatelessWidget {
                 child: ColoredBox(
                   color: const Color(0xFF211A16),
                   child: LiveCamMjpeg(
-                    key: ValueKey<String>('$streamUrl|$pollSnapshots'),
+                    key: ValueKey<String>('$streamUrl|$usePoll'),
                     streamUrl: streamUrl,
-                    pollSnapshots: pollSnapshots,
+                    pollSnapshots: usePoll,
                   ),
                 ),
               ),
@@ -9459,51 +10348,112 @@ class _LiveInspectionLedger extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final bool hasResult =
-        appState.liveLastLabel != 'N/A' && appState.liveLastLabel.isNotEmpty;
-    final bool ok = appState.liveInspectionConnected;
-    final Color frame = ok
-        ? const Color(0xFF3A302A)
-        : _DashboardPalette.warning.withValues(alpha: 0.35);
+    // Rebuild on every AppState notify. EggScaffold receives a pre-built body
+    // Widget; Flutter skips updating identical body instances, so Live Egg
+    // Records otherwise stayed stale until a full page refresh.
+    return ListenableBuilder(
+      listenable: appState,
+      builder: (BuildContext context, Widget? _) {
+        final String lab = appState.liveLastLabel.trim();
+        final String low = lab.toLowerCase();
+        final bool hasResult = appState.liveAwaitingWeight ||
+            (lab.isNotEmpty &&
+                lab != 'N/A' &&
+                low != 'empty model' &&
+                low != 'scanning' &&
+                low != 'egg' &&
+                low != 'detecting') ||
+            appState.detectionRecords.isNotEmpty;
+        final bool ok = appState.liveInspectionConnected;
+        final Color frame = ok
+            ? const Color(0xFF3A302A)
+            : _DashboardPalette.warning.withValues(alpha: 0.35);
 
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: const Color(0xFF171210),
-        borderRadius: BorderRadius.circular(18),
-        border: Border.all(color: frame),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: <Widget>[
-          Row(
+        return Container(
+          width: double.infinity,
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: const Color(0xFF171210),
+            borderRadius: BorderRadius.circular(18),
+            border: Border.all(color: frame),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: <Widget>[
-              const Icon(
-                Icons.videocam_outlined,
-                size: 18,
-                color: _DashboardPalette.primary,
+              Row(
+                children: <Widget>[
+                  const Icon(
+                    Icons.videocam_outlined,
+                    size: 18,
+                    color: _DashboardPalette.primary,
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      'Live Inspection',
+                      style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                        color: _DashboardPalette.foreground,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                  ),
+                  TextButton.icon(
+                    onPressed: () async {
+                      final bool? ok = await showDialog<bool>(
+                        context: context,
+                        builder: (BuildContext ctx) => AlertDialog(
+                          title: const Text('Reset today\'s records?'),
+                          content: const Text(
+                            'This clears Good / Cracked counts for today '
+                            'in the app and deletes today\'s eggs from Firebase.',
+                          ),
+                          actions: <Widget>[
+                            TextButton(
+                              onPressed: () => Navigator.pop(ctx, false),
+                              child: const Text('Cancel'),
+                            ),
+                            FilledButton(
+                              onPressed: () => Navigator.pop(ctx, true),
+                              child: const Text('Reset'),
+                            ),
+                          ],
+                        ),
+                      );
+                      if (ok == true) {
+                        final bool farmOk = await appState.resetCounters();
+                        if (context.mounted) {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(
+                              content: Text(
+                                farmOk
+                                    ? 'Today\'s inspection records were reset.'
+                                    : 'Cleared on this device. Farm reset may still be syncing — check you are signed in as admin.',
+                              ),
+                            ),
+                          );
+                        }
+                      }
+                    },
+                    icon: const Icon(Icons.refresh_rounded, size: 16),
+                    label: const Text('Reset'),
+                    style: TextButton.styleFrom(
+                      foregroundColor: _DashboardPalette.warning,
+                    ),
+                  ),
+                ],
               ),
-              const SizedBox(width: 8),
-              Text(
-                'Live Inspection',
-                style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                  color: _DashboardPalette.foreground,
-                  fontWeight: FontWeight.w800,
-                ),
-              ),
+              const SizedBox(height: 12),
+              _InspectionSystemStatus(appState: appState),
+              const SizedBox(height: 12),
+              _EggCountRow(appState: appState),
+              const SizedBox(height: 12),
+              _EggResultCard(appState: appState, hasResult: hasResult),
+              const SizedBox(height: 12),
+              _IotReadingsPanel(appState: appState),
             ],
           ),
-          const SizedBox(height: 12),
-          _InspectionSystemStatus(appState: appState),
-          const SizedBox(height: 12),
-          _EggCountRow(appState: appState),
-          const SizedBox(height: 12),
-          _EggResultCard(appState: appState, hasResult: hasResult),
-          const SizedBox(height: 12),
-          _IotReadingsPanel(appState: appState),
-        ],
-      ),
+        );
+      },
     );
   }
 }
@@ -9595,7 +10545,7 @@ class _InspectionSystemStatus extends StatelessWidget {
 
 // ── Combined quality + size result card ────────────────────────────────────
 
-/// Shows the most recent egg's quality (Good / Cracked / Dirty) side-by-side
+/// Shows the most recent egg's quality (Good / Cracked) side-by-side
 /// with its weight class (Peewee → Jumbo).  When no egg has been seen yet the
 /// card shows a neutral waiting state.
 class _EggResultCard extends StatelessWidget {
@@ -9606,25 +10556,29 @@ class _EggResultCard extends StatelessWidget {
 
   Color _qualityColor(String label) {
     final String s = label.toLowerCase();
-    if (s.contains('no crack') || s.contains('good') || s.contains('ok')) {
+    if (s.contains('no crack') ||
+        s.contains('clean') ||
+        s.contains('good') ||
+        s.contains('ok')) {
       return _DashboardPalette.success;
     }
     if (s.contains('crack') || s.contains('broken')) {
       return _DashboardPalette.warning;
-    }
-    if (s.contains('dirty') || s.contains('soil') || s.contains('stain')) {
-      return _DashboardPalette.danger;
     }
     return _DashboardPalette.primary;
   }
 
   String _qualityShort(String label) {
     final String s = label.toLowerCase();
-    if (s.contains('no crack') || s.contains('good') || s.contains('ok')) {
+    if (s.contains('no crack') ||
+        s.contains('clean') ||
+        s.contains('good') ||
+        s.contains('ok') ||
+        s.contains('dirty') ||
+        s.contains('soil')) {
       return 'Good';
     }
     if (s.contains('crack') || s.contains('broken')) return 'Cracked';
-    if (s.contains('dirty') || s.contains('soil')) return 'Dirty';
     return label;
   }
 
@@ -9687,13 +10641,24 @@ class _EggResultCard extends StatelessWidget {
       );
     }
 
-    final Color qColor = _qualityColor(appState.liveLastLabel);
-    final String qShort = _qualityShort(appState.liveLastLabel);
+    String displayLabel = appState.liveLastLabel;
+    if ((displayLabel.isEmpty ||
+            displayLabel == 'N/A' ||
+            displayLabel.toLowerCase() == 'empty model') &&
+        appState.detectionRecords.isNotEmpty) {
+      displayLabel = appState.detectionRecords.first.label;
+    }
+    final Color qColor = _qualityColor(displayLabel);
+    final String qShort = _qualityShort(displayLabel);
     final EggSizeClass sz = appState.liveLastSizeClass;
     final Color szColor = _sizeColors[sz] ?? _DashboardPalette.primary;
     final double weight = appState.liveLastWeightGrams;
     final double conf = appState.liveLastConfidence;
     final String meas = appState.liveLastMeasurementStatus;
+    final bool pendingWeight = appState.liveAwaitingWeight ||
+        (qShort == 'Good' && weight < 5.0) ||
+        (appState.detectionRecords.isNotEmpty &&
+            appState.detectionRecords.first.isPendingWeight);
     final bool measWarn =
         weight >= 5.0 && (meas == 'simulated' || meas == 'uncalibrated');
 
@@ -9707,7 +10672,26 @@ class _EggResultCard extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
-          if (measWarn)
+          if (pendingWeight)
+            Container(
+              width: double.infinity,
+              margin: const EdgeInsets.fromLTRB(12, 12, 12, 0),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              decoration: BoxDecoration(
+                color: const Color(0x332E7D32),
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: const Color(0x664CAF50)),
+              ),
+              child: const Text(
+                'RECORDED — pending weight (egg on pad / scale next)',
+                style: TextStyle(
+                  color: Color(0xFF81C784),
+                  fontSize: 11,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            )
+          else if (measWarn)
             Container(
               width: double.infinity,
               margin: const EdgeInsets.fromLTRB(12, 12, 12, 0),
@@ -9739,10 +10723,12 @@ class _EggResultCard extends StatelessWidget {
                   color: _DashboardPalette.primary,
                 ),
                 const SizedBox(width: 8),
-                const Expanded(
+                Expanded(
                   child: Text(
-                    'Last Inspection Result',
-                    style: TextStyle(
+                    pendingWeight
+                        ? 'Last Inspection — pending weight'
+                        : 'Last Inspection Result',
+                    style: const TextStyle(
                       color: _DashboardPalette.foreground,
                       fontWeight: FontWeight.w700,
                       fontSize: 13,
@@ -9761,7 +10747,9 @@ class _EggResultCard extends StatelessWidget {
                     border: Border.all(color: qColor.withValues(alpha: 0.4)),
                   ),
                   child: Text(
-                    '${conf.toStringAsFixed(1)}% conf.',
+                    conf >= 1.0
+                        ? '${conf.toStringAsFixed(1)}% conf.'
+                        : 'RECORDED',
                     style: TextStyle(
                       color: qColor,
                       fontSize: 11,
@@ -9787,7 +10775,7 @@ class _EggResultCard extends StatelessWidget {
                   child: _ResultHalf(
                     topLabel: 'QUALITY',
                     mainText: qShort,
-                    subText: appState.liveLastLabel,
+                    subText: displayLabel,
                     accentColor: qColor,
                     badgeText: qShort.toUpperCase(),
                     icon: qShort == 'Good'
@@ -9808,16 +10796,25 @@ class _EggResultCard extends StatelessWidget {
 
                 // Size half
                 Expanded(
-                  child: _ResultHalf(
-                    topLabel: 'SIZE CLASS',
-                    mainText: sz.label,
-                    subText:
-                        '${weight > 0 ? weight.toStringAsFixed(1) : '—'} g'
-                        '  ·  ${sz.rangeLabel}',
-                    accentColor: szColor,
-                    badgeText: sz.code,
-                    icon: Icons.straighten_rounded,
-                  ),
+                  child: pendingWeight
+                      ? const _ResultHalf(
+                          topLabel: 'SIZE CLASS',
+                          mainText: 'Pending',
+                          subText: 'No weight yet — waiting on scale',
+                          accentColor: Color(0xFFC4A574),
+                          badgeText: 'WAIT',
+                          icon: Icons.hourglass_top_rounded,
+                        )
+                      : _ResultHalf(
+                          topLabel: 'SIZE CLASS',
+                          mainText: sz.label,
+                          subText:
+                              '${weight > 0 ? weight.toStringAsFixed(1) : '—'} g'
+                              '  ·  ${sz.rangeLabel}',
+                          accentColor: szColor,
+                          badgeText: sz.code,
+                          icon: Icons.straighten_rounded,
+                        ),
                 ),
               ],
             ),
@@ -9826,10 +10823,13 @@ class _EggResultCard extends StatelessWidget {
           const SizedBox(height: 16),
 
           // ── Size class scale bar ─────────────────────────────────────────
-          Padding(
-            padding: const EdgeInsets.fromLTRB(18, 0, 18, 18),
-            child: _SizeScaleBar(current: sz),
-          ),
+          if (!pendingWeight)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(18, 0, 18, 18),
+              child: _SizeScaleBar(current: sz),
+            )
+          else
+            const SizedBox(height: 2),
         ],
       ),
     );
@@ -10016,12 +11016,35 @@ class _EggCountRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // Prefer live metrics, but never show 0 when the board list has eggs
+    // (farm /metrics can reset on backend restart while cached rows remain).
+    int good = appState.liveGoodEggs;
+    int cracked = appState.liveCrackedEggs;
+    int boardGood = 0;
+    int boardCrack = 0;
+    for (final DetectionRecord row in appState.detectionRecords) {
+      final String cat = row.category.toLowerCase();
+      final String lab = row.label.toLowerCase();
+      final bool isCrack = cat == 'crackedeggs' ||
+          (lab.contains('crack') && !lab.contains('no crack'));
+      if (isCrack) {
+        boardCrack += 1;
+      } else {
+        boardGood += 1;
+      }
+    }
+    if (boardGood > good) {
+      good = boardGood;
+    }
+    if (boardCrack > cracked) {
+      cracked = boardCrack;
+    }
     return Row(
       children: <Widget>[
         Expanded(
           child: _CountTile(
             label: 'Good',
-            value: appState.liveGoodEggs,
+            value: good,
             icon: Icons.check_circle_outline_rounded,
             accent: _DashboardPalette.success,
           ),
@@ -10030,18 +11053,9 @@ class _EggCountRow extends StatelessWidget {
         Expanded(
           child: _CountTile(
             label: 'Cracked',
-            value: appState.liveCrackedEggs,
+            value: cracked,
             icon: Icons.warning_amber_rounded,
             accent: _DashboardPalette.warning,
-          ),
-        ),
-        const SizedBox(width: 12),
-        Expanded(
-          child: _CountTile(
-            label: 'Dirty',
-            value: appState.liveDirtyEggs,
-            icon: Icons.do_not_disturb_on_outlined,
-            accent: _DashboardPalette.danger,
           ),
         ),
       ],
@@ -10057,6 +11071,9 @@ class _IotReadingsPanel extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final List<IotEggReading> readings = appState.iotReadings;
+    final List<DetectionRecord> farmRecs = appState.detectionRecords;
+    final bool firestoreDenied =
+        appState.liveInspectionStatus.toLowerCase().contains('permission-denied');
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(16),
@@ -10069,7 +11086,7 @@ class _IotReadingsPanel extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
           const Text(
-            'IOT SCALE (FIRESTORE)',
+            'LIVE EGG RECORDS',
             style: TextStyle(
               color: _DashboardPalette.mutedForeground,
               fontSize: 10,
@@ -10078,93 +11095,201 @@ class _IotReadingsPanel extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 6),
-          const Text(
-            'Load-cell calibration deferred — simulated/uncalibrated weights are labeled.',
+          Text(
+            firestoreDenied
+                ? 'Farm PC records below. Firestore cloud sync blocked (permissions) — local pending still shown.'
+                : 'Camera Clean/Crack records appear here immediately; weight fills when the pad reports grams.',
             style: TextStyle(
-              color: Color(0xFFC4A574),
+              color: firestoreDenied
+                  ? const Color(0xFFE8A838)
+                  : const Color(0xFFC4A574),
               fontSize: 11,
             ),
           ),
           const SizedBox(height: 10),
-          if (readings.isEmpty)
+          if (readings.isEmpty && farmRecs.isEmpty)
             const Text(
-              'No IoT readings yet. On DevKit Serial type: sim55  (integration test weight).',
+              'No egg records yet. When the camera says Clean, a pending (no weight) row appears here.',
               style: TextStyle(color: _DashboardPalette.mutedForeground),
             )
-          else
-            ...readings.take(8).map(
-              (IotEggReading reading) {
-                final String quality = reading.displayGrade;
-                final Color accent = _iotQualityColor(quality);
-                return Padding(
-                  padding: const EdgeInsets.only(bottom: 8),
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: <Widget>[
-                      Icon(Icons.egg, color: accent, size: 22),
-                      const SizedBox(width: 10),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: <Widget>[
-                            Text.rich(
-                              TextSpan(
-                                children: <InlineSpan>[
-                                  TextSpan(
-                                    text: quality.toUpperCase(),
-                                    style: TextStyle(
-                                      color: accent,
-                                      fontWeight: FontWeight.w800,
-                                    ),
-                                  ),
-                                  TextSpan(
-                                    text:
-                                        '  •  ${reading.weightGrams.toStringAsFixed(1)} g',
-                                    style: const TextStyle(
-                                      color: _DashboardPalette.foreground,
-                                      fontWeight: FontWeight.w700,
-                                    ),
-                                  ),
-                                  if (reading.sizeClass.isNotEmpty)
+          else ...<Widget>[
+            if (farmRecs.isNotEmpty)
+              ...farmRecs.take(8).map(
+                (DetectionRecord rec) {
+                  final String quality = _farmRecordQuality(rec);
+                  final Color accent = _iotQualityColor(quality);
+                  final bool pending = rec.isPendingWeight;
+                  return Padding(
+                    padding: const EdgeInsets.only(bottom: 8),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: <Widget>[
+                        Icon(Icons.egg, color: accent, size: 22),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: <Widget>[
+                              Text.rich(
+                                TextSpan(
+                                  children: <InlineSpan>[
                                     TextSpan(
-                                      text: '  •  ${reading.sizeClass}',
-                                      style: const TextStyle(
-                                        color: _DashboardPalette.mutedForeground,
+                                      text: quality.toUpperCase(),
+                                      style: TextStyle(
+                                        color: accent,
+                                        fontWeight: FontWeight.w800,
                                       ),
                                     ),
-                                ],
+                                    TextSpan(
+                                      text: pending
+                                          ? '  •  pending weight'
+                                          : '  •  ${rec.weightGrams.toStringAsFixed(1)} g',
+                                      style: TextStyle(
+                                        color: pending
+                                            ? const Color(0xFFC4A574)
+                                            : _DashboardPalette.foreground,
+                                        fontWeight: FontWeight.w700,
+                                      ),
+                                    ),
+                                    if (!pending)
+                                      TextSpan(
+                                        text: '  •  ${rec.sizeClass.label}',
+                                        style: const TextStyle(
+                                          color:
+                                              _DashboardPalette.mutedForeground,
+                                        ),
+                                      ),
+                                  ],
+                                ),
                               ),
-                            ),
-                            if (reading.isSimulated || reading.isUncalibrated)
                               Text(
-                                reading.measurementBanner,
+                                pending
+                                    ? 'Camera recorded — waiting for scale'
+                                    : 'Farm record',
                                 style: TextStyle(
-                                  color: reading.isSimulated
-                                      ? const Color(0xFFE8A838)
-                                      : const Color(0xFFC4A574),
+                                  color: pending
+                                      ? const Color(0xFF81C784)
+                                      : _DashboardPalette.mutedForeground,
                                   fontSize: 10,
                                   fontWeight: FontWeight.w600,
                                 ),
                               ),
-                          ],
+                            ],
+                          ),
                         ),
-                      ),
-                      Text(
-                        _formatIotTime(reading.createdAt),
-                        style: const TextStyle(
-                          color: _DashboardPalette.mutedForeground,
-                          fontSize: 11,
+                        Text(
+                          rec.timestamp.length >= 8
+                              ? rec.timestamp.substring(
+                                  rec.timestamp.length - 8,
+                                )
+                              : rec.timestamp,
+                          style: const TextStyle(
+                            color: _DashboardPalette.mutedForeground,
+                            fontSize: 11,
+                          ),
                         ),
-                      ),
-                    ],
-                  ),
-                );
-              },
-            ),
+                      ],
+                    ),
+                  );
+                },
+              )
+            else
+              ...readings.take(8).map(
+                (IotEggReading reading) {
+                  final String quality = reading.displayGrade;
+                  final Color accent = _iotQualityColor(quality);
+                  final bool pending = reading.weightGrams < 5.0 &&
+                      (reading.sizeClass.toLowerCase() == 'pending' ||
+                          reading.sizeClass.isEmpty);
+                  return Padding(
+                    padding: const EdgeInsets.only(bottom: 8),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: <Widget>[
+                        Icon(Icons.egg, color: accent, size: 22),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: <Widget>[
+                              Text.rich(
+                                TextSpan(
+                                  children: <InlineSpan>[
+                                    TextSpan(
+                                      text: quality.toUpperCase(),
+                                      style: TextStyle(
+                                        color: accent,
+                                        fontWeight: FontWeight.w800,
+                                      ),
+                                    ),
+                                    TextSpan(
+                                      text: pending
+                                          ? '  •  pending weight'
+                                          : '  •  ${reading.weightGrams.toStringAsFixed(1)} g',
+                                      style: TextStyle(
+                                        color: pending
+                                            ? const Color(0xFFC4A574)
+                                            : _DashboardPalette.foreground,
+                                        fontWeight: FontWeight.w700,
+                                      ),
+                                    ),
+                                    if (!pending && reading.sizeClass.isNotEmpty)
+                                      TextSpan(
+                                        text: '  •  ${reading.sizeClass}',
+                                        style: const TextStyle(
+                                          color:
+                                              _DashboardPalette.mutedForeground,
+                                        ),
+                                      ),
+                                  ],
+                                ),
+                              ),
+                              if (reading.isSimulated || reading.isUncalibrated)
+                                Text(
+                                  reading.measurementBanner,
+                                  style: TextStyle(
+                                    color: reading.isSimulated
+                                        ? const Color(0xFFE8A838)
+                                        : const Color(0xFFC4A574),
+                                    fontSize: 10,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                            ],
+                          ),
+                        ),
+                        Text(
+                          _formatIotTime(reading.createdAt),
+                          style: const TextStyle(
+                            color: _DashboardPalette.mutedForeground,
+                            fontSize: 11,
+                          ),
+                        ),
+                      ],
+                    ),
+                  );
+                },
+              ),
+          ],
         ],
       ),
     );
   }
+}
+
+String _farmRecordQuality(DetectionRecord rec) {
+  final String s = '${rec.label} ${rec.category}'.toLowerCase();
+  if (s.contains('crack') || s.contains('broken')) return 'Cracked';
+  if (s.contains('clean') ||
+      s.contains('good') ||
+      s.contains('no crack') ||
+      s.contains('goodeggs') ||
+      s.contains('dirty') ||
+      s.contains('soil') ||
+      s.contains('dirtyeggs')) {
+    return 'Good';
+  }
+  return rec.label.isNotEmpty ? rec.label : 'Egg';
 }
 
 String _formatIotTime(DateTime time) {
@@ -10306,371 +11431,6 @@ class _PulsingDotState extends State<_PulsingDot>
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// WORKER DASHBOARD PANELS
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// The main worker panel — four fully-functional cards driven by AppState.
-class _WorkerDashboardPanels extends StatelessWidget {
-  const _WorkerDashboardPanels({required this.appState});
-
-  final AppState appState;
-
-  @override
-  Widget build(BuildContext context) {
-    return LayoutBuilder(
-      builder: (BuildContext context, BoxConstraints constraints) {
-        final bool twoCol = constraints.maxWidth >= 820;
-        final double w = twoCol
-            ? (constraints.maxWidth - 16) / 2
-            : constraints.maxWidth;
-
-        return Wrap(
-          spacing: 16,
-          runSpacing: 16,
-          children: <Widget>[
-            SizedBox(
-              width: w,
-              child: _WorkerTaskCard(appState: appState),
-            ),
-            SizedBox(
-              width: w,
-              child: _WorkerSubmissionCard(appState: appState),
-            ),
-            SizedBox(
-              width: w,
-              child: _WorkerNotificationCard(appState: appState),
-            ),
-            SizedBox(
-              width: w,
-              child: _WorkerActivityCard(appState: appState),
-            ),
-          ],
-        );
-      },
-    );
-  }
-}
-
-// ── Pending Tasks card ─────────────────────────────────────────────────────
-
-class _WorkerTaskCard extends StatelessWidget {
-  const _WorkerTaskCard({required this.appState});
-
-  final AppState appState;
-
-  @override
-  Widget build(BuildContext context) {
-    final int pending = appState.workerPendingTaskCount;
-    return _GlassSection(
-      titleIcon: Icons.checklist_rounded,
-      title: 'Pending Tasks',
-      trailing: pending > 0
-          ? Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-              decoration: BoxDecoration(
-                color: _DashboardPalette.warning.withValues(alpha: 0.18),
-                borderRadius: BorderRadius.circular(20),
-              ),
-              child: Text(
-                '$pending left',
-                style: const TextStyle(
-                  color: _DashboardPalette.warning,
-                  fontSize: 11,
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-            )
-          : Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-              decoration: BoxDecoration(
-                color: _DashboardPalette.success.withValues(alpha: 0.18),
-                borderRadius: BorderRadius.circular(20),
-              ),
-              child: const Text(
-                'All done',
-                style: TextStyle(
-                  color: _DashboardPalette.success,
-                  fontSize: 11,
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-            ),
-      child: Column(
-        children: appState.workerTasks.entries
-            .map(
-              (MapEntry<String, bool> entry) => Padding(
-                padding: const EdgeInsets.only(bottom: 10),
-                child: _WorkerTaskTile(
-                  label: entry.key,
-                  done: entry.value,
-                  onToggle: () => appState.toggleWorkerTask(entry.key),
-                  onNavigate: () {
-                    final String route =
-                        entry.key.toLowerCase().contains('grad') ||
-                            entry.key.toLowerCase().contains('damaged')
-                        ? AppPaths.grading
-                        : AppPaths.production;
-                    Navigator.of(context).pushReplacementNamed(route);
-                  },
-                ),
-              ),
-            )
-            .toList(),
-      ),
-    );
-  }
-}
-
-class _WorkerTaskTile extends StatelessWidget {
-  const _WorkerTaskTile({
-    required this.label,
-    required this.done,
-    required this.onToggle,
-    required this.onNavigate,
-  });
-
-  final String label;
-  final bool done;
-  final VoidCallback onToggle;
-  final VoidCallback onNavigate;
-
-  @override
-  Widget build(BuildContext context) {
-    return Material(
-      color: Colors.transparent,
-      borderRadius: BorderRadius.circular(14),
-      child: InkWell(
-        onTap: onNavigate,
-        borderRadius: BorderRadius.circular(14),
-        child: Ink(
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-          decoration: BoxDecoration(
-            color: done
-                ? _DashboardPalette.success.withValues(alpha: 0.07)
-                : _DashboardPalette.tabBackground,
-            borderRadius: BorderRadius.circular(14),
-            border: Border.all(
-              color: done
-                  ? _DashboardPalette.success.withValues(alpha: 0.35)
-                  : _DashboardPalette.glassBorder,
-            ),
-          ),
-          child: Row(
-            children: <Widget>[
-              // Tap the checkbox to toggle done; tap the row to navigate
-              GestureDetector(
-                onTap: onToggle,
-                child: AnimatedContainer(
-                  duration: const Duration(milliseconds: 200),
-                  width: 24,
-                  height: 24,
-                  decoration: BoxDecoration(
-                    color: done
-                        ? _DashboardPalette.success
-                        : Colors.transparent,
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(
-                      color: done
-                          ? _DashboardPalette.success
-                          : _DashboardPalette.mutedForeground,
-                      width: 1.5,
-                    ),
-                  ),
-                  child: done
-                      ? const Icon(
-                          Icons.check_rounded,
-                          size: 15,
-                          color: Colors.black,
-                        )
-                      : null,
-                ),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Text(
-                  label,
-                  style: TextStyle(
-                    color: done
-                        ? _DashboardPalette.mutedForeground
-                        : _DashboardPalette.foreground,
-                    fontSize: 13,
-                    fontWeight: FontWeight.w500,
-                    decoration: done ? TextDecoration.lineThrough : null,
-                    decorationColor: _DashboardPalette.mutedForeground,
-                  ),
-                ),
-              ),
-              Icon(
-                Icons.arrow_forward_ios_rounded,
-                size: 13,
-                color: done
-                    ? _DashboardPalette.mutedForeground.withValues(alpha: 0.4)
-                    : _DashboardPalette.mutedForeground,
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-// ── Submission Status card ─────────────────────────────────────────────────
-
-class _WorkerSubmissionCard extends StatelessWidget {
-  const _WorkerSubmissionCard({required this.appState});
-
-  final AppState appState;
-
-  @override
-  Widget build(BuildContext context) {
-    final int submitted = appState.workerSubmissions.values
-        .where((bool v) => v)
-        .length;
-    final int total = appState.workerSubmissions.length;
-
-    return _GlassSection(
-      titleIcon: Icons.assignment_turned_in_outlined,
-      title: 'Submission Status',
-      trailing: Text(
-        '$submitted / $total submitted',
-        style: TextStyle(
-          color: submitted == total
-              ? _DashboardPalette.success
-              : _DashboardPalette.mutedForeground,
-          fontSize: 12,
-          fontWeight: FontWeight.w600,
-        ),
-      ),
-      child: Column(
-        children: <Widget>[
-          // Progress bar
-          ClipRRect(
-            borderRadius: BorderRadius.circular(4),
-            child: LinearProgressIndicator(
-              value: submitted / total,
-              minHeight: 6,
-              backgroundColor: _DashboardPalette.glassBorder,
-              valueColor: const AlwaysStoppedAnimation<Color>(
-                _DashboardPalette.success,
-              ),
-            ),
-          ),
-          const SizedBox(height: 14),
-          ...appState.workerSubmissions.entries.map(
-            (MapEntry<String, bool> entry) => Padding(
-              padding: const EdgeInsets.only(bottom: 10),
-              child: _WorkerSubmissionTile(
-                label: entry.key,
-                submitted: entry.value,
-                onSubmit: entry.value
-                    ? null
-                    : () => appState.markSubmitted(entry.key),
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _WorkerSubmissionTile extends StatelessWidget {
-  const _WorkerSubmissionTile({
-    required this.label,
-    required this.submitted,
-    required this.onSubmit,
-  });
-
-  final String label;
-  final bool submitted;
-  final VoidCallback? onSubmit;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-      decoration: BoxDecoration(
-        color: submitted
-            ? _DashboardPalette.success.withValues(alpha: 0.07)
-            : _DashboardPalette.tabBackground,
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(
-          color: submitted
-              ? _DashboardPalette.success.withValues(alpha: 0.30)
-              : _DashboardPalette.glassBorder,
-        ),
-      ),
-      child: Row(
-        children: <Widget>[
-          Icon(
-            submitted
-                ? Icons.check_circle_rounded
-                : Icons.radio_button_unchecked_rounded,
-            color: submitted
-                ? _DashboardPalette.success
-                : _DashboardPalette.mutedForeground,
-            size: 20,
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Text(
-              label,
-              style: TextStyle(
-                color: submitted
-                    ? _DashboardPalette.mutedForeground
-                    : _DashboardPalette.foreground,
-                fontSize: 13,
-                fontWeight: FontWeight.w500,
-              ),
-            ),
-          ),
-          if (!submitted)
-            TextButton(
-              onPressed: onSubmit,
-              style: TextButton.styleFrom(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 12,
-                  vertical: 6,
-                ),
-                backgroundColor: _DashboardPalette.primary.withValues(
-                  alpha: 0.12,
-                ),
-                foregroundColor: _DashboardPalette.primary,
-                minimumSize: Size.zero,
-                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(8),
-                ),
-              ),
-              child: const Text(
-                'Submit',
-                style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700),
-              ),
-            )
-          else
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-              decoration: BoxDecoration(
-                color: _DashboardPalette.success.withValues(alpha: 0.14),
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: const Text(
-                'Done',
-                style: TextStyle(
-                  color: _DashboardPalette.success,
-                  fontSize: 11,
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-            ),
-        ],
-      ),
-    );
-  }
-}
-
 // ── Notifications card ─────────────────────────────────────────────────────
 
 class _WorkerNotificationCard extends StatelessWidget {
@@ -10699,24 +11459,45 @@ class _WorkerNotificationCard extends StatelessWidget {
               ),
             )
           : null,
-      child: Column(
-        children: appState.workerNotifications
-            .map(
-              (WorkerNotification n) => Padding(
-                padding: const EdgeInsets.only(bottom: 10),
-                child: _WorkerNotificationTile(notification: n),
+      child: appState.workerNotifications.isEmpty
+          ? const Align(
+              alignment: Alignment.centerLeft,
+              child: Text(
+                'No notifications yet. Live farm status will appear here.',
+                style: TextStyle(
+                  color: _DashboardPalette.mutedForeground,
+                  fontSize: 12,
+                  height: 1.4,
+                ),
               ),
             )
-            .toList(),
-      ),
+          : Column(
+              children: appState.workerNotifications
+                  .map(
+                    (WorkerNotification n) => Padding(
+                      padding: const EdgeInsets.only(bottom: 10),
+                      child: _WorkerNotificationTile(
+                        notification: n,
+                        onTap: n.read
+                            ? null
+                            : () => appState.markNotificationRead(n.id),
+                      ),
+                    ),
+                  )
+                  .toList(),
+            ),
     );
   }
 }
 
 class _WorkerNotificationTile extends StatelessWidget {
-  const _WorkerNotificationTile({required this.notification});
+  const _WorkerNotificationTile({
+    required this.notification,
+    this.onTap,
+  });
 
   final WorkerNotification notification;
+  final VoidCallback? onTap;
 
   Color get _accentColor {
     switch (notification.type) {
@@ -10744,156 +11525,53 @@ class _WorkerNotificationTile extends StatelessWidget {
   Widget build(BuildContext context) {
     final Color accent = _accentColor;
     final bool unread = !notification.read;
-    return AnimatedContainer(
-      duration: const Duration(milliseconds: 250),
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-      decoration: BoxDecoration(
-        color: unread
-            ? accent.withValues(alpha: 0.08)
-            : _DashboardPalette.tabBackground,
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: onTap,
         borderRadius: BorderRadius.circular(14),
-        border: Border.all(
-          color: unread
-              ? accent.withValues(alpha: 0.35)
-              : _DashboardPalette.glassBorder,
-        ),
-      ),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: <Widget>[
-          Icon(_icon, color: accent, size: 18),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Text(
-              notification.message,
-              style: TextStyle(
-                color: unread
-                    ? _DashboardPalette.foreground
-                    : _DashboardPalette.mutedForeground,
-                fontSize: 13,
-                fontWeight: unread ? FontWeight.w600 : FontWeight.w400,
-              ),
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 250),
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+          decoration: BoxDecoration(
+            color: unread
+                ? accent.withValues(alpha: 0.08)
+                : _DashboardPalette.tabBackground,
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(
+              color: unread
+                  ? accent.withValues(alpha: 0.35)
+                  : _DashboardPalette.glassBorder,
             ),
           ),
-          if (unread)
-            Container(
-              width: 8,
-              height: 8,
-              margin: const EdgeInsets.only(top: 4, left: 6),
-              decoration: BoxDecoration(color: accent, shape: BoxShape.circle),
-            ),
-        ],
-      ),
-    );
-  }
-}
-
-// ── Recent Activity card ───────────────────────────────────────────────────
-
-class _WorkerActivityCard extends StatelessWidget {
-  const _WorkerActivityCard({required this.appState});
-
-  final AppState appState;
-
-  @override
-  Widget build(BuildContext context) {
-    final List<WorkerActivity> items = appState.workerActivities.length > 5
-        ? appState.workerActivities.sublist(0, 5)
-        : appState.workerActivities;
-
-    return _GlassSection(
-      titleIcon: Icons.timeline_rounded,
-      title: 'Recent Activity',
-      child: Column(
-        children: items
-            .asMap()
-            .entries
-            .map(
-              (MapEntry<int, WorkerActivity> entry) => Padding(
-                padding: const EdgeInsets.only(bottom: 0),
-                child: _WorkerActivityTile(
-                  activity: entry.value,
-                  isLast: entry.key == items.length - 1,
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              Icon(_icon, color: accent, size: 18),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  notification.message,
+                  style: TextStyle(
+                    color: unread
+                        ? _DashboardPalette.foreground
+                        : _DashboardPalette.mutedForeground,
+                    fontSize: 13,
+                    fontWeight: unread ? FontWeight.w600 : FontWeight.w400,
+                  ),
                 ),
               ),
-            )
-            .toList(),
-      ),
-    );
-  }
-}
-
-class _WorkerActivityTile extends StatelessWidget {
-  const _WorkerActivityTile({required this.activity, required this.isLast});
-
-  final WorkerActivity activity;
-  final bool isLast;
-
-  @override
-  Widget build(BuildContext context) {
-    return IntrinsicHeight(
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: <Widget>[
-          // Timeline spine
-          SizedBox(
-            width: 32,
-            child: Column(
-              children: <Widget>[
+              if (unread)
                 Container(
-                  width: 28,
-                  height: 28,
-                  decoration: BoxDecoration(
-                    color: _DashboardPalette.primary.withValues(alpha: 0.14),
-                    shape: BoxShape.circle,
-                  ),
-                  child: Icon(
-                    activity.icon,
-                    size: 14,
-                    color: _DashboardPalette.primary,
-                  ),
+                  width: 8,
+                  height: 8,
+                  margin: const EdgeInsets.only(top: 4, left: 6),
+                  decoration:
+                      BoxDecoration(color: accent, shape: BoxShape.circle),
                 ),
-                if (!isLast)
-                  Expanded(
-                    child: Container(
-                      width: 1.5,
-                      margin: const EdgeInsets.symmetric(vertical: 3),
-                      color: _DashboardPalette.glassBorder,
-                    ),
-                  ),
-              ],
-            ),
+            ],
           ),
-          const SizedBox(width: 12),
-          // Content
-          Expanded(
-            child: Padding(
-              padding: const EdgeInsets.only(bottom: 16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: <Widget>[
-                  const SizedBox(height: 4),
-                  Text(
-                    activity.message,
-                    style: const TextStyle(
-                      color: _DashboardPalette.foreground,
-                      fontSize: 13,
-                      fontWeight: FontWeight.w500,
-                    ),
-                  ),
-                  const SizedBox(height: 3),
-                  Text(
-                    activity.time,
-                    style: const TextStyle(
-                      color: _DashboardPalette.mutedForeground,
-                      fontSize: 11,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        ],
+        ),
       ),
     );
   }
@@ -11424,79 +12102,6 @@ class _LineChartPainter extends CustomPainter {
   bool shouldRepaint(covariant _LineChartPainter oldDelegate) => true;
 }
 
-class _SalesLossChart extends StatelessWidget {
-  const _SalesLossChart({required this.data});
-
-  final List<_SalesLossPoint> data;
-
-  @override
-  Widget build(BuildContext context) {
-    if (data.isEmpty) {
-      return const SizedBox(
-        height: 220,
-        child: Center(
-          child: Text(
-            'No sales yet',
-            style: TextStyle(color: _DashboardPalette.mutedForeground),
-          ),
-        ),
-      );
-    }
-    final double maxValue = data
-        .map((point) => point.sales.toDouble())
-        .reduce((double a, double b) => a > b ? a : b);
-
-    return SizedBox(
-      height: 220,
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.end,
-        children: data
-            .map(
-              (_SalesLossPoint point) => Expanded(
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 4),
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.end,
-                    children: <Widget>[
-                      Expanded(
-                        child: Align(
-                          alignment: Alignment.bottomCenter,
-                          child: Row(
-                            crossAxisAlignment: CrossAxisAlignment.end,
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: <Widget>[
-                              _MiniBar(
-                                heightFactor: point.sales / maxValue,
-                                color: _DashboardPalette.primary,
-                              ),
-                              const SizedBox(width: 6),
-                              _MiniBar(
-                                heightFactor: point.losses / 45,
-                                color: _DashboardPalette.danger,
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                      const SizedBox(height: 10),
-                      Text(
-                        point.label,
-                        style: const TextStyle(
-                          color: _DashboardPalette.mutedForeground,
-                          fontSize: 11,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            )
-            .toList(),
-      ),
-    );
-  }
-}
-
 class _MiniBar extends StatelessWidget {
   const _MiniBar({required this.heightFactor, required this.color});
 
@@ -11633,41 +12238,6 @@ class _InventoryStatusRow extends StatelessWidget {
           ),
         ),
       ],
-    );
-  }
-}
-
-class _AlertTile extends StatelessWidget {
-  const _AlertTile({required this.alert});
-
-  final AlertMessage alert;
-
-  @override
-  Widget build(BuildContext context) {
-    final bool high = alert.severity == 'high';
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: _DashboardPalette.tabBackground,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: _DashboardPalette.glassBorder),
-      ),
-      child: Row(
-        children: <Widget>[
-          Icon(
-            high ? Icons.error_outline_rounded : Icons.info_outline_rounded,
-            color: high ? _DashboardPalette.danger : _DashboardPalette.warning,
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Text(
-              alert.title,
-              style: const TextStyle(color: _DashboardPalette.foreground),
-            ),
-          ),
-        ],
-      ),
     );
   }
 }

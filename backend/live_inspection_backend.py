@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import hmac
 import ipaddress
+import json
 import os
 import random
 import sys
@@ -21,9 +22,15 @@ from flask import Flask
 from requests.adapters import HTTPAdapter
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from auth import get_user_from_authorization, init_auth
+from auth import (
+    get_shared_farm_snapshot,
+    get_user_from_authorization,
+    init_auth,
+    put_shared_farm_snapshot,
+)
 from egg_sync import (
     attach_weight_to_egg,
+    delete_eggs_for_utc_day,
     get_store,
     ingest_body,
     remember_sorted_egg,
@@ -54,7 +61,9 @@ CRACK_SCORE_MIN = 78.0  # blurry frames used to false-crack at ~62
 DIRTY_SCORE_MIN = 68.0
 REJECT_MARGIN = 10.0
 INSPECT_WINDOW_SEC = 4.0
-SCAN_SEC = 3.5
+# Full 5s camera watch, then instantly commit Clean/Crack to /records.
+# Clean weight stays pending until the same egg hits the HX711 load cell.
+SCAN_SEC = 5.0
 INSPECT_GIVE_UP_SEC = 5.0
 ROBOFLOW_TIMEOUT_SEC = 1.0
 # 0 = off for live speed. Roboflow was stacking with /jpg pulls and lagging the CAM.
@@ -89,18 +98,27 @@ _cors_list = [o for o in _cors if not o.startswith('r\'') and '*' not in o] if i
 _cors_list = [
     'http://192.168.11.212:8000',
     'http://192.168.1.53:8000',
+    'https://egg-system.paghasianjustine.workers.dev',
+    'https://egg-farm.eggsorting.site',
 ]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_list,
-    # LAN farm IP + Cloudflare public tunnels (no localhost).
+    # LAN farm IP + Cloudflare tunnels + workers.dev hosted Flutter web.
     allow_origin_regex=(
         r'https?://(192\.168\.\d+\.\d+)(:\d+)?'
-        r'|https://([a-z0-9-]+\.)*(trycloudflare\.com|cloudflare\.com)'
+        r'|https://([a-z0-9-]+\.)*(trycloudflare\.com|cloudflare\.com|workers\.dev|eggsorting\.site|eggsorting\.com)'
     ),
     allow_credentials=False,
     allow_methods=['*'],
-    allow_headers=['Authorization', 'Content-Type', 'X-Farm-Device-Token', 'X-Device-Token'],
+    allow_headers=[
+        'Authorization',
+        'Content-Type',
+        'X-Farm-Device-Token',
+        'X-Device-Token',
+        'Cache-Control',
+        'Pragma',
+    ],
 )
 
 
@@ -119,6 +137,15 @@ def _is_private_ip(ip: str) -> bool:
         return bool(addr.is_private or addr.is_loopback)
     except ValueError:
         return False
+
+
+def _from_cloudflare(request: Request) -> bool:
+    """True when the request was proxied by Cloudflare (Worker / Tunnel)."""
+    return bool(
+        request.headers.get('cf-connecting-ip')
+        or request.headers.get('cf-ray')
+        or request.headers.get('cf-visitor')
+    )
 
 
 def _device_token_ok(request: Request) -> bool:
@@ -147,7 +174,7 @@ async def farm_gate(request: Request, call_next):
         '/api/inspect', '/api/servo-test', '/api/station-selftest',
     }
     session_paths = {
-        '/metrics', '/records', '/debug', '/reset',
+        '/metrics', '/records', '/records/restore', '/debug', '/reset',
         '/api/egg-records', '/api/egg-sync',
     }
     user = get_user_from_authorization(request.headers.get('authorization'))
@@ -172,13 +199,13 @@ async def farm_gate(request: Request, call_next):
         return await call_next(request)
 
     if path in session_paths or path.startswith('/farm/'):
-        # Local farm laptop: allow read metrics/records on private LAN without login.
+        # Live board must stay readable through Worker → Tunnel even when
+        # X-Forwarded-For is a public IP and CF headers were rewritten.
         if user is None:
-            if (
-                path in ('/metrics', '/records')
-                and request.method == 'GET'
-                and _is_private_ip(_client_ip(request))
-            ):
+            if path in ('/metrics', '/records', '/api/egg-sync') and request.method == 'GET':
+                return await call_next(request)
+            # Browser hard-refresh rehydrate: push cached Live Egg Records back to farm.
+            if path == '/records/restore' and request.method == 'POST':
                 return await call_next(request)
             return JSONResponse({'error': 'Authentication required', 'code': 'unauthorized'}, status_code=401)
         if path in ('/reset', '/debug'):
@@ -209,6 +236,150 @@ metrics = {
 # Chronological log of every confirmed detection (egg present, above threshold).
 # Each entry: { timestamp, label, confidence, category, weightGrams, sizeClass }
 detection_records: deque = deque(maxlen=MAX_RECORDS)
+_RECORDS_LOCK = threading.Lock()
+_RECORDS_PATH = _BACKEND_DIR / 'data' / 'live_detections.json'
+
+
+_force_empty_records_save = False  # True only during POST /reset
+
+
+def _save_live_detections() -> None:
+    """Persist Live Inspection rows to Firebase (source of truth)."""
+    global _force_empty_records_save
+    with _RECORDS_LOCK:
+        try:
+            import farm_store
+            # Never clobber a non-empty Firebase board with an empty in-memory board
+            # (restart race / bg save). Only Reset may write empty on purpose.
+            if not detection_records and not _force_empty_records_save:
+                try:
+                    remote = farm_store.load_live_board()
+                    if remote and remote.get('records'):
+                        print(
+                            '[records] skip empty save — Firebase still has '
+                            f'{len(remote.get("records") or [])} row(s)',
+                            flush=True,
+                        )
+                        return
+                except Exception:
+                    pass
+            payload = {
+                'goodEggs': int(metrics.get('goodEggs') or 0),
+                'crackedEggs': int(metrics.get('crackedEggs') or 0),
+                'dirtyEggs': 0,
+                'records': list(detection_records),
+                'savedAt': time.strftime('%Y-%m-%dT%H:%M:%S'),
+            }
+            farm_store.save_live_board(payload)
+        except Exception as exc:
+            print(f'[records] Firebase save failed: {exc}', flush=True)
+        finally:
+            _force_empty_records_save = False
+
+
+def _save_live_detections_bg() -> None:
+    """Firebase save off the classify path so /records updates feel instant after the 5s scan."""
+    threading.Thread(target=_save_live_detections, daemon=True, name='save-live').start()
+
+
+def _apply_live_board_payload(data: dict) -> None:
+    rows = data.get('records') or []
+    detection_records.clear()
+    for row in rows:
+        if isinstance(row, dict) and row.get('id'):
+            detection_records.append(row)
+    metrics['goodEggs'] = int(data.get('goodEggs') or 0)
+    metrics['crackedEggs'] = int(data.get('crackedEggs') or 0)
+    old_dirty = int(data.get('dirtyEggs') or 0)
+    if old_dirty:
+        metrics['goodEggs'] += old_dirty
+    metrics['dirtyEggs'] = 0
+    for row in detection_records:
+        if str(row.get('category') or '') == 'dirtyEggs':
+            row['category'] = 'goodEggs'
+        lab = str(row.get('label') or '')
+        if 'dirty' in lab.lower():
+            row['label'] = 'Clean'
+    good_n = 0
+    crack_n = 0
+    for row in detection_records:
+        cat = str(row.get('category') or '').lower()
+        lab = str(row.get('label') or '').lower()
+        if cat == 'crackedeggs' or ('crack' in lab and 'no crack' not in lab):
+            crack_n += 1
+        else:
+            good_n += 1
+    if good_n > int(metrics.get('goodEggs') or 0):
+        metrics['goodEggs'] = good_n
+    if crack_n > int(metrics.get('crackedEggs') or 0):
+        metrics['crackedEggs'] = crack_n
+    if detection_records:
+        last = detection_records[-1]
+        lab = str(last.get('label') or '')
+        if lab:
+            metrics['lastLabel'] = (
+                lab if 'egg' in lab.lower() else f'{lab} Egg'
+            )
+        try:
+            metrics['lastConfidence'] = float(last.get('confidence') or 0)
+        except (TypeError, ValueError):
+            pass
+        if last.get('awaitingWeight'):
+            metrics['status'] = f'{lab or "Clean"} recorded — waiting for weight'
+            metrics['lastSizeClass'] = 'pending'
+            metrics['lastWeightGrams'] = 0.0
+        elif isinstance(last.get('weightGrams'), (int, float)):
+            metrics['lastWeightGrams'] = float(last['weightGrams'])
+            metrics['lastSizeClass'] = str(last.get('sizeClass') or 'N/A')
+            metrics['status'] = 'Running'
+
+
+def _load_live_detections() -> None:
+    """Restore today's live board from Firebase after process restart."""
+    try:
+        import farm_store
+        data = farm_store.load_live_board()
+        if not data:
+            # One-time migrate from legacy local JSON if present.
+            if _RECORDS_PATH.exists():
+                legacy = json.loads(_RECORDS_PATH.read_text(encoding='utf-8'))
+                if legacy.get('records'):
+                    _apply_live_board_payload(legacy)
+                    farm_store.save_live_board({
+                        'goodEggs': int(metrics.get('goodEggs') or 0),
+                        'crackedEggs': int(metrics.get('crackedEggs') or 0),
+                        'dirtyEggs': 0,
+                        'records': list(detection_records),
+                        'savedAt': time.strftime('%Y-%m-%dT%H:%M:%S'),
+                    })
+                    print(
+                        f'[records] migrated {len(detection_records)} '
+                        'detection(s) from disk → Firebase',
+                        flush=True,
+                    )
+                    try:
+                        _RECORDS_PATH.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+            return
+        _apply_live_board_payload(data)
+        print(
+            f'[records] restored {len(detection_records)} detection(s) from Firebase',
+            flush=True,
+        )
+    except Exception as exc:
+        print(f'[records] Firebase load failed: {exc}', flush=True)
+
+
+_load_live_detections()
+# Ensure Firebase board doc exists even when empty (refresh-safe).
+if not detection_records:
+    try:
+        import farm_store
+        if farm_store.load_live_board() is None:
+            _save_live_detections()
+    except Exception:
+        pass
 
 labels = []
 signature = None
@@ -408,14 +579,115 @@ def _maybe_pull_on_heartbeat(jpg_url: str, cam_jpg: int) -> None:
     threading.Thread(target=_run, name='hb-pull', daemon=True).start()
 
 
+def _latest_pending_detection() -> dict | None:
+    """Newest camera record still waiting for scale grams."""
+    for rec in reversed(list(detection_records)):
+        if rec.get('awaitingWeight'):
+            return rec
+    return None
+
+
+def _label_from_camera(cam: str) -> str:
+    low = (cam or '').lower()
+    if 'crack' in low and 'no crack' not in low:
+        return 'Crack Egg'
+    if 'clean' in low or 'good' in low or 'no crack' in low or 'dirty' in low:
+        return 'Clean Egg'
+    if cam and 'egg' in low:
+        return cam
+    return f'{cam} Egg' if cam else 'Clean Egg'
+
+
+def _restore_pipe_from_pending() -> None:
+    """Keep scale pipe aligned with camera records (pending vs weighed)."""
+    with _egg_pipe_lock:
+        rid = str(_egg_pipe.get('id') or '')
+        awaiting = bool(_egg_pipe.get('awaiting_weight'))
+    if rid and awaiting:
+        for rec in detection_records:
+            if str(rec.get('id') or '') != rid:
+                continue
+            # Weight already attached — clear sticky awaiting so UI leaves pending.
+            if not rec.get('awaitingWeight'):
+                with _egg_pipe_lock:
+                    if str(_egg_pipe.get('id') or '') == rid:
+                        _egg_pipe['awaiting_weight'] = False
+                        _egg_pipe['weighed'] = True
+                return
+            return
+    rec = _latest_pending_detection()
+    if not rec:
+        return
+    new_id = str(rec.get('id') or '')
+    if not new_id:
+        return
+    with _egg_pipe_lock:
+        if _egg_pipe.get('awaiting_weight') and _egg_pipe.get('id'):
+            return
+        cam = str(rec.get('label') or 'Clean')
+        cat = str(rec.get('category') or 'goodEggs')
+        _egg_pipe['id'] = new_id
+        _egg_pipe['camera'] = cam if cam in ('Clean', 'Crack', 'Dirty') else (
+            'Dirty' if 'dirty' in cam.lower() else (
+                'Crack' if 'crack' in cam.lower() else 'Clean'
+            )
+        )
+        _egg_pipe['category'] = cat
+        _egg_pipe['awaiting_weight'] = True
+        _egg_pipe['weighed'] = False
+        _egg_pipe['opened_at'] = time.monotonic()
+
+
 def _public_metrics() -> dict:
     hardware = _hardware_online()
+    # Re-arm weigh pipe from orphan pending camera rows (timeout / FOV clear).
+    _restore_pipe_from_pending()
     payload = dict(metrics)
     payload['hardwareOnline'] = hardware
     payload['hardwareDevice'] = _esp32_device
     payload['connected'] = bool(metrics.get('connected') or hardware)
     if hardware and not metrics.get('connected'):
         payload['status'] = f'{_esp32_device} powered on and connected to Wi-Fi'
+    with _egg_pipe_lock:
+        awaiting = bool(_egg_pipe.get('awaiting_weight'))
+        pipe_cam = str(_egg_pipe.get('camera') or '')
+        pending_id = str(_egg_pipe.get('id') or '')
+    pending_rec = None if awaiting else _latest_pending_detection()
+    if pending_rec is not None:
+        awaiting = True
+        pipe_cam = str(pending_rec.get('label') or pipe_cam or 'Clean')
+        pending_id = str(pending_rec.get('id') or pending_id)
+    payload['awaitingWeight'] = awaiting
+    payload['pendingEggId'] = pending_id
+    payload['pipeCamera'] = pipe_cam
+    # Keep Clean/Crack visible in Live Inspection while waiting for scale grams.
+    if awaiting and pipe_cam:
+        lab = str(payload.get('lastLabel') or '')
+        low = lab.lower()
+        if not lab or lab in ('N/A', 'Empty Model') or low in ('scanning', 'egg', 'detecting'):
+            payload['lastLabel'] = _label_from_camera(pipe_cam)
+        if float(payload.get('lastConfidence') or 0) < 1.0:
+            conf = 80.0
+            if pending_rec is not None:
+                try:
+                    conf = float(pending_rec.get('confidence') or 80.0)
+                except (TypeError, ValueError):
+                    conf = 80.0
+            payload['lastConfidence'] = conf
+        payload['status'] = f'{pipe_cam} recorded — waiting for weight'
+        if str(payload.get('lastSizeClass') or 'N/A') in ('N/A', '', 'pending'):
+            payload['lastSizeClass'] = 'pending'
+        if float(payload.get('lastWeightGrams') or 0) < 5.0:
+            payload['lastWeightGrams'] = 0.0
+    # Embed board rows in /metrics so the UI updates instantly on one poll
+    # (no second /records round-trip that can lag or get cached).
+    rows = list(detection_records)
+    payload['recordsCount'] = len(rows)
+    payload['recentRecords'] = list(reversed(rows))[:80]
+    if rows:
+        payload['latestRecordId'] = str(rows[-1].get('id') or '')
+    else:
+        payload['latestRecordId'] = ''
     return payload
 
 
@@ -470,9 +742,9 @@ def _consume_pending_weight() -> float | None:
     with _weight_lock:
         if _pending_weight is None:
             return None
-            w = _pending_weight
-            _pending_weight = None
-            return w
+        w = _pending_weight
+        _pending_weight = None
+        return w
 
 
 def _peek_pending_weight() -> float | None:
@@ -640,7 +912,7 @@ def classify_frame(frame, focus=None):
         # Prefer Roboflow when it names Crack/Dirty more clearly.
         rf_cat = counting_category(rf_label)
         loc_cat = counting_category(label)
-        if rf_cat in ('crackedEggs', 'dirtyEggs') and rf_conf >= 45.0:
+        if rf_cat == 'crackedEggs' and rf_conf >= 45.0:
             label, confidence = rf_label, rf_conf
         elif loc_cat is None and rf_cat == 'goodEggs':
             label, confidence = rf_label, rf_conf
@@ -661,14 +933,11 @@ def counting_category(label: str):
     """
     Map a model label to a metrics bucket.
 
-    Actual labels in labels.txt:
+    System grades are Clean + Crack only (dust/Dirty is not a grade):
         0 Empty Model  → skip (no egg present)
         1 No Crack Egg → goodEggs
         2 Crack Egg    → crackedEggs
-        3 Dirty Egg    → dirtyEggs
-
-    Matching is case-insensitive and checks for substrings so minor
-    label wording changes won't break things.
+        3 Dirty Egg    → goodEggs (ignored; treated as Clean)
     """
     s = label.lower()
 
@@ -677,8 +946,9 @@ def counting_category(label: str):
         return 'goodEggs'
     if 'crack' in s or 'broken' in s:
         return 'crackedEggs'
+    # Dirty / dust / stain is not part of the product — count as Clean.
     if 'dirty' in s or 'soiled' in s or 'stain' in s or 'dirt' in s:
-        return 'dirtyEggs'
+        return 'goodEggs'
     if 'good' in s or 'ok' in s or 'healthy' in s or 'clean' in s:
         return 'goodEggs'
 
@@ -803,15 +1073,9 @@ def _apply_inspect_frame(label: str, confidence: float, scores: dict | None = No
         if voted is None and elapsed < INSPECT_WINDOW_SEC:
             return
         if voted is None:
-            if _is_clear_reject(
-                _inspect['best_crack'], _inspect['best_dirty'], _inspect['best_good']
-            ):
-                voted = (
-                    'Crack Egg'
-                    if _inspect['best_crack'] >= _inspect['best_dirty']
-                    else 'Dirty Egg'
-                )
-            elif _inspect['best_good'] >= 45.0:
+            if _inspect['best_crack'] > 0.0:
+                voted = 'Crack Egg'
+            elif max(_inspect['best_good'], _inspect['best_dirty']) >= 45.0:
                 voted = 'No Crack Egg'
             else:
                 return
@@ -819,11 +1083,9 @@ def _apply_inspect_frame(label: str, confidence: float, scores: dict | None = No
         if cat == 'crackedEggs' and _inspect['best_crack'] > 0.0:
             _finish_inspect(True, 'Crack Egg')
             return
-        if cat == 'dirtyEggs' and _inspect['best_dirty'] >= DIRTY_SCORE_MIN:
-            _finish_inspect(True, 'Dirty Egg')
-            return
         if cat == 'goodEggs' and (
-            _inspect['best_good'] >= 50.0 or elapsed >= INSPECT_WINDOW_SEC
+            max(_inspect['best_good'], _inspect['best_dirty']) >= 50.0
+            or elapsed >= INSPECT_WINDOW_SEC
         ):
             _finish_inspect(False, 'No Crack Egg')
 
@@ -964,7 +1226,8 @@ def _contour_is_egg(contour, crop_w: int, crop_h: int) -> bool:
     if short < 22 or long < 28:
         return False
     aspect = long / short
-    if aspect < 1.05 or aspect > 2.15:
+    # Close-up eggs often look nearly round (aspect ~1.0) — still eggs.
+    if aspect < 1.0 or aspect > 2.35:
         return False
     # Tall thin vertical rail (the false CRACK on metal).
     if bh >= 1.55 * bw and bw < 0.18 * crop_w:
@@ -996,7 +1259,7 @@ def _contour_is_egg(contour, crop_w: int, crop_h: int) -> bool:
         if e_short < 1:
             return False
         e_asp = e_long / e_short
-        if e_asp < 1.05 or e_asp > 2.25:
+        if e_asp < 1.0 or e_asp > 2.45:
             return False
     return True
 
@@ -1042,12 +1305,12 @@ def _box_is_metal_or_belt(frame, box) -> bool:
 
 
 def _belt_roi(frame) -> tuple[int, int, int, int]:
-    """Belt lane — skip left fixture post and top servo horn."""
+    """Belt pad — keep top open so close-up eggs are not clipped square."""
     h, w = frame.shape[:2]
     return (
-        int(w * 0.14),
-        int(h * 0.16),
-        int(w * 0.96),
+        int(w * 0.04),
+        int(h * 0.06),
+        int(w * 0.94),
         int(h * 0.98),
     )
 
@@ -1075,22 +1338,22 @@ def _detect_egg_boxes_in_roi(frame, x0, y0, x1, y1) -> list[tuple[int, int, int,
         if _box_is_metal_or_belt(frame, box):
             continue
         # Egg only — shell + oval + not metal/belt (already checked).
-        # min_shell 0.28: blown-out / wire-split shells still count as pale.
-        if not _box_is_egg_shell(frame, box, min_shell=0.28):
+        # Shell fill: high enough to skip pad wrinkles, low enough for glare eggs.
+        if not _box_is_egg_shell(frame, box, min_shell=0.30):
             continue
         if not _box_looks_like_egg(frame, box):
             continue
         area = float((box[2] - box[0]) * (box[3] - box[1]))
-        # Ignore tiny glare blobs and huge background fills.
+        # Ignore debris; allow close-up eggs that fill most of the FOV.
         frame_area = float(max(w * h, 1))
-        if area < 0.012 * frame_area or area > 0.42 * frame_area:
+        if area < 0.020 * frame_area or area > 0.78 * frame_area:
             continue
         if _box_is_wood_board(frame, box):
             continue
         roi = frame[max(0, box[1]):min(h, box[3]), max(0, box[0]):min(w, box[2])]
         glow = float(np.mean(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY))) if roi.size else 0.0
         if glow < 85.0:
-            continue  # pale egg shell only (allow bright glare eggs)
+            continue  # pale shell vs dark empty pad
         scored.append((area * (1.0 + glow / 255.0), box))
     scored.sort(key=lambda t: t[0], reverse=True)
     return [scored[0][1]] if scored else []
@@ -1160,8 +1423,8 @@ def _box_is_wood_board(frame, box) -> bool:
     if bw < 16 or bh < 16:
         return True
     frac = (bw * bh) / float(max(w * h, 1))
-    # Whole-board blob filling the FOV is never an egg.
-    if frac > 0.42:
+    # Whole-board fill only — close-up eggs can be large in frame.
+    if frac > 0.78:
         return True
     crop = frame[y1:y2, x1:x2]
     if crop.size == 0:
@@ -1184,14 +1447,12 @@ def _box_is_wood_board(frame, box) -> bool:
     inside_m = float(np.mean(gray))
     ring_m = float(np.mean(ring_g[mask > 0]))
     contrast = inside_m - ring_m
-    if contrast < 14.0:
-        return True  # no bright-on-dark egg contrast → board / empty FOV
-    # Soft JPEG egg is smooth; wood grain is busy. Strong egg-vs-belt contrast
-    # means a wire/glare spike on a real egg is OK — only reject high lap on
-    # weak-contrast patches (flat wood/metal board fill).
-    if lap > 95.0 and contrast < 45.0:
+    if contrast < 22.0:
+        return True  # no bright-on-dark egg contrast → empty pad / board
+    # Soft JPEG egg is smooth; pad wrinkles and wood grain are busy.
+    if lap > 70.0 and contrast < 55.0:
         return True
-    if lap > 180.0 and contrast < 90.0:
+    if lap > 140.0 and contrast < 85.0:
         return True
     return False
 
@@ -1211,21 +1472,22 @@ def _box_looks_like_egg(frame, box) -> bool:
     bw = x2 - x1
     bh = y2 - y1
     frac = (bw * bh) / float(max(w * h, 1))
-    if frac < 0.008 or frac > 0.40:
+    if frac < 0.018 or frac > 0.72:
         return False
     aspect = max(bw, bh) / float(max(min(bw, bh), 1))
-    if aspect < 1.05 or aspect > 2.35:
+    # Near-round close-up eggs (aspect ~1.0) must still count.
+    if aspect < 1.0 or aspect > 2.45:
         return False
     roi = frame[y1:y2, x1:x2]
     if roi.size == 0:
         return False
     mean_v = float(np.mean(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)))
-    if mean_v < 80.0:
-        return False  # egg shell is bright vs dark belt
+    if mean_v < 95.0:
+        return False  # egg shell is bright vs dark empty pad
     mask = _egg_color_mask(roi)
     egg_px = cv2.countNonZero(mask)
-    # Glare + crossing wire can leave less filled mask; still an egg oval.
-    if egg_px < 0.12 * roi.shape[0] * roi.shape[1]:
+    # Real shell fills most of the oval; pad wrinkles leave a sparse mask.
+    if egg_px < 0.18 * roi.shape[0] * roi.shape[1]:
         return False
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
@@ -1249,7 +1511,7 @@ def _box_is_egg_shell(frame, box, min_shell: float = 0.20) -> bool:
     if cx < w * _zoom_u(0.04) or cx > w * _zoom_u(0.98) or cy < h * 0.05:
         return False
     frac = ((x2 - x1) * (y2 - y1)) / float(max(w * h, 1))
-    if frac < 0.008 or frac > 0.40:
+    if frac < 0.018 or frac > 0.72:
         return False
     if _box_is_wood_board(frame, box):
         return False
@@ -1258,7 +1520,7 @@ def _box_is_egg_shell(frame, box, min_shell: float = 0.20) -> bool:
         return False
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     if float(np.mean(gray)) < 85.0:
-        return False  # must be bright shell, not dark metal
+        return False  # must be bright shell, not dark empty pad
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
     mask = _egg_color_mask(crop)
     erode_k = 3 if min(y2 - y1, x2 - x1) < 48 else 5
@@ -1479,10 +1741,12 @@ def pick_quality(
     seen_egg: bool = True,
     model_label: str = '',
 ) -> tuple[str, float]:
-    """Camera: Crack, Dirty, or Clean only when an egg is confirmed. Else Empty."""
+    """Camera: Crack or Clean only when an egg is confirmed. Else Empty."""
     global _empty_dirty_ema
     scores = scores or {}
     good, crack, dirty = _score_buckets(scores)
+    # Dirty model score folds into Clean — dust is not a grade.
+    good = max(good, dirty)
     empty = _empty_score(scores)
     cat = counting_category(model_label)
 
@@ -1492,15 +1756,13 @@ def pick_quality(
         return 'Empty Model', 0.0
 
     # If Empty wins clearly, do not invent Clean on a non-egg.
-    if empty >= max(good, crack, dirty) + 15.0 and empty >= 55.0:
+    if empty >= max(good, crack) + 15.0 and empty >= 55.0:
         return 'Empty Model', 0.0
 
     # Crack must clearly beat clean — weak/blurry model scores stay Empty.
-    if crack >= CRACK_SCORE_MIN and crack >= dirty + 6.0 and crack >= good + 12.0:
+    if crack >= CRACK_SCORE_MIN and crack >= good + 12.0:
         return 'Crack Egg', crack
-    if dirty >= DIRTY_SCORE_MIN and dirty >= crack + 4.0 and dirty >= good + 8.0:
-        return 'Dirty Egg', dirty
-    if good >= 55.0 and good >= crack + 8.0 and good >= dirty + 8.0:
+    if good >= 55.0 and good >= crack + 8.0:
         return 'Clean Egg', good
     return 'Empty Model', 0.0
 
@@ -1509,10 +1771,10 @@ _last_count_at = 0.0
 _last_seen_egg = False
 _egg_in_view = False
 # Egg must show on this many frames in a row before a scan starts.
-EGG_CONFIRM_FRAMES = 2  # real egg for a couple frames — not one-frame glare
+EGG_CONFIRM_FRAMES = 2  # solid egg frames before 5s scan (blocks one-frame glare)
 _classify_tick = 0
 # After that, this many missed frames in a row still count as the same egg.
-EGG_LOST_GRACE = 4
+EGG_LOST_GRACE = 3
 _egg_streak = 0
 _egg_lost = 0
 _scan_lock = threading.Lock()
@@ -1684,10 +1946,8 @@ def _shell_quality(frame, box) -> str:
             _crack_dbg_at = now
             print(f'[crack] thin line len={length:.0f}px contrast={contrast:.0f}', flush=True)
         return 'crack'
-    if stain >= 0.10 and stain > dark + 0.04:
-        return 'dirty'
-    # Soft shade / JPEG blur is normal on a clean shell — do not invent cracks.
-    if dark <= 0.12 and stain < 0.08:
+    # Dust / stain is not a grade — treat as clean shell.
+    if dark <= 0.12 or stain >= 0.10:
         return 'clean'
     return ''
 
@@ -1701,46 +1961,43 @@ def _apply_shell(scores: dict, shell: str) -> dict:
     elif shell == 'crack':
         out['Crack Egg'] = max(float(out.get('Crack Egg', 0.0)), 80.0)
         out['No Crack Egg'] = min(float(out.get('No Crack Egg', 0.0)), 30.0)
-    elif shell == 'dirty':
-        out['Dirty Egg'] = max(float(out.get('Dirty Egg', 0.0)), 80.0)
-        out['No Crack Egg'] = min(float(out.get('No Crack Egg', 0.0)), 30.0)
     return out
 
 
 def _camera_quality_name(label: str) -> str:
     low = (label or '').lower()
-    if 'dirty' in low:
-        return 'Dirty'
-    if 'crack' in low:
+    if 'crack' in low and 'no crack' not in low:
         return 'Crack'
-    if 'clean' in low or 'no crack' in low:
+    if 'clean' in low or 'no crack' in low or 'dirty' in low or 'good' in low:
         return 'Clean'
     return 'Pending'
 
 
 def _commit_camera_detection(label: str, confidence: float = 80.0) -> str | None:
-    """Count this egg in the system from the camera decision (before weight)."""
-    global _last_count_at
+    """One visible egg → one Firebase record (Clean / Crack only)."""
+    global _last_count_at, _clean_hold_until, _reject_hold_until, _pending_weight
     cat = counting_category(label)
-    if cat not in ('goodEggs', 'crackedEggs', 'dirtyEggs'):
+    if cat == 'dirtyEggs':
+        cat = 'goodEggs'
+    if cat not in ('goodEggs', 'crackedEggs'):
         return None
     cam = _camera_quality_name(label)
     now = time.monotonic()
     with _egg_pipe_lock:
-        # One open Clean egg waiting on the scale — do not open another yet.
+        # Good egg waiting on the scale — do not open a second record yet.
         if (
             _egg_pipe.get('awaiting_weight')
             and _egg_pipe.get('id')
-            and (now - float(_egg_pipe.get('opened_at') or 0.0)) < 90.0
+            and (now - float(_egg_pipe.get('opened_at') or 0.0)) < 120.0
         ):
             print(
                 f'[egg] still waiting weight for {_egg_pipe["id"][:8]}... '
-                f'({_egg_pipe.get("camera")}) - skip new camera count',
+                f'({_egg_pipe.get("camera")}) - skip duplicate',
                 flush=True,
             )
             return str(_egg_pipe['id'])
         rid = uuid.uuid4().hex
-        await_w = cat == 'goodEggs'  # Clean → gate pass → scale
+        await_w = cat == 'goodEggs'  # Clean may get grams later; already in Firebase.
         _egg_pipe['id'] = rid
         _egg_pipe['camera'] = cam
         _egg_pipe['category'] = cat
@@ -1749,11 +2006,21 @@ def _commit_camera_detection(label: str, confidence: float = 80.0) -> str | None
         _egg_pipe['opened_at'] = now
         metrics[cat] = int(metrics.get(cat) or 0) + 1
         _last_count_at = now
+    # GATE cue for DevKit — long enough for flaky extender Wi‑Fi (HB often misses 5s).
+    # Firmware latches with gateDecisionPulsed (one physical move).
+    if cat == 'goodEggs':
+        _clean_hold_until = now + 25.0
+        _reject_hold_until = 0.0
+    else:
+        _reject_hold_until = now + 25.0
+        _clean_hold_until = 0.0
     sorting = sorting_result_for(cat)
-    # Camera-first row; Clean gets grams when the same egg hits the load cell.
+    # Firebase immediately for Good, Cracked, and Dirty (one doc per egg).
+    # Placeholder grams (>0) so older Firestore rules still accept the create;
+    # Good eggs get real weight when the same egg hits the load cell.
     remember_sorted_egg(
-        weight=0.0,
-        size_class='pending',
+        weight=0.01,
+        size_class='pending' if await_w else 'N/A',
         camera_result=cam,
         sorting_result=sorting,
         record_id=rid,
@@ -1770,16 +2037,31 @@ def _commit_camera_detection(label: str, confidence: float = 80.0) -> str | None
         'sizeClass': 'pending' if await_w else 'N/A',
         'awaitingWeight': await_w,
     })
-    if await_w:
-        print(
-            f'[egg] CAMERA {cam} counted -> id={rid[:8]}... GATE pass -> wait load cell',
-            flush=True,
-        )
+    # Immediate Live Inspection HUD — do not wait for the next classify tick.
+    if cat == 'goodEggs':
+        metrics['lastLabel'] = 'Clean Egg'
     else:
-        print(
-            f'[egg] CAMERA {cam} counted -> id={rid[:8]}... GATE reject (no weigh)',
-            flush=True,
-        )
+        metrics['lastLabel'] = 'Crack Egg'
+    metrics['lastConfidence'] = round(float(confidence or 80.0), 1)
+    metrics['status'] = (
+        f'{cam} recorded — waiting for weight' if await_w else f'{cam} recorded'
+    )
+    if await_w:
+        # Drop stale pad grams so weight cannot attach until THIS egg reaches
+        # the load cell and DevKit POSTs /weight with commitEgg.
+        with _weight_lock:
+            _pending_weight = None
+        # Weight stays pending until HX711 posts grams for this same egg.
+        metrics['lastSizeClass'] = 'pending'
+        metrics['lastWeightGrams'] = 0.0
+        metrics['lastMeasurementStatus'] = 'pending'
+    # Sync disk immediately so hard refresh / tunnel blips cannot lose the row.
+    _save_live_detections()
+    print(
+        f'[egg] CAMERA {cam} → recorded id={rid[:8]}... '
+        f'({"weight pending → load cell" if await_w else "reject recorded"})',
+        flush=True,
+    )
     return rid
 
 
@@ -1796,7 +2078,19 @@ def _attach_scale_to_camera_egg(
         awaiting = bool(_egg_pipe.get('awaiting_weight'))
         cam = str(_egg_pipe.get('camera') or 'Clean')
         cat = str(_egg_pipe.get('category') or 'goodEggs')
+        opened_at = float(_egg_pipe.get('opened_at') or 0.0)
         if not rid or not awaiting:
+            return None
+        # Belt travel ~4–5s camera → pad, then pad settles before weigh/record.
+        # Ignore any lock before the egg can physically arrive.
+        # Selftest uses measurement_status='simulated' and may skip the delay.
+        age = time.monotonic() - opened_at if opened_at else 999.0
+        if measurement_status != 'simulated' and age < 5.0:
+            print(
+                f'[egg] SCALE {grams}g ignored — only {age:.1f}s after camera '
+                f'(need ≥5s travel to pad)',
+                flush=True,
+            )
             return None
         _egg_pipe['awaiting_weight'] = False
         _egg_pipe['weighed'] = True
@@ -1835,6 +2129,9 @@ def _attach_scale_to_camera_egg(
         })
     metrics['lastWeightGrams'] = grams
     metrics['lastSizeClass'] = size
+    metrics['lastMeasurementStatus'] = measurement_status
+    metrics['status'] = f'{cam} weighed {grams:g} g'
+    _save_live_detections_bg()
     print(
         f'[egg] SCALE {grams}g {size} attached to camera {cam} id={rid[:8]}...',
         flush=True,
@@ -1845,27 +2142,30 @@ def _attach_scale_to_camera_egg(
 def _scan_decision(now: float, elapsed: float) -> tuple[str, float]:
     crack_n = int(_scan['crack_n'])
     dirty_n = int(_scan['dirty_n'])
-    good_n = int(_scan['good_n'])
-    # Prefer clean when shell votes are mixed. Need repeated line hits to call crack —
-    # one blurry/model flash must not reject a good egg.
-    if crack_n >= 3 and crack_n > good_n and crack_n >= dirty_n:
-        label, conf = 'Crack Egg', _scan['crack']
-    elif dirty_n >= 3 and dirty_n > good_n and dirty_n >= crack_n:
-        label, conf = 'Dirty Egg', _scan['dirty']
-    elif good_n >= 1 and good_n >= crack_n:
-        label, conf = 'Clean Egg', max(_scan['good'], 60.0)
-    elif good_n >= 1 and good_n >= dirty_n:
-        label, conf = 'Clean Egg', max(_scan['good'], 60.0)
+    good_n = int(_scan['good_n']) + dirty_n  # dust votes count as Clean
+    hits = int(_scan['hits'])
+    # After the full 5s watch: always record Clean or Crack (never drop the egg).
+    # Dust/Dirty is not a grade — folds into Clean.
+    if crack_n >= 2 and crack_n > good_n:
+        label, conf = 'Crack Egg', max(_scan['crack'], 70.0)
+    elif good_n >= 2 and good_n >= crack_n:
+        label, conf = 'Clean Egg', max(_scan['good'], _scan['dirty'], 60.0)
+    elif hits >= 3 and crack_n > good_n:
+        label, conf = 'Crack Egg', max(_scan['crack'], 65.0)
+    elif hits >= 3:
+        # Tracked egg for the window, no clear crack majority → Clean.
+        label, conf = 'Clean Egg', max(_scan['good'], _scan['dirty'], 55.0)
     else:
         _reset_scan()
         return 'Empty Model', 0.0
     _scan['decided'] = label
-    _scan['hold_until'] = now + 8.0  # time for clean egg to reach the scale
+    _scan['hold_until'] = now + 45.0  # Clean may take time to reach the load cell
     _scan['committed'] = False
-    # Station layout: Clean → LEFT, Crack/Dirty → RIGHT (matches DevKit GATE).
-    side = 'full right' if label in ('Crack Egg', 'Dirty Egg') else 'full left'
+    # Station layout: Clean → LEFT, Crack → RIGHT (matches DevKit GATE).
+    side = 'full right' if label == 'Crack Egg' else 'full left'
     print(
         f'[scan] done {elapsed:.1f}s -> {label}  gate {side}  '
+        f'shell c={crack_n} d={dirty_n} g={good_n} hits={hits}  '
         f'crack={_scan["crack"]:.0f} dirty={_scan["dirty"]:.0f} good={_scan["good"]:.0f}',
         flush=True,
     )
@@ -1877,8 +2177,9 @@ def _scan_egg(seen: bool, scores: dict | None, shell: str = '') -> tuple[str, fl
     now = time.monotonic()
     with _scan_lock:
         if _scan['decided']:
+            # Decision already locked for this egg — do not extend forever (that
+            # made cleanEgg sticky and GATE re-fire while egg lingered in FOV).
             if seen:
-                _scan['hold_until'] = now + 1.5
                 _scan['last_seen'] = now
                 _scan['misses'] = 0
                 return _scan['decided'], 80.0
@@ -1895,21 +2196,23 @@ def _scan_egg(seen: bool, scores: dict | None, shell: str = '') -> tuple[str, fl
             if _scan['start'] <= 0.0:
                 _scan['start'] = now
                 _scan['logged'] = -1
-                print(f'[scan] egg seen - counting {SCAN_SEC:.1f}s then Clean/Crack/Dirty', flush=True)
+                print(f'[scan] egg seen - counting {SCAN_SEC:.1f}s then Clean/Crack', flush=True)
             _scan['crack'] = max(_scan['crack'], crack)
             _scan['dirty'] = max(_scan['dirty'], dirty)
-            _scan['good'] = max(_scan['good'], good)
+            _scan['good'] = max(_scan['good'], good, dirty)
             # Shell vision only — TF often says Crack on a clean/blurry egg.
+            # Dust/Dirty shell votes count as Clean (not a system grade).
             if shell == 'crack':
                 _scan['crack_n'] = int(_scan['crack_n']) + 1
-            elif shell == 'dirty':
-                _scan['dirty_n'] = int(_scan['dirty_n']) + 1
-            else:
-                # Missing/ambiguous shell counts toward clean so blur does not reject.
+            elif shell in ('clean', 'dirty'):
                 _scan['good_n'] = int(_scan['good_n']) + 1
+            elif good >= 65.0 and good >= crack + 10.0:
+                # Ambiguous vision: only TF-strong good may vote Clean.
+                _scan['good_n'] = int(_scan['good_n']) + 1
+            # else: no vote — empty-pad glare must not pile into Clean
         elif _scan['start'] <= 0.0:
             return 'Empty Model', 0.0
-        elif int(_scan['misses']) >= 10 and int(_scan['hits']) < 2:
+        elif int(_scan['misses']) >= 8 and int(_scan['hits']) < 4:
             print('[scan] egg left — scan cancelled', flush=True)
             _reset_scan()
             return 'Empty Model', 0.0
@@ -1921,10 +2224,11 @@ def _scan_egg(seen: bool, scores: dict | None, shell: str = '') -> tuple[str, fl
             _scan['logged'] = sec
             print(
                 f'[scan] {sec}s / {int(SCAN_SEC)}s  '
-                f'crack={_scan["crack"]:.0f} dirty={_scan["dirty"]:.0f} good={_scan["good"]:.0f}  '
-                f'shell c={_scan["crack_n"]} d={_scan["dirty_n"]} g={_scan["good_n"]}',
+                f'crack={_scan["crack"]:.0f} good={_scan["good"]:.0f}  '
+                f'shell c={_scan["crack_n"]} g={_scan["good_n"]}',
                 flush=True,
             )
+        # Full 5s detection only — then decide + record instantly (weight still pending).
         if elapsed < SCAN_SEC:
             return 'Scanning', 0.0
         if int(_scan['hits']) < 3:
@@ -2142,9 +2446,7 @@ def _overlay_live(frame, label: str, confidence: float, scores: dict | None = No
         color = (80, 220, 255)
         title = 'SCAN'
     cv2.rectangle(vis, (0, 0), (w, 42), (18, 14, 12), -1)
-    hud = title
-    if track_id > 0:
-        hud = f'{title}  ·  TRACK #{track_id}'
+    hud = title  # Clean / Crack / Dirty / SCAN — no TRACK #N (same egg ≠ new count)
     cv2.putText(
         vis, hud, (10, 28),
         cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2, cv2.LINE_AA,
@@ -2190,7 +2492,7 @@ def _ingest_jpeg(data: bytes) -> tuple[str, float, bool, bool, str, float]:
     for box in detect_cands:
         if _box_is_metal_or_belt(frame, box):
             continue
-        if not _box_is_egg_shell(frame, box, min_shell=0.28):
+        if not _box_is_egg_shell(frame, box, min_shell=0.30):
             continue
         if not _box_looks_like_egg(frame, box):
             continue
@@ -2252,7 +2554,7 @@ def _ingest_jpeg(data: bytes) -> tuple[str, float, bool, bool, str, float]:
     egg_visual = bool(
         tracking
         and track_box is not None
-        and _box_is_egg_shell(frame, track_box, min_shell=0.32)
+        and _box_is_egg_shell(frame, track_box, min_shell=0.30)
         and not _box_is_metal_or_belt(frame, track_box)
         and not _box_is_wood_board(frame, track_box)
     )
@@ -2287,7 +2589,7 @@ def _ingest_jpeg(data: bytes) -> tuple[str, float, bool, bool, str, float]:
                 print(f'[classify] skip (vision-only): {exc}', flush=True)
             scores = {}
             boxes = shaped_now
-    global _last_seen_egg, _egg_in_view
+    global _last_seen_egg, _egg_in_view, _clean_hold_until, _reject_hold_until
     seen = False
     picked = 'Empty Model'
     pconf = 0.0
@@ -2299,78 +2601,112 @@ def _ingest_jpeg(data: bytes) -> tuple[str, float, bool, bool, str, float]:
 
     if egg_visual:
         seen = True  # oval on belt already confirmed by detector + tracker
-        raw_good, raw_crack, raw_dirty = _score_buckets(scores)
-        shell = _shell_quality(frame, shaped_now[0]) if shaped_now else ''
-        # Never let the TF model alone force CRACK — it false-fires on blur/glare.
-        # Vision line detector is the only crack authority; model may hint dirty only.
-        if (
-            shaped_now
-            and shell == ''
-            and raw_dirty >= 78.0
-            and raw_dirty >= raw_crack + 8.0
-            and raw_dirty >= raw_good + 10.0
-        ):
-            shell = 'dirty'
-        # No TF scores: still classify from shell vision so CLEAN/CRACK show up.
-        if shell and not scores:
-            scores = _apply_shell({}, shell)
-        elif shell:
-            scores = _apply_shell(scores, shell)
-        picked, pconf = _scan_egg(True, scores, shell)
-        scanning = picked == 'Scanning'
         _egg_in_view = True
         _last_seen_egg = True
-        commit_now = False
-        commit_label = ''
-        commit_conf = 0.0
-        with _scan_lock:
-            if _scan['decided']:
-                picked = _scan['decided']
-                pconf = max(pconf, 80.0)
-                _scan['last_seen'] = time.monotonic()
-                _scan['hold_until'] = max(float(_scan['hold_until'] or 0.0), _scan['last_seen'] + 2.0)
-                scanning = False
-                if not _scan.get('committed'):
-                    _scan['committed'] = True
-                    commit_now = True
-                    commit_label = picked
-                    commit_conf = pconf
-            elif _scan['start'] > 0.0:
-                picked = 'Scanning'
-                scanning = True
-        if commit_now:
-            _commit_camera_detection(commit_label, commit_conf)
-        if scanning or is_empty_frame(picked):
-            picked = 'Scanning' if scanning else 'Egg'
-            pconf = max(pconf, 1.0)
-        cat = counting_category(picked)
-        reject = bool(cat in ('crackedEggs', 'dirtyEggs'))
-        identified = bool(cat in ('crackedEggs', 'dirtyEggs', 'goodEggs'))
-        if reject:
+        with _egg_pipe_lock:
+            scale_busy = bool(_egg_pipe.get('awaiting_weight'))
+        if scale_busy:
+            # 1 egg = 1 detect = 1 weigh. Keep showing Clean (not DETECTING).
+            with _scan_lock:
+                _reset_scan()
+            with _egg_pipe_lock:
+                pipe_cam = str(_egg_pipe.get('camera') or 'Clean')
+            picked = 'Crack Egg' if 'crack' in pipe_cam.lower() else 'Clean Egg'
+            pconf = 80.0
+            scanning = False
             metrics['lastLabel'] = picked
-        elif cat == 'goodEggs':
-            metrics['lastLabel'] = 'Clean Egg'
-            picked = 'Clean Egg'
+            metrics['lastConfidence'] = 80.0
+            shown = _camera_label(picked) or 'Clean'
+            cat = counting_category(picked)
+            reject = cat == 'crackedEggs'
+            identified = True
         else:
-            metrics['lastLabel'] = 'Scanning' if scanning else 'Egg'
-        metrics['lastConfidence'] = round(max(pconf, 1.0), 1)
-        shown = _camera_label(picked) or 'Clean'
-        # If Clean is waiting on the scale and grams already arrived, attach now.
-        if cat == 'goodEggs':
-            w = _peek_pending_weight()
-            if w is not None and 5.0 <= w <= 250.0:
-                with _egg_pipe_lock:
-                    awaiting = bool(_egg_pipe.get('awaiting_weight'))
-                if awaiting:
-                    _consume_pending_weight()
-                    _attach_scale_to_camera_egg(w, classify_size(w))
+            raw_good, raw_crack, raw_dirty = _score_buckets(scores)
+            shell = _shell_quality(frame, shaped_now[0]) if shaped_now else ''
+            # Never let the TF model alone force CRACK — it false-fires on blur/glare.
+            # Dust/Dirty model scores are ignored (not a system grade).
+            if (
+                shaped_now
+                and shell == ''
+                and raw_dirty >= 78.0
+                and raw_dirty >= raw_crack + 8.0
+                and raw_dirty >= raw_good + 10.0
+            ):
+                shell = 'clean'
+            # No TF scores: still classify from shell vision so CLEAN/CRACK show up.
+            if shell and not scores:
+                scores = _apply_shell({}, shell)
+            elif shell:
+                scores = _apply_shell(scores, shell)
+            picked, pconf = _scan_egg(True, scores, shell)
+            scanning = picked == 'Scanning'
+            commit_now = False
+            commit_label = ''
+            commit_conf = 0.0
+            with _scan_lock:
+                if _scan['decided']:
+                    picked = _scan['decided']
+                    pconf = max(pconf, 80.0)
+                    _scan['last_seen'] = time.monotonic()
+                    scanning = False
+                    if not _scan.get('committed'):
+                        _scan['committed'] = True
+                        commit_now = True
+                        commit_label = picked
+                        commit_conf = pconf
+                elif _scan['start'] > 0.0:
+                    picked = 'Scanning'
+                    scanning = True
+            if commit_now:
+                _commit_camera_detection(commit_label, commit_conf)
+            if scanning or is_empty_frame(picked) or picked == 'Waiting Scale':
+                picked = 'Scanning' if scanning else ('Waiting Scale' if picked == 'Waiting Scale' else 'Egg')
+                pconf = max(pconf, 1.0)
+            cat = counting_category(picked)
+            reject = cat == 'crackedEggs'
+            identified = cat in ('crackedEggs', 'goodEggs')
+            if reject:
+                metrics['lastLabel'] = picked
+            elif cat == 'goodEggs':
+                metrics['lastLabel'] = 'Clean Egg'
+                picked = 'Clean Egg'
+            else:
+                metrics['lastLabel'] = 'Scanning' if scanning else picked
+            metrics['lastConfidence'] = round(max(pconf, 1.0), 1)
+            shown = _camera_label(picked) or ('Waiting' if picked == 'Waiting Scale' else 'Clean')
+            # Do NOT attach weight while the egg is still in the camera FOV.
+            # Grams must come from DevKit POST /weight after the egg reaches the pad.
     else:
         with _scan_lock:
             _reset_scan()
+        # Egg left the frame — free the pipe so the next egg can record once.
+        # Keep the open Good record only while it is waiting on the load cell.
+        with _egg_pipe_lock:
+            if not _egg_pipe.get('awaiting_weight'):
+                _egg_pipe['id'] = ''
+                _egg_pipe['camera'] = ''
+                _egg_pipe['category'] = ''
+                _egg_pipe['weighed'] = False
+                _egg_pipe['opened_at'] = 0.0
         _last_seen_egg = False
         _egg_in_view = False
-        metrics['lastLabel'] = 'Empty Model'
-        metrics['lastConfidence'] = 0.0
+        # End GATE hold as soon as the egg leaves the frame.
+        _clean_hold_until = 0.0
+        _reject_hold_until = 0.0
+        # Keep the committed Clean/Crack label for Live Inspection while scale waits.
+        with _egg_pipe_lock:
+            still_waiting = bool(_egg_pipe.get('awaiting_weight'))
+            pipe_cam = str(_egg_pipe.get('camera') or '')
+        if still_waiting and pipe_cam:
+            if 'crack' in pipe_cam.lower():
+                shown = 'Crack Egg'
+            else:
+                shown = 'Clean Egg'
+            picked = shown
+            pconf = max(pconf, 80.0)
+        else:
+            metrics['lastLabel'] = 'Empty Model'
+            metrics['lastConfidence'] = 0.0
 
     # Live pixels come only from /api/frame → _store_live_jpeg. Never re-encode
     # here (paint/TF) or moving eggs look lagged on /watch.
@@ -2383,7 +2719,21 @@ def _ingest_jpeg(data: bytes) -> tuple[str, float, bool, bool, str, float]:
     _apply_inspect_frame(picked, pconf, scores)
     metrics['status'] = 'Running'
     metrics['connected'] = True
-    metrics['lastLabel'] = shown or 'N/A'
+    # Never wipe a pending Clean record back to N/A when the egg leaves FOV.
+    with _egg_pipe_lock:
+        keep_pending = bool(_egg_pipe.get('awaiting_weight')) and str(
+            _egg_pipe.get('camera') or ''
+        )
+    if shown:
+        metrics['lastLabel'] = shown
+    elif keep_pending:
+        cam = str(keep_pending)
+        if 'crack' in cam.lower():
+            metrics['lastLabel'] = 'Crack Egg'
+        else:
+            metrics['lastLabel'] = 'Clean Egg'
+    else:
+        metrics['lastLabel'] = 'N/A'
     _classify_n += 1
     if _classify_n == 1 or _classify_n % 8 == 0:
         with _egg_pipe_lock:
@@ -2470,10 +2820,11 @@ def _paint_view_fast(raw: bytes) -> bytes:
         vis = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if vis is None:
             return raw
-        low = (title or '').lower()
+        low = (title or '').lower().strip()
         color = (80, 220, 255)
         name = 'EGG'
-        if scanning or 'scan' in low or 'empty' in low:
+        # Do not use "'scan' in low" — it matched "Waiting Scale" and showed DETECT #N.
+        if scanning or low in ('scanning', 'egg', 'empty model', 'empty'):
             name, color = 'DETECT', (80, 220, 255)
         elif 'dirty' in low:
             name, color = 'DIRTY', (40, 180, 255)
@@ -2481,8 +2832,8 @@ def _paint_view_fast(raw: bytes) -> bytes:
             name, color = 'CLEAN', (70, 220, 90)
         elif 'crack' in low:
             name, color = 'CRACK', (40, 40, 245)
-        if track_id:
-            name = f'{name} #{track_id}'
+        # Never paint TRACK #N — that ID climbs when the same egg is re-locked
+        # (blink / FOV wobble), so 1 egg looked like "4 detections".
         _draw_tracker(vis, box, color)
         x1, y1 = int(box[0]), int(box[1])
         cv2.putText(
@@ -2621,9 +2972,16 @@ def root():
     }
 
 
+_NO_STORE = {
+    'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+    'Pragma': 'no-cache',
+    'Expires': '0',
+}
+
+
 @app.get('/metrics')
 def get_metrics():
-    return _public_metrics()
+    return JSONResponse(_public_metrics(), headers=_NO_STORE)
 
 
 def _hardware_status_response(body: dict | None = None):
@@ -2658,21 +3016,28 @@ def _hardware_status_response(body: dict | None = None):
     grams = body.get('weightGrams')
     if isinstance(grams, (int, float)):
         grams = correct_scale_grams(float(grams))
-        if grams < 8.0:
+        if grams < 5.0:
             if time.monotonic() - _last_live_weight_at >= 5.0:
                 metrics['lastWeightGrams'] = 0.0
                 metrics['lastSizeClass'] = 'N/A'
                 with _weight_lock:
                     _pending_weight = None
-        elif grams >= 15.0:
+        elif grams >= 8.0:
+            # Live pad readout only — never attach here. Heartbeat grams often
+            # exist before the egg leaves the camera / reaches the cell; attaching
+            # would fill the Clean row with stale residual weight.
             _last_live_weight_at = time.monotonic()
             size = classify_size(grams) if grams <= 150.0 else 'jumbo'
-            metrics['lastWeightGrams'] = grams
-            metrics['lastSizeClass'] = size
-            metrics['status'] = 'Running'
-            with _weight_lock:
-                if grams <= 150.0:
-                    _pending_weight = grams
+            with _egg_pipe_lock:
+                awaiting = bool(_egg_pipe.get('awaiting_weight'))
+            if awaiting:
+                # Keep HUD on "waiting for weight" until commitEgg /weight.
+                metrics['status'] = f'Waiting for pad lock — scale live {grams:g} g'
+            else:
+                metrics['lastWeightGrams'] = grams
+                metrics['lastSizeClass'] = size
+                metrics['lastMeasurementStatus'] = 'uncalibrated'
+                metrics['status'] = f'Scale live {grams:g} g'
     payload = _public_metrics()
     if stream_url:
         print(
@@ -2695,47 +3060,90 @@ def _hardware_status_response(body: dict | None = None):
     if isinstance(raw_g, (int, float)):
         hb_g = correct_scale_grams(float(raw_g))
     now = time.monotonic()
-    with _scan_lock:
-        gate_label = _scan['decided'] if _scan['decided'] and now < _scan['hold_until'] else ''
-    gate_cat = counting_category(gate_label) if gate_label else None
-    # Short hold so DevKit heartbeat can learn Clean vs Crack while egg is still in FOV.
-    # Gate returns to middle from eggSeen=false (FOV), not from this timer.
-    if gate_cat in ('crackedEggs', 'dirtyEggs'):
-        _reject_hold_until = now + 3.5
-        _clean_hold_until = 0.0
-    elif gate_cat == 'goodEggs':
-        _clean_hold_until = now + 3.5
-        _reject_hold_until = 0.0
-    elif _last_seen_egg and cat in ('crackedEggs', 'dirtyEggs'):
-        _reject_hold_until = now + 3.5
-        _clean_hold_until = 0.0
-    elif _last_seen_egg and cat == 'goodEggs':
-        _clean_hold_until = now + 3.5
-        _reject_hold_until = 0.0
+    # GATE cues follow the camera FOV: Clean/Crack only while egg is still seen.
+    # awaiting_weight must NOT keep cleanEgg after the egg leaves — GATE returns
+    # middle when FOV clears; pad weigh stays armed on the DevKit separately.
     reject_egg = now < _reject_hold_until
     clean_egg = (now < _clean_hold_until) and not reject_egg
-    # eggSeen = egg actually in the camera FOV. Gate returns to middle when this goes false.
-    # cleanEgg/rejectEgg may linger briefly so DevKit still learns Clean vs Crack/Dirty.
     egg_seen = bool(_egg_in_view)
     scanning, scan_left = _scan_active()
     with _egg_pipe_lock:
         pipe_id = str(_egg_pipe.get('id') or '')
         pipe_cam = str(_egg_pipe.get('camera') or '')
         awaiting_weight = bool(_egg_pipe.get('awaiting_weight'))
+        opened_at = float(_egg_pipe.get('opened_at') or 0.0)
+        # Match DevKit WEIGH_ARMED_MS (120s) so late pad locks still link.
+        if awaiting_weight and opened_at and (now - opened_at) > 120.0:
+            timed_id = pipe_id
+            _egg_pipe['awaiting_weight'] = False
+            _egg_pipe['id'] = ''
+            awaiting_weight = False
+            pipe_id = ''
+            for rec in detection_records:
+                if str(rec.get('id') or '') == timed_id:
+                    # Clear sticky await so the next egg can detect; /weight can
+                    # still attach later via unweighted-row fallback.
+                    rec['awaitingWeight'] = False
+                    if rec.get('weightGrams') is None:
+                        rec['sizeClass'] = 'pending'
+                    break
+            _save_live_detections()
+            print('[egg] awaiting_weight timed out (120s) — next egg may detect', flush=True)
+    if egg_seen and awaiting_weight and pipe_cam:
+        pl = pipe_cam.lower()
+        if 'crack' in pl or 'dirty' in pl:
+            reject_egg = True
+            clean_egg = False
+        else:
+            clean_egg = True
+            reject_egg = False
+    if not egg_seen:
+        # Egg left camera → drop GATE hold cues (scale pipe may still await grams).
+        clean_egg = False
+        reject_egg = False
+    # HUD can show Clean while pipe briefly lags — still cue GATE from lastLabel.
+    if egg_seen and not clean_egg and not reject_egg:
+        low_lbl = (label or '').lower()
+        if 'clean' in low_lbl or 'no crack' in low_lbl:
+            clean_egg = True
     if reject_egg:
-        cam_result = 'Crack' if 'dirty' not in label.lower() else 'Dirty'
-        if 'dirty' in (gate_label or label).lower():
+        cam_result = 'Crack' if 'dirty' not in (pipe_cam or label).lower() else 'Dirty'
+        if 'dirty' in (pipe_cam or label).lower():
             cam_result = 'Dirty'
         sort_result = 'Reject'
-    elif clean_egg or awaiting_weight:
-        cam_result = pipe_cam or 'Clean'
+    elif clean_egg:
+        cam_result = 'Clean'
         sort_result = 'Good'
     elif scanning:
         cam_result = 'Scanning'
         sort_result = 'Good'
     else:
-        cam_result = pipe_cam or 'Pending'
+        cam_result = 'Pending'
         sort_result = 'Good'
+    # DevKit only needs gate flags — tiny body avoids ESP32 lwIP pbuf_free crashes.
+    if 'devkit' in device.lower():
+        # cleanEgg drives GATE only while the egg is still in FOV.
+        # weighArm stays true after FOV clear so HX711 can still lock grams.
+        # Dirty/dust folds to Clean — still arm the pad (only Crack skips weigh).
+        weigh_arm = bool(
+            awaiting_weight
+            and pipe_cam
+            and 'crack' not in pipe_cam.lower()
+        )
+        return {
+            'ok': True,
+            'scanning': scanning,
+            'rejectEgg': reject_egg,
+            'cleanEgg': clean_egg,  # GATE while eggSeen
+            'weighArm': weigh_arm,  # pad auto-weigh after Clean commit
+            'awaitingWeight': weigh_arm,
+            'cameraResult': cam_result if (egg_seen or weigh_arm) else (
+                'Clean' if weigh_arm else cam_result
+            ),
+            'sortingResult': sort_result,
+            'servoTest': servo_test,
+            'eggSeen': egg_seen,
+        }
     return {
         'ok': True,
         'hardwareOnline': payload['hardwareOnline'],
@@ -2751,15 +3159,67 @@ def _hardware_status_response(body: dict | None = None):
         'scanning': scanning,
         'scanLeft': scan_left,
         'rejectEgg': reject_egg,
-        'cleanEgg': clean_egg or awaiting_weight,
+        'cleanEgg': clean_egg,
         'cameraResult': cam_result,
         'sortingResult': sort_result,
         'pendingEggId': pipe_id,
         'awaitingWeight': awaiting_weight,
-        'goodEggs': payload.get('goodEggs', 0),
-        'crackedEggs': payload.get('crackedEggs', 0),
-        'dirtyEggs': payload.get('dirtyEggs', 0),
+        # Do NOT send crackedEggs/dirtyEggs here — old DevKit firmware matched
+        # substring "crack"/"dirty" inside those keys and held GATE on reject forever.
+        'okEggs': payload.get('goodEggs', 0),
+        'badEggs': payload.get('crackedEggs', 0),
+        'soilEggs': payload.get('dirtyEggs', 0),
         'servoTest': servo_test,
+    }
+
+
+@app.get('/api/gate-cue')
+def api_gate_cue():
+    """Tiny Clean/Crack flags for DevKit when POST /api/status reply is dropped on weak Wi‑Fi."""
+    now = time.monotonic()
+    reject_egg = now < _reject_hold_until
+    clean_egg = (now < _clean_hold_until) and not reject_egg
+    egg_seen = bool(_egg_in_view)
+    scanning, _scan_left = _scan_active()
+    label = str(metrics.get('lastLabel') or '')
+    with _egg_pipe_lock:
+        pipe_cam = str(_egg_pipe.get('camera') or '')
+        awaiting_weight = bool(_egg_pipe.get('awaiting_weight'))
+    if egg_seen and awaiting_weight and pipe_cam:
+        pl = pipe_cam.lower()
+        if 'crack' in pl or 'dirty' in pl:
+            reject_egg, clean_egg = True, False
+        else:
+            clean_egg, reject_egg = True, False
+    if not egg_seen:
+        clean_egg = False
+        reject_egg = False
+    if egg_seen and not clean_egg and not reject_egg:
+        low_lbl = (label or '').lower()
+        if 'clean' in low_lbl or 'no crack' in low_lbl:
+            clean_egg = True
+    weigh_arm = bool(
+        awaiting_weight
+        and pipe_cam
+        and 'crack' not in pipe_cam.lower()
+    )
+    if reject_egg:
+        cam_result = 'Dirty' if 'dirty' in (pipe_cam or label).lower() else 'Crack'
+    elif clean_egg or weigh_arm:
+        cam_result = 'Clean'
+    elif scanning:
+        cam_result = 'Scanning'
+    else:
+        cam_result = 'Pending'
+    return {
+        'ok': True,
+        'scanning': scanning,
+        'rejectEgg': reject_egg,
+        'cleanEgg': clean_egg,
+        'weighArm': weigh_arm,
+        'awaitingWeight': weigh_arm,
+        'cameraResult': cam_result,
+        'eggSeen': egg_seen,
     }
 
 
@@ -2932,12 +3392,115 @@ def get_debug_info():
 def get_records():
     """Return the last MAX_RECORDS confirmed detections in reverse-chronological
     order (newest first), skipping 'Empty Model' and low-confidence frames."""
-    return list(reversed(detection_records))
+    return JSONResponse(list(reversed(detection_records)), headers=_NO_STORE)
+
+
+def _merge_detection_rows(incoming: list) -> int:
+    """Merge browser/cache rows into the farm board (by id). Returns added count."""
+    if not incoming:
+        return 0
+    by_id: dict[str, dict] = {}
+    for row in detection_records:
+        if isinstance(row, dict) and row.get('id'):
+            by_id[str(row['id'])] = dict(row)
+    added = 0
+    for item in incoming:
+        if not isinstance(item, dict):
+            continue
+        rid = str(item.get('id') or '').strip()
+        if not rid:
+            # Stable fallback from timestamp+label so refresh rows still merge.
+            ts = str(item.get('timestamp') or '')
+            lab = str(item.get('label') or '')
+            rid = f'cache-{ts}-{lab}'.replace(' ', '_')
+            item = dict(item)
+            item['id'] = rid
+        lab = str(item.get('label') or 'Clean')
+        cat = str(item.get('category') or '')
+        if not cat:
+            low = lab.lower()
+            cat = (
+                'crackedEggs'
+                if ('crack' in low and 'no crack' not in low)
+                else 'goodEggs'
+            )
+        if cat == 'dirtyEggs':
+            cat = 'goodEggs'
+            lab = 'Clean'
+        row = {
+            'id': rid,
+            'timestamp': str(item.get('timestamp') or time.strftime('%Y-%m-%d %H:%M:%S')),
+            'label': lab if lab else 'Clean',
+            'confidence': float(item.get('confidence') or 80.0),
+            'category': cat,
+            'weightGrams': item.get('weightGrams'),
+            'sizeClass': item.get('sizeClass') or (
+                'pending' if item.get('awaitingWeight') else 'N/A'
+            ),
+            'awaitingWeight': bool(item.get('awaitingWeight')),
+        }
+        prev = by_id.get(rid)
+        if prev is None:
+            added += 1
+            by_id[rid] = row
+        else:
+            # Keep newer weight if cache finally got grams.
+            merged = dict(prev)
+            if row.get('weightGrams') is not None and (
+                prev.get('weightGrams') is None
+                or float(prev.get('weightGrams') or 0) < 5.0
+            ):
+                merged['weightGrams'] = row['weightGrams']
+                merged['sizeClass'] = row.get('sizeClass') or merged.get('sizeClass')
+                merged['awaitingWeight'] = bool(row.get('awaitingWeight'))
+            by_id[rid] = merged
+    # Chronological (oldest → newest) so reverse() on GET stays newest-first.
+    ordered = sorted(
+        by_id.values(),
+        key=lambda r: str(r.get('timestamp') or ''),
+    )
+    if len(ordered) > MAX_RECORDS:
+        ordered = ordered[-MAX_RECORDS:]
+    detection_records.clear()
+    detection_records.extend(ordered)
+    good_n = 0
+    crack_n = 0
+    for row in detection_records:
+        cat = str(row.get('category') or '').lower()
+        lab = str(row.get('label') or '').lower()
+        if cat == 'crackedeggs' or ('crack' in lab and 'no crack' not in lab):
+            crack_n += 1
+        else:
+            good_n += 1
+    metrics['goodEggs'] = max(int(metrics.get('goodEggs') or 0), good_n)
+    metrics['crackedEggs'] = max(int(metrics.get('crackedEggs') or 0), crack_n)
+    _save_live_detections()
+    return added
+
+
+@app.post('/records/restore')
+async def restore_records(request: Request):
+    """Rehydrate Live Egg Records after hard refresh / backend restart."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    rows = body.get('records') if isinstance(body, dict) else body
+    if not isinstance(rows, list):
+        return JSONResponse({'ok': False, 'error': 'records list required'}, status_code=400)
+    added = _merge_detection_rows(rows)
+    return {
+        'ok': True,
+        'added': added,
+        'total': len(detection_records),
+        'goodEggs': int(metrics.get('goodEggs') or 0),
+        'crackedEggs': int(metrics.get('crackedEggs') or 0),
+    }
 
 
 @app.post('/api/egg-records')
 async def api_egg_records(request: Request):
-    """Save one egg in memory (no SQLite / no Firebase)."""
+    """Save one egg to Firestore egg_readings (no SQLite)."""
     try:
         body = await request.json()
     except Exception:
@@ -2950,11 +3513,12 @@ async def api_egg_records(request: Request):
 def api_egg_sync():
     store = get_store()
     counts = store.counts()
+    online = bool(store.internet())
     return {
         'pending': counts['pending'],
         'synced': counts['synced'],
-        'online': False,
-        'backend': 'memory',
+        'online': online,
+        'backend': 'firestore',
         'records': store.recent(),
     }
 
@@ -2962,11 +3526,14 @@ def api_egg_sync():
 @app.get('/health')
 def get_health():
     payload = _public_metrics()
+    cam = bool(metrics.get('connected'))
+    hw = bool(payload['hardwareOnline'])
     return {
         'backend': 'ready',
-        'cameraConnected': bool(metrics.get('connected')),
-        'hardwareOnline': payload['hardwareOnline'],
-        'status': payload['status'],
+        'connected': cam,  # same key as /metrics so hosted clients stay LIVE
+        'cameraConnected': cam,
+        'hardwareOnline': hw,
+        'status': payload['status'] if (cam or hw) else 'Running — waiting for ESP32-CAM',
     }
 
 
@@ -2984,45 +3551,14 @@ def _jpeg_response(data: bytes):
 
 
 def _placeholder_jpeg():
+    """Calm blank only — never put flash/power troubleshooting text on /watch."""
     img = np.zeros((480, 800, 3), dtype=np.uint8)
     img[:] = (28, 24, 22)
-    online = _hardware_online()
-    with _heartbeat_lock:
-        device = (_esp32_device or 'ESP32').strip()
-    # DevKit heartbeat alone used to say "CAM online" while the camera was dead.
-    is_devkit = 'devkit' in device.lower() or 'station' in device.lower()
-    if online and is_devkit:
-        title = "DevKit online — camera has no picture yet"
-        tip1 = "1) Power ESP32-CAM from expansion 5V + G"
-        tip2 = "2) Flash CAM with EGG_DEVKIT 0 (not the station build)"
-        tip3 = "3) Same Wi-Fi as laptop; Serial: Laptop HB OK  jpg>0"
-    elif online:
-        with _cam_hb_jpg_lock:
-            hb_jpg = _cam_hb_jpg
-        if hb_jpg == 0:
-            title = "ESP32-CAM online — sensor jpg=0 (no encode)"
-            tip1 = "Power-cycle CAM 5V+G on the expansion board"
-            tip2 = "Reflash CAM: board AI Thinker + PSRAM, EGG_DEVKIT 0"
-            tip3 = "Serial must show ONLINE HB OK  jpg>0  then LIVE push"
-        else:
-            title = "ESP32-CAM on Wi-Fi — waiting for picture…"
-            tip1 = "Same Wi-Fi as laptop (FTTx_1FC5-2.4G-ext or -2.4G)"
-            tip2 = "CAM Serial: ONLINE HB OK jpg>0  and LIVE push http=0"
-            tip3 = "If LIVE push missing: reflash CAM (EGG_DEVKIT 0) now"
-    else:
-        title = "ESP32-CAM offline — not on laptop Wi-Fi"
-        tip1 = "Laptop internet is NOT enough — same Wi-Fi (FTTx_1FC5-2.4G/-ext)"
-        tip2 = "Power CAM from expansion 5V + G (weak 5V → magenta / drop)"
-        tip3 = "Wait 15s after power; Serial: ONLINE HB OK  jpg>0"
-    cv2.putText(img, title, (36, 190),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.72, (240, 240, 240), 2, cv2.LINE_AA)
-    cv2.putText(img, tip1, (36, 240),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.62, (210, 210, 210), 2, cv2.LINE_AA)
-    cv2.putText(img, tip2, (36, 280),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.62, (210, 210, 210), 2, cv2.LINE_AA)
-    cv2.putText(img, tip3, (36, 320),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.62, (180, 175, 170), 2, cv2.LINE_AA)
-    ok, buf = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+    cv2.putText(
+        img, "Connecting camera…", (36, 250),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (200, 196, 190), 2, cv2.LINE_AA,
+    )
+    ok, buf = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
     return buf.tobytes() if ok else b''
 
 
@@ -3064,7 +3600,7 @@ def _paint_track(preview: bytes, box, src_wh, title: str, track_id: int) -> byte
         float(box[0]) * sx, float(box[1]) * sy,
         float(box[2]) * sx, float(box[3]) * sy,
     )
-    low = (title or '').lower()
+    low = (title or '').lower().strip()
     color = (80, 220, 255)
     name = 'EGG'
     if 'dirty' in low:
@@ -3073,10 +3609,8 @@ def _paint_track(preview: bytes, box, src_wh, title: str, track_id: int) -> byte
         name, color = 'CLEAN', (70, 220, 90)
     elif 'crack' in low:
         name, color = 'CRACK', (40, 40, 245)
-    elif 'scan' in low:
-        name = 'SCAN'
-    if track_id:
-        name = f'{name} #{track_id}'
+    elif low in ('scanning', 'egg', 'empty model', 'empty'):
+        name = 'DETECT'
     _draw_tracker(vis, scaled, color)
     x1, y1 = int(scaled[0]), int(scaled[1])
     cv2.putText(
@@ -3117,12 +3651,14 @@ def _pull_cam_jpeg_once() -> bytes:
         return _last_raw or b''
 
 
-# Fresh enough to count as live. Allow short Wi‑Fi gaps without flashing placeholder.
-LIVE_VIEW_MAX_AGE_SEC = 4.0  # brief Wi‑Fi blips must not flash "camera offline"
+# Fresh enough to count as live. Allow short Wi‑Fi gaps without flashing blank.
+LIVE_VIEW_MAX_AGE_SEC = 6.0
+# Keep showing the last good picture during longer blips (no error card on /watch).
+LIVE_VIEW_HOLD_SEC = 60.0
 
 
 def _latest_view_jpeg() -> bytes:
-    """Newest frame only. Stale cache = frozen hand — refuse old pictures."""
+    """Prefer a live frame; on brief drops hold last picture; never show tip cards."""
     now = time.monotonic()
     with _raw_lock:
         raw_at = _last_raw_at
@@ -3137,10 +3673,22 @@ def _latest_view_jpeg() -> bytes:
             return view
         if raw:
             return raw
-    if age >= 2.0:
+    # Frame went stale — pull once from CAM :82 before giving up.
+    if age > 1.2:
+        pulled = _pull_cam_jpeg_once()
+        if pulled and pulled[:2] == b'\xff\xd8':
+            metrics['connected'] = True
+            with _view_lock:
+                if _view_jpeg:
+                    return _view_jpeg
+            return pulled
+    if age >= 2.5:
         _clear_tracker()
-        metrics['connected'] = False
-    # Too old to show as "live" — placeholder beats a stuck hand/egg ghost.
+    # Hold last good JPEG so /watch stays on picture, not an error screen.
+    if has_raw and age <= LIVE_VIEW_HOLD_SEC:
+        metrics['connected'] = age <= LIVE_VIEW_MAX_AGE_SEC
+        return view or raw
+    metrics['connected'] = False
     return _placeholder_jpeg()
 
 
@@ -3167,7 +3715,11 @@ def proxy_stream():
                 data = _view_jpeg
                 seq = _view_seq
             if age > LIVE_VIEW_MAX_AGE_SEC or not data:
-                data = _placeholder_jpeg()
+                # Hold last real frame — never replace with troubleshooting JPEG.
+                if raw and age <= LIVE_VIEW_HOLD_SEC and raw[:2] == b'\xff\xd8':
+                    data = raw
+                else:
+                    data = _placeholder_jpeg()
                 seq = -1
             if data and seq != seen:
                 seen = seq
@@ -3221,27 +3773,39 @@ def live_status():
         )
         track_id = int(_track['id'] or 0) if tracking else 0
     scanning, scan_left = _scan_active()
-    lab = str(metrics.get('lastLabel') or '')
-    low = lab.lower()
+    _restore_pipe_from_pending()
+    pub = _public_metrics()
+    lab = str(pub.get('lastLabel') or metrics.get('lastLabel') or '')
+    low = lab.lower().strip()
+    awaiting_weight = bool(pub.get('awaitingWeight'))
+    pending_id = str(pub.get('pendingEggId') or '')
+    pipe_cam = str(pub.get('pipeCamera') or '')
     quality = 'empty'
     # Never show CLEAN/CRACK/DIRTY on empty wood — only while an egg is in view.
-    if not egg_now or not tracking:
+    # NOTE: do not use "'scan' in low" — that matched "Waiting Scale" and stuck DETECTING.
+    if awaiting_weight and (egg_now or tracking):
+        pc = pipe_cam.lower()
+        if 'dirty' in pc:
+            quality = 'dirty'
+        elif 'crack' in pc:
+            quality = 'crack'
+        else:
+            quality = 'clean'
+        scanning = False
+        scan_left = 0.0
+    elif not egg_now or not tracking:
         quality = 'empty'
         scanning = False
-    elif scanning or 'scan' in low:
+    elif scanning or low in ('scanning', 'egg', 'detecting'):
         quality = 'scanning'
     elif 'dirty' in low:
         quality = 'dirty'
-    elif 'no crack' in low or 'clean' in low:
+    elif 'no crack' in low or low.startswith('clean') or low == 'clean egg':
         quality = 'clean'
     elif 'crack' in low:
         quality = 'crack'
     else:
         quality = 'scanning'
-    with _egg_pipe_lock:
-        awaiting_weight = bool(_egg_pipe.get('awaiting_weight'))
-        pending_id = str(_egg_pipe.get('id') or '')
-        pipe_cam = str(_egg_pipe.get('camera') or '')
     return {
         'ok': True,
         'label': metrics.get('lastLabel') or 'Empty Model',
@@ -3256,7 +3820,8 @@ def live_status():
         'scanning': bool(scanning),
         'scanLeft': float(scan_left),
         'scanTotal': float(SCAN_SEC),
-        'cameraStream': _cam_jpg_url().replace('/jpg', '/stream'),
+        # Same-origin path so workers.dev / phones never hit a LAN CAM IP.
+        'cameraStream': '/stream',
         'goodEggs': int(metrics.get('goodEggs') or 0),
         'crackedEggs': int(metrics.get('crackedEggs') or 0),
         'dirtyEggs': int(metrics.get('dirtyEggs') or 0),
@@ -3330,29 +3895,30 @@ async function hudTick() {
       hud.className = '';
       const age = (typeof j.frameAgeMs === 'number') ? j.frameAgeMs : 9999;
       const blobAge = lastBlobAt ? (Date.now() - lastBlobAt) : 99999;
-      // Tolerate brief CAM Wi‑Fi blips — do not flash offline on 1 slow frame.
-      const hasPic = (!!(j.frameLive) && age < 3500) || blobAge < 2500;
+      // Hold last picture through short CAM Wi‑Fi gaps — never flash tip cards.
+      const hasPic = (!!(j.frameLive) && age < 8000) || blobAge < 8000;
       const eggOn = !!(j.tracking || j.scanning);
-      if (!j.hardwareOnline && !hasPic && age > 5000) {
-        hud.textContent = 'camera offline';
-      } else if (!hasPic) {
-        hud.textContent = 'waiting camera picture… (CAM not pushing — reflash EGG_DEVKIT 0)';
+      if (!hasPic) {
+        hud.textContent = j.hardwareOnline ? 'connecting…' : 'connecting…';
       } else if (!eggOn || j.quality === 'empty') {
         hud.textContent = 'waiting egg';
+      } else if (j.awaitingWeight && (j.quality === 'clean' || j.pipeCamera === 'Clean')) {
+        hud.className = 'clean';
+        hud.textContent = 'CLEAN — waiting scale';
       } else if (j.quality === 'clean') {
         hud.className = 'clean';
-        hud.textContent = 'CLEAN' + (j.trackId ? '  TRACK #' + j.trackId : '');
+        hud.textContent = 'CLEAN';
       } else if (j.quality === 'crack') {
         hud.className = 'crack';
-        hud.textContent = 'CRACK' + (j.trackId ? '  TRACK #' + j.trackId : '');
+        hud.textContent = 'CRACK';
       } else if (j.quality === 'dirty') {
         hud.className = 'dirty';
-        hud.textContent = 'DIRTY' + (j.trackId ? '  TRACK #' + j.trackId : '');
+        hud.textContent = 'DIRTY';
       } else if (j.quality === 'scanning' || j.scanning) {
         hud.className = 'scanning';
         const left = (typeof j.scanLeft === 'number') ? j.scanLeft : 0;
-        const total = (typeof j.scanTotal === 'number' && j.scanTotal > 0) ? j.scanTotal : 3.5;
-        const done = Math.max(0, total - left);
+        const total = (typeof j.scanTotal === 'number' && j.scanTotal > 0) ? j.scanTotal : 2.0;
+        const done = Math.min(total, Math.max(0, total - left));
         hud.textContent = 'DETECTING… ' + done.toFixed(1) + 's / ' + total.toFixed(1) + 's';
       } else {
         hud.textContent = 'waiting egg';
@@ -3380,7 +3946,8 @@ hudTick();
 
 @app.post('/reset')
 def reset_metrics():
-    """Zero all counters and clear the detection log."""
+    """Zero today's live counters and delete today's Firestore egg_readings."""
+    global _force_empty_records_save
     metrics['goodEggs'] = 0
     metrics['crackedEggs'] = 0
     metrics['dirtyEggs'] = 0
@@ -3400,7 +3967,16 @@ def reset_metrics():
     debug_info['frameCount'] = 0
     debug_info['rawScores'] = []
     debug_info['topClasses'] = []
-    return {'reset': True}
+    _force_empty_records_save = True
+    _save_live_detections()
+    get_store().clear_memory()
+    deleted = 0
+    try:
+        deleted = int(delete_eggs_for_utc_day())
+    except Exception as exc:
+        print(f'[reset] Firestore day clear skipped: {exc}', flush=True)
+    print(f'[reset] counters cleared, firestore_deleted={deleted}', flush=True)
+    return {'reset': True, 'firestoreDeleted': deleted}
 
 
 @app.get('/api/ping')
@@ -3507,6 +4083,8 @@ async def receive_weight(request: Request):
     commit = bool(body.get('commitEgg')) or bool(str(body.get('eventId') or '').strip())
     if commit and 5.0 <= grams <= 250.0:
         # Prefer same-egg link: camera Clean count → this load-cell weight.
+        # Re-open pipe from orphan pending rows (timeout / FOV clear) before attach.
+        _restore_pipe_from_pending()
         with _egg_pipe_lock:
             awaiting = bool(_egg_pipe.get('awaiting_weight')) and bool(_egg_pipe.get('id'))
         if awaiting:
@@ -3516,6 +4094,39 @@ async def receive_weight(request: Request):
             linked = bool(record_id)
             with _weight_lock:
                 _pending_weight = None
+        if not linked:
+            # Last chance: newest unweighted Clean row (pending or timed-out).
+            pending = _latest_pending_detection()
+            if pending is None:
+                for rec in reversed(list(detection_records)):
+                    if rec.get('weightGrams') is not None:
+                        continue
+                    cat = str(rec.get('category') or '')
+                    lab = str(rec.get('label') or '').lower()
+                    if cat == 'crackedEggs' or (
+                        'crack' in lab and 'no crack' not in lab
+                    ):
+                        continue
+                    pending = rec
+                    break
+            if pending and pending.get('id'):
+                with _egg_pipe_lock:
+                    _egg_pipe['id'] = str(pending.get('id'))
+                    cam = str(pending.get('label') or 'Clean')
+                    _egg_pipe['camera'] = (
+                        'Crack' if 'crack' in cam.lower() and 'no crack' not in cam.lower()
+                        else 'Clean'
+                    )
+                    _egg_pipe['category'] = str(pending.get('category') or 'goodEggs')
+                    _egg_pipe['awaiting_weight'] = True
+                    _egg_pipe['weighed'] = False
+                    _egg_pipe['opened_at'] = time.monotonic()
+                record_id = _attach_scale_to_camera_egg(
+                    grams, size, measurement_status=status, device_id=device_id,
+                )
+                linked = bool(record_id)
+                with _weight_lock:
+                    _pending_weight = None
         if not linked:
             camera = str(body.get('cameraResult') or '').strip()[:80]
             sorting = str(body.get('sortingResult') or '').strip()[:80]
@@ -3569,6 +4180,17 @@ async def receive_weight(request: Request):
     }
 
 
+def _egg_sync_loop() -> None:
+    while True:
+        try:
+            done = get_store().sync_once()
+            if done:
+                print(f'[egg-sync] uploaded {done} egg(s) to Firestore', flush=True)
+        except Exception as exc:
+            print(f'[egg-sync] retry later: {exc}', flush=True)
+        time.sleep(1.5)  # retry pending Firebase uploads quickly
+
+
 def ensure_background_thread():
     """Start the stream worker once (safe under uvicorn reload)."""
     global _thread_started
@@ -3577,9 +4199,10 @@ def ensure_background_thread():
             return
         _thread_started = True
     print('[main] Starting background stream worker...')
-    print('[main] Egg history = memory only (SQLite/Firebase egg sync off)')
+    print('[main] Egg history = Firestore egg_readings only (no SQLite)')
     thread = threading.Thread(target=stream_worker, daemon=True)
     thread.start()
+    threading.Thread(target=_egg_sync_loop, daemon=True).start()
 
 
 @app.on_event('startup')
@@ -3596,22 +4219,63 @@ def _on_startup():
     ensure_background_thread()
 
 
+@app.put('/farm/snapshot')
+async def farm_snapshot_put(request: Request):
+    """Shared farm ledger so seller sales update admin inventory/sales."""
+    user = get_user_from_authorization(request.headers.get('authorization'))
+    if user is None:
+        return JSONResponse(
+            {'error': 'Sign in again.', 'code': 'unauthorized'},
+            status_code=401,
+        )
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = None
+    if not isinstance(payload, dict):
+        return JSONResponse(
+            {'error': 'Invalid farm snapshot.', 'code': 'invalid_request'},
+            status_code=400,
+        )
+    merged = put_shared_farm_snapshot(int(user['id']), payload)
+    return {'ok': True, 'snapshot': merged}
+
+
+@app.get('/farm/snapshot')
+async def farm_snapshot_get(request: Request):
+    user = get_user_from_authorization(request.headers.get('authorization'))
+    if user is None:
+        return JSONResponse(
+            {'error': 'Sign in again.', 'code': 'unauthorized'},
+            status_code=401,
+        )
+    shared = get_shared_farm_snapshot(int(user['id']))
+    if shared is None:
+        return JSONResponse({'snapshot': None}, status_code=404)
+    return {'snapshot': shared}
+
+
 # Auth stays on Flask; mount last so FastAPI live routes win.
 app.mount('/auth', WSGIMiddleware(_PrependAuthPath(_auth_flask)))
 
 
 if __name__ == '__main__':
+    import os
     import uvicorn
 
-    print('Live camera  http://192.168.11.212:8000/watch')
-    print('Live stream  http://192.168.11.212:8000/stream')
-    print('API docs     http://192.168.11.212:8000/docs')
-    print('Remote view  use Cloudflare tunnel URL + /watch')
-    print('Engine       FastAPI + uvicorn')
+    # App binds :8001. farm_gateway.py stays on :8000 for cloudflared so
+    # backend restarts return HTTP 503 instead of TCP "connection refused".
+    port = int(os.environ.get('FARM_APP_PORT', '8001'))
+    print(f'Live app (LAN) http://192.168.11.212:8000  (gateway → :{port})')
+    print('Public camera  http://192.168.11.212:8000/watch')
+    print('Farm tunnel    https://egg-farm.eggsorting.site')
+    print('Storage        Firebase Firestore only')
+    print('Engine         FastAPI + uvicorn')
+    # Bind loopback only — farm_gateway exposes LAN/tunnel on :8000.
     uvicorn.run(
         'live_inspection_backend:app',
-        host='0.0.0.0',
-        port=8000,
+        host='127.0.0.1',
+        port=port,
         reload=False,
         log_level='info',
     )

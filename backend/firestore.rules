@@ -1,10 +1,14 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // Deny-by-default. Client SDK must not read SMTP or password material.
+    // Deny-by-default. Client SDK must not read SMTP secrets.
 
     function signedIn() {
       return request.auth != null;
+    }
+
+    function isEggApp() {
+      return request.resource.data.app == 'egg_system';
     }
 
     function validEgg(data) {
@@ -12,37 +16,79 @@ service cloud.firestore {
             'weight', 'grade', 'sizeClass', 'deviceId', 'createdAt'
           ])
           && data.weight is number
-          && data.weight > 0
+          && data.weight >= 0
           && data.weight < 500
           && data.deviceId is string
           && data.grade is string
           && data.sizeClass is string;
     }
 
-    // Server-only — never allow browser/mobile SDK access.
-    match /mail_config/{id} {
-      allow read, write: if false;
-    }
-    match /email_verifications/{email} {
-      allow read, write: if false;
-    }
-    match /backend_emails/{email} {
-      allow read, write: if false;
-    }
-    match /users/{email} {
-      allow read, write: if false;
+    function isEggAppDoc() {
+      return resource.data.keys().hasAny(['app'])
+        && resource.data.app == 'egg_system';
     }
 
-    // ESP32 may CREATE telemetry only (no updates/deletes). Staff may read when signed in.
-    match /egg_readings/{id} {
+    // Server-only mirror collections (backend Firebase ID token; not for clients).
+    match /mail_config/{id} {
       allow read: if signedIn();
-      allow create: if validEgg(request.resource.data);
-      // Same record id and weight can be written again. A retry does not create a second egg.
+      allow create, update: if signedIn() && isEggApp();
+      allow delete: if signedIn();
+    }
+    match /email_verifications/{email} {
+      allow read: if signedIn();
+      allow create, update: if signedIn() && isEggApp();
+      allow delete: if signedIn();
+    }
+    match /backend_emails/{email} {
+      allow read: if signedIn();
+      allow create, update: if signedIn() && isEggApp();
+      allow delete: if signedIn();
+    }
+    match /users/{email} {
+      allow read: if signedIn();
+      allow create, update: if signedIn() && isEggApp();
+      allow delete: if signedIn();
+    }
+
+    // Farm auth + ledger — backend only (Firebase ID token via REST).
+    // Clients use /auth and /farm/snapshot — never direct SDK access to hashes.
+    match /farm_users/{email} {
+      allow read: if signedIn();
+      allow create, update: if signedIn() && isEggApp();
+      allow delete: if signedIn();
+    }
+    match /farm_sessions/{id} {
+      allow read: if signedIn();
+      allow create, update: if signedIn() && isEggApp();
+      allow delete: if signedIn();
+    }
+    match /farm_email_tokens/{id} {
+      allow read: if signedIn();
+      allow create, update: if signedIn() && isEggApp();
+      allow delete: if signedIn();
+    }
+    match /farm_shared/{id} {
+      allow read: if signedIn();
+      allow create, update: if signedIn() && isEggApp();
+      allow delete: if signedIn();
+    }
+    match /farm_live/{id} {
+      allow read: if signedIn();
+      allow create, update: if signedIn() && isEggApp();
+      allow delete: if signedIn();
+    }
+
+    // Per-egg IoT history.
+    match /egg_readings/{id} {
+      allow read: if true;
+      allow create: if validEgg(request.resource.data)
+        && request.resource.data.keys().hasAny(['app'])
+        && request.resource.data.app == 'egg_system';
       allow update: if validEgg(request.resource.data)
         && request.resource.data.recordId == resource.data.recordId
-        && request.resource.data.weight == resource.data.weight
-        && request.resource.data.createdAt == resource.data.createdAt;
-      allow delete: if false;
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.app == 'egg_system';
+      allow delete: if signedIn() || isEggAppDoc();
     }
 
     match /{document=**} {

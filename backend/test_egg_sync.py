@@ -1,4 +1,4 @@
-"""Offline egg queue: local save, backoff, restart, and duplicate ids."""
+"""Firebase egg queue: offline pending, backoff, and duplicate ids (no SQLite)."""
 
 import sys
 import tempfile
@@ -13,13 +13,13 @@ from egg_sync import EggRecordStore, ingest_body, sorting_result_for, valid_reco
 class EggSyncTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.path = Path(self.tmp.name) / 'eggs.sqlite'
         self.now = [1000.0]
         self.uploads = []
         self.online = True
         self.fail = False
+        self.accept = True
         self.store = EggRecordStore(
-            self.path,
+            Path(self.tmp.name),
             uploader=self._upload,
             internet=lambda: self.online,
             clock=lambda: self.now[0],
@@ -59,16 +59,18 @@ class EggSyncTests(unittest.TestCase):
     def test_interrupted_upload_is_not_marked_synced(self):
         self.accept = True
         self.fail = True
+        self.online = True
         self._save()
-        self.assertEqual(self.store.sync_once(), 0)
-        row = self.store.get('eggrecord01')
-        self.assertEqual(row['sync_status'], 'pending')
-        self.assertEqual(row['attempts'], 1)
+        # enqueue already tried upload and failed
+        self.assertEqual(self.store.get('eggrecord01')['sync_status'], 'pending')
+        self.fail = False
+        self.store.backoff('eggrecord01')
+        self.now[0] += 5
+        self.assertEqual(self.store.sync_once(), 1)
 
     def test_backoff_waits_before_retry(self):
         self.accept = False
         self._save()
-        self.store.sync_once()
         self.assertEqual(len(self.uploads), 1)
         self.store.sync_once()
         self.assertEqual(len(self.uploads), 1)
@@ -78,15 +80,16 @@ class EggSyncTests(unittest.TestCase):
         self.assertEqual(self.store.counts()['synced'], 1)
 
     def test_duplicate_id_does_not_insert_a_second_row(self):
+        self.online = False
         self._save()
         self._save()
         self.assertEqual(self.store.counts()['pending'], 1)
 
-    def test_memory_store_clears_on_close(self):
-        # No SQLite — records live in RAM only for this process.
+    def test_memory_clears(self):
+        self.online = False
         self._save('eggrecord02')
         self.assertIsNotNone(self.store.get('eggrecord02'))
-        self.store.close()
+        self.store.clear_memory()
         self.assertIsNone(self.store.get('eggrecord02'))
 
     def test_sorting_result_maps_quality_labels(self):

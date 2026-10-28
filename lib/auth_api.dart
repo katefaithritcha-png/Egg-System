@@ -58,6 +58,7 @@ class AuthMailResult {
     this.user,
     this.session,
     this.verificationCode,
+    this.emailSent = false,
     this.mfaRequired = false,
   });
 
@@ -65,6 +66,7 @@ class AuthMailResult {
   final Map<String, dynamic>? user;
   final AuthSession? session;
   final String? verificationCode;
+  final bool emailSent;
   final bool mfaRequired;
 
   bool get signedIn =>
@@ -141,6 +143,7 @@ class AuthApi {
           : null,
       verificationCode: body['verificationCode'] as String? ??
           body['token'] as String?,
+      emailSent: body['emailSent'] == true,
       mfaRequired: body['mfaRequired'] == true || body['code'] == 'mfa_required',
     );
   }
@@ -149,11 +152,15 @@ class AuthApi {
     required String email,
     required String password,
   }) async {
-    final http.Response response = await http.post(
-      _uri('/auth/login'),
-      headers: _jsonHeaders(),
-      body: jsonEncode(<String, String>{'email': email, 'password': password}),
-    );
+    final http.Response response = await http
+        .post(
+          _uri('/auth/login'),
+          headers: _jsonHeaders(),
+          body: jsonEncode(
+            <String, String>{'email': email, 'password': password},
+          ),
+        )
+        .timeout(const Duration(seconds: 15));
     return _loginResult(_object(response));
   }
 
@@ -198,6 +205,21 @@ class AuthApi {
     );
     final Map<String, dynamic> body = _object(response);
     return body['message'] as String? ?? 'Email verified.';
+  }
+
+  Future<AuthLoginResult> confirmFirebaseEmail({
+    required String email,
+    required String password,
+  }) async {
+    final http.Response response = await http.post(
+      _uri('/auth/confirm-firebase-email'),
+      headers: _jsonHeaders(),
+      body: jsonEncode(<String, String>{
+        'email': email,
+        'password': password,
+      }),
+    );
+    return _loginResult(_object(response));
   }
 
   Future<AuthLoginResult> verifyLogin(String code) async {
@@ -267,6 +289,62 @@ class AuthApi {
     return body['message'] as String? ?? 'Password updated.';
   }
 
+  Future<List<Map<String, dynamic>>> listUsers(String token) async {
+    final http.Response response = await http.get(
+      _uri('/auth/users'),
+      headers: _jsonHeaders(token),
+    );
+    final Map<String, dynamic> body = _object(response);
+    final Object? raw = body['users'];
+    if (raw is! List) {
+      return <Map<String, dynamic>>[];
+    }
+    return raw
+        .whereType<Map>()
+        .map((Map row) => Map<String, dynamic>.from(row))
+        .toList();
+  }
+
+  /// Admin creates a worker/seller in Firebase and gets back the auth code.
+  Future<AuthMailResult> adminCreateUser({
+    required String token,
+    required String name,
+    required String email,
+    required String password,
+    required String role,
+  }) async {
+    final http.Response response = await http.post(
+      _uri('/auth/admin/create-user'),
+      headers: _jsonHeaders(token),
+      body: jsonEncode(<String, String>{
+        'name': name,
+        'email': email,
+        'password': password,
+        'role': role,
+      }),
+    );
+    return _mailResult(_object(response));
+  }
+
+  Future<Map<String, dynamic>> adminUpdateUser({
+    required String token,
+    required String email,
+    String? role,
+    bool? disabled,
+  }) async {
+    final Map<String, Object> body = <String, Object>{
+      'email': email,
+      if (role != null) 'role': role,
+      if (disabled != null) 'disabled': disabled,
+    };
+    final http.Response response = await http.post(
+      _uri('/auth/admin/update-user'),
+      headers: _jsonHeaders(token),
+      body: jsonEncode(body),
+    );
+    return _object(response);
+  }
+
   Future<Map<String, dynamic>> changePassword({
     required String token,
     required String currentPassword,
@@ -310,10 +388,12 @@ class AuthApi {
   }
 
   Future<Map<String, dynamic>?> loadFarmSnapshot(String token) async {
-    final http.Response response = await http.get(
-      _uri('/farm/snapshot'),
-      headers: _jsonHeaders(token),
-    );
+    final http.Response response = await http
+        .get(
+          _uri('/farm/snapshot'),
+          headers: _jsonHeaders(token),
+        )
+        .timeout(const Duration(seconds: 8));
     if (response.statusCode == 404) {
       return null;
     }

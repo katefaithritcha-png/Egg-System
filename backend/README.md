@@ -18,6 +18,8 @@ python backend/auth_server.py
 
 Copy `backend/.env.example` to `backend/.env` and set seed passwords plus SMTP if you have it. Seed passwords never ship in the Flutter client. If they are omitted, random passwords are generated on first boot and written only to `backend/data/bootstrap_credentials.txt` and the server log.
 
+**Storage:** Farm auth, sessions, and the farm ledger (production / grading / inventory / sales) are saved in **Firebase Firestore** (`farm_users`, `farm_sessions`, `farm_email_tokens`, `farm_shared`). Egg inspection history stays in `egg_readings`. Set `FIREBASE_PROJECT_ID` and `FIREBASE_WEB_API_KEY` in `.env`, then deploy `backend/firestore.rules`. On first boot, existing `data/auth.sqlite` (if present) is migrated once into Firestore. Without Firebase env vars, the auth API uses in-memory storage (tests / local dry-run only).
+
 Without SMTP, verification and reset emails are written to `backend/data/outbox/`.
 
 ## Auth endpoints

@@ -34,10 +34,16 @@ def _patch(collection: str, doc_id: str, fields: dict[str, Any], *, log: str) ->
         f'/databases/(default)/documents/{collection}/{encoded}'
         f'?key={urllib.parse.quote(api_key)}'
     )
+    headers = {'Content-Type': 'application/json'}
+    try:
+        from farm_store import firestore_http_headers
+        headers = firestore_http_headers(content_type=True)
+    except Exception:
+        pass
     request = urllib.request.Request(
         url,
         data=json.dumps({'fields': fields}).encode('utf-8'),
-        headers={'Content-Type': 'application/json'},
+        headers=headers,
         method='PATCH',
     )
     try:
@@ -94,8 +100,9 @@ def upsert_user_profile(
     created_at: str,
     password_hash: str,
 ) -> None:
+    # Public profile mirror only. Password hashes live in farm_users via farm_store.
+    _ = password_hash
     normalized = email.strip().lower()
-    _ = password_hash  # kept in SQLite only — never mirror hashes to Firestore
     _patch(
         'users',
         normalized,
@@ -171,11 +178,23 @@ def mark_email_verified(email: str) -> None:
         f'/databases/(default)/documents/email_verifications/{doc_id}'
         f'?key={urllib.parse.quote(api_key)}'
         '&updateMask.fieldPaths=verified'
+        '&updateMask.fieldPaths=app'
     )
+    headers = {'Content-Type': 'application/json'}
+    try:
+        from farm_store import firestore_http_headers
+        headers = firestore_http_headers(content_type=True)
+    except Exception:
+        pass
     request = urllib.request.Request(
         url,
-        data=json.dumps({'fields': {'verified': _b(True)}}).encode('utf-8'),
-        headers={'Content-Type': 'application/json'},
+        data=json.dumps({
+            'fields': {
+                'verified': _b(True),
+                'app': _s('egg_system'),
+            },
+        }).encode('utf-8'),
+        headers=headers,
         method='PATCH',
     )
     try:
@@ -253,23 +272,98 @@ def firebase_password_ok(email: str, password: str) -> bool:
     return isinstance(data, dict) and bool(data.get('localId') or data.get('email'))
 
 
-def ensure_firebase_email_user(email: str, password: str) -> None:
-    """Create the same email/password user in Firebase Auth (shows in console)."""
+def ensure_firebase_email_user(email: str, password: str) -> str | None:
+    """Create/sign-in Firebase Auth user. Returns idToken when available."""
     if os.environ.get('AUTH_TESTING') == '1':
-        return
+        return None
     if not os.environ.get('FIREBASE_WEB_API_KEY', '').strip():
-        return
+        return None
     normalized = email.strip().lower()
     created = _identity_toolkit(
         'accounts:signUp',
         {
             'email': normalized,
             'password': password,
-            'returnSecureToken': False,
+            'returnSecureToken': True,
         },
     )
-    if created is not None:
+    if isinstance(created, dict) and created.get('idToken'):
         print(f'[auth] Firebase Auth user created for {normalized}')
-        return
-    # Already exists is fine — console already has the account.
-    print(f'[auth] Firebase Auth signup skipped/exists for {normalized}')
+        return str(created['idToken'])
+    signed_in = _identity_toolkit(
+        'accounts:signInWithPassword',
+        {
+            'email': normalized,
+            'password': password,
+            'returnSecureToken': True,
+        },
+    )
+    if isinstance(signed_in, dict) and signed_in.get('idToken'):
+        print(f'[auth] Firebase Auth sign-in ok for {normalized}')
+        return str(signed_in['idToken'])
+    print(f'[auth] Firebase Auth signup/sign-in skipped for {normalized}')
+    return None
+
+
+def _continue_url_allowed(url: str) -> bool:
+    """Firebase only accepts allowlisted https domains (not LAN IPs)."""
+    text = (url or '').strip().lower()
+    if not text.startswith('https://'):
+        return False
+    if '192.168.' in text or '127.0.0.1' in text or 'localhost' in text:
+        return False
+    return True
+
+
+def send_firebase_email_verification(
+    email: str,
+    password: str,
+    *,
+    continue_url: str | None = None,
+) -> bool:
+    """Email a verification link to a real Gmail via Firebase Auth (HTTPS)."""
+    if os.environ.get('AUTH_TESTING') == '1':
+        return True
+    id_token = ensure_firebase_email_user(email, password)
+    if not id_token:
+        return False
+    # Prefer a plain VERIFY_EMAIL (no continueUrl) — LAN farm URLs are not allowlisted.
+    result = _identity_toolkit(
+        'accounts:sendOobCode',
+        {'requestType': 'VERIFY_EMAIL', 'idToken': id_token},
+    )
+    if result is None and continue_url and _continue_url_allowed(continue_url):
+        result = _identity_toolkit(
+            'accounts:sendOobCode',
+            {
+                'requestType': 'VERIFY_EMAIL',
+                'idToken': id_token,
+                'continueUrl': continue_url.strip(),
+                'canHandleCodeInApp': False,
+            },
+        )
+    ok = result is not None
+    if ok:
+        print(f'[auth] Firebase verification email sent to {email.strip().lower()}')
+    return ok
+
+
+def firebase_email_is_verified(email: str, password: str) -> bool:
+    """True when Firebase Auth reports emailVerified for this Gmail login."""
+    if os.environ.get('AUTH_TESTING') == '1':
+        return False
+    normalized = email.strip().lower()
+    data = _identity_toolkit(
+        'accounts:signInWithPassword',
+        {
+            'email': normalized,
+            'password': password,
+            'returnSecureToken': True,
+        },
+    )
+    if not isinstance(data, dict) or not data.get('idToken'):
+        return False
+    record = lookup_firebase_id_token(str(data['idToken']))
+    if not record:
+        return False
+    return bool(record.get('emailVerified'))

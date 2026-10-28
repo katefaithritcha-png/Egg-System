@@ -11,7 +11,6 @@ class AppPaths {
   static const String reports = '/reports';
   static const String profile = '/profile';
   static const String accounts = '/accounts';
-  static const String classification = '/classification';
   static const String sales = '/sales';
 }
 
@@ -25,14 +24,13 @@ class FlutterConversion {
     AppPaths.reports,
     AppPaths.profile,
     AppPaths.accounts,
-    AppPaths.classification,
     AppPaths.sales,
   ];
 
   static const Map<String, String> legacyRedirects = <String, String>{
     AppPaths.root: AppPaths.auth,
-    '/quality-control': AppPaths.production,
-    AppPaths.grading: AppPaths.production,
+    // QC lives at /grading — do not redirect it away to Production.
+    '/quality-control': AppPaths.grading,
     '/collection': AppPaths.production,
     '/losses': AppPaths.production,
     '/notifications': AppPaths.dashboard,
@@ -42,7 +40,6 @@ class FlutterConversion {
 
   static const Set<String> adminOnlyRoutes = <String>{
     AppPaths.inventory,
-    AppPaths.reports,
     AppPaths.accounts,
   };
 

@@ -50,7 +50,8 @@ class AuthTests(unittest.TestCase):
         cls.app = app
 
     def setUp(self) -> None:
-        auth.reset_rate_limits_for_tests()
+        auth.reset_store_for_tests()
+        auth._seed()
         self.client: FlaskClient = self.app.test_client()
 
     def _signup(self, email: str, password: str = 'NewUser12') -> dict:
@@ -80,16 +81,10 @@ class AuthTests(unittest.TestCase):
         self.assertNotIn('password_hash', dumped)
         self.assertNotIn('pbkdf2_sha256', dumped)
         self.assertIn('token', payload['session'])
-        conn = auth._connect()
-        try:
-            row = conn.execute(
-                "SELECT password_hash FROM users WHERE email = ?",
-                ('admin@eggsystem.local',),
-            ).fetchone()
-            self.assertTrue(row['password_hash'].startswith('pbkdf2_sha256$'))
-            self.assertNotEqual(row['password_hash'], 'AdminPass1')
-        finally:
-            conn.close()
+        row = auth._user_by_email('admin@eggsystem.local')
+        assert row is not None
+        self.assertTrue(str(row['password_hash']).startswith('pbkdf2_sha256$'))
+        self.assertNotEqual(row['password_hash'], 'AdminPass1')
 
     def test_firebase_password_opens_account_missing_from_farm_db(self) -> None:
         email = 'firebase-only@eggsystem.local'
@@ -100,15 +95,9 @@ class AuthTests(unittest.TestCase):
             )
         self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
         self.assertEqual(response.get_json()['user']['email'], email)
-        conn = auth._connect()
-        try:
-            row = conn.execute(
-                'SELECT email_verified FROM users WHERE email = ?',
-                (email,),
-            ).fetchone()
-            self.assertEqual(row['email_verified'], 1)
-        finally:
-            conn.close()
+        row = auth._user_by_email(email)
+        assert row is not None
+        self.assertTrue(bool(row.get('email_verified')))
         again = self.client.post(
             '/auth/login',
             json={'email': email, 'password': 'Firebase12'},
@@ -200,22 +189,13 @@ class AuthTests(unittest.TestCase):
             },
         )
         self.assertEqual(worker.status_code, 201)
-        conn = auth._connect()
-        try:
-            admin_row = conn.execute(
-                "SELECT role FROM users WHERE email = ?",
-                ('new-admin@eggsystem.local',),
-            ).fetchone()
-            worker_row = conn.execute(
-                "SELECT role, email_verified FROM users WHERE email = ?",
-                ('not-admin@eggsystem.local',),
-            ).fetchone()
-            # BFLA: client-requested admin must be ignored
-            self.assertEqual(admin_row['role'], 'worker')
-            self.assertEqual(worker_row['role'], 'worker')
-            self.assertEqual(worker_row['email_verified'], 0)
-        finally:
-            conn.close()
+        admin_row = auth._user_by_email('new-admin@eggsystem.local')
+        worker_row = auth._user_by_email('not-admin@eggsystem.local')
+        assert admin_row is not None and worker_row is not None
+        # BFLA: client-requested admin must be ignored
+        self.assertEqual(admin_row['role'], 'worker')
+        self.assertEqual(worker_row['role'], 'worker')
+        self.assertFalse(bool(worker_row.get('email_verified')))
 
     def test_verified_signup_with_same_password_signs_in(self) -> None:
         email = 'again@eggsystem.local'
@@ -285,15 +265,11 @@ class AuthTests(unittest.TestCase):
             json={'email': 'worker@eggsystem.local', 'password': 'WorkerPass1'},
         )
         token = login.get_json()['session']['token']
-        conn = auth._connect()
-        try:
-            conn.execute(
-                "UPDATE sessions SET expires_at = '2000-01-01T00:00:00Z' WHERE token_hash = ?",
-                (auth.hash_token(token),),
-            )
-            conn.commit()
-        finally:
-            conn.close()
+        import farm_store
+        session = farm_store.get_session(auth.hash_token(token))
+        assert session is not None
+        session['expires_at'] = '2000-01-01T00:00:00Z'
+        farm_store.save_session(session)
         me = self.client.get('/auth/me', headers={'Authorization': f'Bearer {token}'})
         self.assertEqual(me.status_code, 401)
 
@@ -303,15 +279,11 @@ class AuthTests(unittest.TestCase):
             json={'email': 'worker@eggsystem.local', 'password': 'WorkerPass1'},
         )
         token = login.get_json()['session']['token']
-        conn = auth._connect()
-        try:
-            conn.execute(
-                "UPDATE sessions SET last_seen_at = '2000-01-01T00:00:00Z' WHERE token_hash = ?",
-                (auth.hash_token(token),),
-            )
-            conn.commit()
-        finally:
-            conn.close()
+        import farm_store
+        session = farm_store.get_session(auth.hash_token(token))
+        assert session is not None
+        session['last_seen_at'] = '2000-01-01T00:00:00Z'
+        farm_store.save_session(session)
         me = self.client.get('/auth/me', headers={'Authorization': f'Bearer {token}'})
         self.assertEqual(me.status_code, 401)
 
@@ -323,15 +295,11 @@ class AuthTests(unittest.TestCase):
         self.assertEqual(forgot.status_code, 200)
         self.assertNotIn('token', json.dumps(forgot.get_json()))
         token = _outbox_token()
-        conn = auth._connect()
-        try:
-            conn.execute(
-                "UPDATE email_tokens SET expires_at = '2000-01-01T00:00:00Z' WHERE token_hash = ?",
-                (auth.hash_token(token),),
-            )
-            conn.commit()
-        finally:
-            conn.close()
+        import farm_store
+        row = farm_store.get_email_token(auth.hash_token(token))
+        assert row is not None
+        row['expires_at'] = '2000-01-01T00:00:00Z'
+        farm_store.save_email_token(row)
         reset = self.client.post(
             '/auth/reset-password',
             json={'token': token, 'password': 'FreshPass9'},
