@@ -63,23 +63,23 @@ class IotEggReading {
     return 'CALIBRATED';
   }
 
-  /// Normalized quality label for UI: Good or Cracked only.
-  /// Dust/Dirty is not a system grade — maps to Good. Crack → Cracked.
+  /// Normalized quality label for UI: Good, Cracked, or Dirty.
   String get displayGrade {
     final String combined =
         '${grade.toLowerCase()} ${(cameraResult ?? '').toLowerCase()}';
     if (combined.contains('crack') || combined.contains('broken')) {
       return 'Cracked';
     }
+    if (combined.contains('dirty') ||
+        combined.contains('soil') ||
+        combined.contains('stain')) {
+      return 'Dirty';
+    }
     if (combined.contains('good') ||
         combined.contains('clean') ||
         combined.contains('no crack') ||
         combined.contains('keep') ||
-        combined.contains('ok') ||
-        combined.contains('dirt') ||
-        combined.contains('soil') ||
-        combined.contains('stain') ||
-        combined.contains('reject')) {
+        combined.contains('ok')) {
       return 'Good';
     }
     return grade;

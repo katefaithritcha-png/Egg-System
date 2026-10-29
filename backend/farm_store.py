@@ -64,10 +64,16 @@ def require_firebase_ready() -> None:
         ensure_firebase_email_user(email, password)
     token = _sign_in_id_token()
     if not token:
-        raise RuntimeError(
-            'Firebase Auth sign-in failed for FIREBASE_BACKEND_EMAIL '
-            '(or AUTH_ADMIN_EMAIL). Fix password / enable Email-Password Auth.'
+        # Soft-fail: Cloudflare live CAM must stay up even if Auth quota is hit
+        # (restart storms → QUOTA_EXCEEDED). Firestore writes may fail until
+        # quota resets; /health + /live.jpg + /api/frame still work.
+        print(
+            '[farm-store] WARNING: Firebase Auth sign-in failed '
+            f'(email={email or "?"}). Live API starts anyway — '
+            'check password / Auth quota. Firestore writes may be limited.',
+            flush=True,
         )
+        return
     print(f'[farm-store] Firebase Auth OK as {email} — Firestore writes enabled', flush=True)
 
 

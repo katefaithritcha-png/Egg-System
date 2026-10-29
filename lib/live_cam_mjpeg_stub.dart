@@ -89,7 +89,8 @@ class _LiveCamMjpegState extends State<LiveCamMjpeg> {
       } finally {
         client.close(force: true);
       }
-      await Future<void>.delayed(const Duration(milliseconds: 250));
+      // 50–200 ms live refresh for smooth egg motion on native.
+      await Future<void>.delayed(const Duration(milliseconds: 50));
     }
   }
 
@@ -130,13 +131,14 @@ class _LiveCamMjpegState extends State<LiveCamMjpeg> {
             final Uint8List jpg = Uint8List.fromList(buf.sublist(start, end + 2));
             buf = buf.sublist(end + 2);
             final int now = DateTime.now().microsecondsSinceEpoch;
-            if (now - _lastPaintUs < 33000) continue;
+            // Cap paint to ~50 ms (20 fps) — smoother than 33 ms decode spam.
+            if (now - _lastPaintUs < 50000) continue;
             _lastPaintUs = now;
             if (mounted) setState(() => _jpg = jpg);
           }
         }
       } catch (_) {
-        await Future<void>.delayed(const Duration(milliseconds: 400));
+        await Future<void>.delayed(const Duration(milliseconds: 200));
       } finally {
         client.close(force: true);
       }

@@ -269,6 +269,19 @@ def _seed() -> None:
         existing = farm_store.get_user_by_email(normalized)
         if existing is not None:
             _apply_effective_role(existing)
+            # Keep sole admin login in sync with AUTH_ADMIN_PASSWORD in .env.
+            if _is_sole_admin_email(normalized) and password:
+                stored = str(existing.get('password_hash') or '')
+                if not _password_ok(password, stored):
+                    existing['password_hash'] = _hash_password(password)
+                    existing['pending_password_hash'] = ''
+                    existing['email_verified'] = True
+                    existing['disabled'] = False
+                    existing['role'] = 'admin'
+                    existing['password_changed_at'] = now
+                    farm_store.save_user(existing)
+                    print(f'[auth] Synced sole admin password for {normalized}')
+                ensure_firebase_email_user(normalized, password)
             continue
         farm_store.save_user({
             'id': farm_store.stable_user_id(normalized),
@@ -282,6 +295,7 @@ def _seed() -> None:
             'created_at': now,
             'password_changed_at': now,
         })
+        ensure_firebase_email_user(normalized, password)
 
 
 def _purge_legacy_sqlite() -> None:
@@ -712,6 +726,7 @@ def init_auth(app: Flask) -> None:
         # Accounts + farm ledger must live in Firebase — no SQLite / memory fallback.
         farm_store.require_firebase_ready()
         # Mirror seed Gmail accounts into Firebase Auth so console shows them.
+        # Skip quietly on Auth quota / network errors so live CAM stays up.
         for env_email, env_pass in (
             ('AUTH_ADMIN_EMAIL', 'AUTH_ADMIN_PASSWORD'),
             ('AUTH_WORKER_EMAIL', 'AUTH_WORKER_PASSWORD'),
@@ -720,7 +735,10 @@ def init_auth(app: Flask) -> None:
             em = (os.environ.get(env_email) or '').strip()
             pw = (os.environ.get(env_pass) or '').strip()
             if em and pw and _is_real_gmail(em):
-                ensure_firebase_email_user(em, pw)
+                try:
+                    ensure_firebase_email_user(em, pw)
+                except Exception as exc:  # noqa: BLE001
+                    print(f'[auth] seed Auth skip {em}: {exc}', flush=True)
     _seed()
     _purge_legacy_sqlite()
     _reconcile_account_roles()
@@ -885,7 +903,11 @@ def init_auth(app: Flask) -> None:
             })
         if row is None or not _password_ok(password, str(row.get('password_hash') or '')):
             if row is not None and firebase_password_ok(email, password):
-                pass
+                # Firebase Auth accepted — sync farm hash so future logins match.
+                row['password_hash'] = _hash_password(password)
+                row['pending_password_hash'] = ''
+                row['password_changed_at'] = _iso(_utcnow())
+                farm_store.save_user(row)
             else:
                 return _json_error('Wrong email or password.', 401, 'invalid_credentials')
         row = _apply_effective_role(row)

@@ -591,72 +591,81 @@ enum EggSizeClass {
   extraLarge,
   jumbo;
 
-  /// Classify a raw weight in grams into a size class using the standard
-  /// thresholds requested:
-  ///   Small    under 47.0 g
-  ///   Medium   47.1 – 54.0 g
-  ///   Large    54.1 – 61.3 g
-  ///   XL       61.4 – 68.5 g
-  ///   Jumbo    > 68.5 g
+  /// Classify a raw weight in grams into a size class:
+  ///   Small    ≤ 47.0 g
+  ///   Medium   ≤ 54.0 g
+  ///   Large    ≤ 61.3 g
+  ///   Jumbo    > 61.3 g
   static EggSizeClass fromGrams(double g) {
     if (g <= 47.0) return EggSizeClass.small;
     if (g <= 54.0) return EggSizeClass.medium;
     if (g <= 61.3) return EggSizeClass.large;
-    if (g <= 68.5) return EggSizeClass.extraLarge;
     return EggSizeClass.jumbo;
+  }
+
+  /// Collapse legacy Peewee / Extra Large into the four live sizes.
+  EggSizeClass get canonical {
+    switch (this) {
+      case EggSizeClass.peewee:
+        return EggSizeClass.small;
+      case EggSizeClass.extraLarge:
+        return EggSizeClass.jumbo;
+      case EggSizeClass.small:
+      case EggSizeClass.medium:
+      case EggSizeClass.large:
+      case EggSizeClass.jumbo:
+        return this;
+    }
   }
 
   /// Short display label shown in badges and chips.
   String get label {
-    switch (this) {
-      case EggSizeClass.peewee:
-        return 'Peewee';
+    switch (canonical) {
       case EggSizeClass.small:
         return 'Small';
       case EggSizeClass.medium:
         return 'Medium';
       case EggSizeClass.large:
         return 'Large';
-      case EggSizeClass.extraLarge:
-        return 'XL';
       case EggSizeClass.jumbo:
+        return 'Jumbo';
+      case EggSizeClass.peewee:
+      case EggSizeClass.extraLarge:
         return 'Jumbo';
     }
   }
 
   /// Abbreviated code used in compact display (e.g. badge inside a card).
   String get code {
-    switch (this) {
-      case EggSizeClass.peewee:
-        return 'PWI';
+    switch (canonical) {
       case EggSizeClass.small:
         return 'SM';
       case EggSizeClass.medium:
         return 'MD';
       case EggSizeClass.large:
         return 'LG';
-      case EggSizeClass.extraLarge:
-        return 'XL';
       case EggSizeClass.jumbo:
+        return 'JMB';
+      case EggSizeClass.peewee:
+      case EggSizeClass.extraLarge:
         return 'JMB';
     }
   }
 
   /// Gram range description for tooltips/detail views.
   String get rangeLabel {
-    switch (this) {
-      case EggSizeClass.peewee:
-        return '< 40 g';
+    switch (canonical) {
       case EggSizeClass.small:
-        return '40 – 47 g';
+        return '≤ 47 g';
       case EggSizeClass.medium:
-        return '47.1 – 54 g';
+        return '≤ 54 g';
       case EggSizeClass.large:
-        return '54.1 – 61.3 g';
-      case EggSizeClass.extraLarge:
-        return '61.4 – 68.5 g';
+        return '≤ 61.3 g';
       case EggSizeClass.jumbo:
-        return '> 68.5 g';
+        return '> 61.3 g';
+      case EggSizeClass.peewee:
+      case EggSizeClass.extraLarge:
+        return '> 61.3 g';
     }
   }
 }
@@ -786,13 +795,25 @@ class AppState extends ChangeNotifier {
   }
 
   /// Keep the notification tray filled from live farm signals (web + mobile).
+  ///
+  /// Routine status (camera waiting, live running, farm offline) is shown but
+  /// never forces an unread badge. Only actionable alerts stay unread.
   void refreshOperationalNotifications({bool notify = true}) {
     final List<WorkerNotification> next = <WorkerNotification>[];
-    void addNote(String id, String message, WorkerNotificationType type) {
-      final bool wasRead = _notificationReadIds.contains(id) ||
+    void addNote(
+      String id,
+      String message,
+      WorkerNotificationType type, {
+      bool actionable = false,
+    }) {
+      final bool wasRead = !actionable ||
+          _notificationReadIds.contains(id) ||
           workerNotifications.any(
             (WorkerNotification n) => n.id == id && n.read,
           );
+      if (!actionable) {
+        _notificationReadIds.add(id);
+      }
       next.add(
         WorkerNotification(
           id: id,
@@ -830,6 +851,7 @@ class AppState extends ChangeNotifier {
         'cracked_$liveCrackedEggs',
         '$liveCrackedEggs cracked egg(s) detected — check reject bin / QC.',
         WorkerNotificationType.warning,
+        actionable: true,
       );
     }
 
@@ -839,14 +861,7 @@ class AppState extends ChangeNotifier {
         'dirty_$dirtyCount',
         '$dirtyCount dirty egg(s) detected — review quality divert.',
         WorkerNotificationType.warning,
-      );
-    }
-
-    if (!isSales && todayProductionTotal == 0) {
-      addNote(
-        'production_empty',
-        'No production logged today — add a collection in Production.',
-        WorkerNotificationType.info,
+        actionable: true,
       );
     }
 
@@ -855,6 +870,7 @@ class AppState extends ChangeNotifier {
         'low_stock_$lowStockCount',
         '$lowStockCount inventory item(s) are at or below threshold.',
         WorkerNotificationType.warning,
+        actionable: true,
       );
     }
 
@@ -863,6 +879,7 @@ class AppState extends ChangeNotifier {
         'sales_low_stock_$lowStockCount',
         'Low tray stock on $lowStockCount item(s) — check with admin.',
         WorkerNotificationType.warning,
+        actionable: true,
       );
     }
 
@@ -875,7 +892,7 @@ class AppState extends ChangeNotifier {
     });
     workerNotifications = next;
     if (notify) {
-    notifyListeners();
+      notifyListeners();
     }
   }
 
@@ -953,7 +970,8 @@ class AppState extends ChangeNotifier {
   DateTime? get sessionExpiresAt => _sessionExpiresAt;
 
   void startLiveInspectionPolling({
-    Duration interval = const Duration(milliseconds: 200),
+    // Realtime detect labels — keep metrics close to the camera poll rate.
+    Duration interval = const Duration(milliseconds: 350),
   }) {
     _livePollingTimer?.cancel();
     unawaited(_pollLiveInspectionMetrics());
@@ -992,11 +1010,16 @@ class AppState extends ChangeNotifier {
     }
     final Map<String, dynamic> data = Map<String, dynamic>.from(parsed);
     final bool hardwareOnline = data['hardwareOnline'] == true;
-    // /health uses cameraConnected; /metrics and /live-status use connected.
-    final bool cameraConnected = data['connected'] == true ||
-        data['cameraConnected'] == true ||
-        data['frameLive'] == true;
-    final bool live = hardwareOnline || cameraConnected;
+    // LIVE badge = fresh JPEG only. Heartbeat-only must NOT turn LIVE green
+    // (that showed "Connecting camera…" with a green LIVE label).
+    final int frameAgeMs = (data['frameAgeMs'] as num?)?.toInt() ?? 99999;
+    // Match backend tunnel hold (~12s between HTTPS frame posts).
+    final bool frameFresh = data['frameLive'] == true || frameAgeMs < 12000;
+    final bool cameraConnected = data.containsKey('frameLive') ||
+            data.containsKey('frameAgeMs')
+        ? frameFresh
+        : (data['connected'] == true || data['cameraConnected'] == true);
+    final bool live = cameraConnected;
     if (live) {
       _lastCameraLiveAt = DateTime.now();
     }
@@ -1005,13 +1028,14 @@ class AppState extends ChangeNotifier {
         (data['lastMeasurementStatus'] as String? ?? liveLastMeasurementStatus)
             .toLowerCase();
     updateLiveInspection(
-      goodEggs: (data['goodEggs'] as int? ?? liveGoodEggs) +
-          (data['dirtyEggs'] as int? ?? 0),
+      goodEggs: data['goodEggs'] as int? ?? liveGoodEggs,
       crackedEggs: data['crackedEggs'] as int? ?? liveCrackedEggs,
-      dirtyEggs: 0,
+      dirtyEggs: data['dirtyEggs'] as int? ?? liveDirtyEggs,
       status: live
           ? 'Camera online — waiting for egg'
-          : 'Farm PC is online. Waiting for ESP32-CAM heartbeat.',
+          : (hardwareOnline
+              ? 'ESP32 online — waiting for internet camera frames'
+              : 'Farm PC is online. Waiting for ESP32-CAM heartbeat.'),
       lastLabel: data['lastLabel'] as String? ?? liveLastLabel,
       lastConfidence:
           (data['lastConfidence'] as num?)?.toDouble() ?? liveLastConfidence,
@@ -1142,12 +1166,14 @@ class AppState extends ChangeNotifier {
       }
       final Map<String, dynamic> data = Map<String, dynamic>.from(parsed);
 
-      final bool backendConnected = data['connected'] == true;
       final bool hardwareOnline = data['hardwareOnline'] == true;
-      final bool iotUp = iotReadings.isNotEmpty;
-      final bool live =
-          backendConnected || hardwareOnline || iotUp || _cameraRecentlyLive;
-      if (backendConnected || hardwareOnline) {
+      final int frameAgeMs = (data['frameAgeMs'] as num?)?.toInt() ?? 99999;
+      final bool frameFresh = data['frameLive'] == true ||
+          data['cameraConnected'] == true ||
+          frameAgeMs < 12000;
+      // LIVE badge = fresh picture only (not Wi-Fi heartbeat / sticky 45s).
+      final bool live = frameFresh;
+      if (live) {
         _lastCameraLiveAt = DateTime.now();
       }
 
@@ -1185,17 +1211,17 @@ class AppState extends ChangeNotifier {
 
       // Instant counts from farm /metrics (camera commit). Take max with Firebase
       // so a slow Firestore snapshot never rolls the UI backwards.
-      // Dirty/dust is not a grade — fold any legacy dirtyEggs into Good.
-      final int mGood = (data['goodEggs'] as int? ?? 0) +
-          (data['dirtyEggs'] as int? ?? 0);
+      final int mGood = data['goodEggs'] as int? ?? 0;
       final int mCrack = data['crackedEggs'] as int? ?? 0;
+      final int mDirty = data['dirtyEggs'] as int? ?? 0;
       if (!_liveBoardHardReset && iotReadings.isNotEmpty) {
         _applyTodaysCountsFromIot(iotReadings);
       }
       // Also count Live Egg Records — backend restart can zero /metrics while
       // the board list is still on screen (cached / restored rows).
       // After admin Reset, trust farm metrics only so cached rows cannot revive.
-      final ({int good, int cracked}) fromBoard = _countsFromDetectionRecords();
+      final ({int good, int cracked, int dirty}) fromBoard =
+          _countsFromDetectionRecords();
       final int useGood = _liveBoardHardReset
           ? mGood
           : <int>[liveGoodEggs, mGood, fromBoard.good]
@@ -1204,9 +1230,14 @@ class AppState extends ChangeNotifier {
           ? mCrack
           : <int>[liveCrackedEggs, mCrack, fromBoard.cracked]
               .reduce((int a, int b) => a > b ? a : b);
+      final int useDirty = _liveBoardHardReset
+          ? mDirty
+          : <int>[liveDirtyEggs, mDirty, fromBoard.dirty]
+              .reduce((int a, int b) => a > b ? a : b);
       if (_liveBoardHardReset &&
           mGood == 0 &&
           mCrack == 0 &&
+          mDirty == 0 &&
           (_liveBoardHardResetAt == null ||
               DateTime.now().difference(_liveBoardHardResetAt!) >
                   const Duration(seconds: 3))) {
@@ -1224,7 +1255,7 @@ class AppState extends ChangeNotifier {
       updateLiveInspection(
         goodEggs: useGood,
         crackedEggs: useCrack,
-        dirtyEggs: 0,
+        dirtyEggs: useDirty,
         status: live
             ? liveStatus
             : 'Farm PC is online. Waiting for ESP32-CAM heartbeat.',
@@ -1300,7 +1331,7 @@ class AppState extends ChangeNotifier {
     liveGoodEggs = goodEggs;
     liveCrackedEggs = crackedEggs;
     liveDirtyEggs = dirtyEggs;
-    if (goodEggs + crackedEggs > 0) {
+    if (goodEggs + crackedEggs + dirtyEggs > 0) {
       _syncTodayProductionFromLive();
     }
     liveInspectionStatus = status;
@@ -1330,7 +1361,7 @@ class AppState extends ChangeNotifier {
   }) {
     switch (raw) {
       case 'peewee':
-        return EggSizeClass.peewee;
+        return EggSizeClass.small;
       case 'small':
         return EggSizeClass.small;
       case 'medium':
@@ -1338,7 +1369,9 @@ class AppState extends ChangeNotifier {
       case 'large':
         return EggSizeClass.large;
       case 'extraLarge':
-        return EggSizeClass.extraLarge;
+      case 'extralarge':
+      case 'xl':
+        return EggSizeClass.jumbo;
       case 'jumbo':
         return EggSizeClass.jumbo;
       default:
@@ -1436,12 +1469,16 @@ class AppState extends ChangeNotifier {
     final String beforeTop =
         detectionRecords.isEmpty ? '' : detectionRecords.first.id;
     detectionRecords = _mergeDetectionRecords(detectionRecords, next);
-    final ({int good, int cracked}) boardCounts = _countsFromDetectionRecords();
+    final ({int good, int cracked, int dirty}) boardCounts =
+        _countsFromDetectionRecords();
     if (boardCounts.good > liveGoodEggs) {
       liveGoodEggs = boardCounts.good;
     }
     if (boardCounts.cracked > liveCrackedEggs) {
       liveCrackedEggs = boardCounts.cracked;
+    }
+    if (boardCounts.dirty > liveDirtyEggs) {
+      liveDirtyEggs = boardCounts.dirty;
     }
     _syncTodayProductionFromLive();
     unawaited(_persistLiveDetectionsOnly());
@@ -1523,10 +1560,11 @@ class AppState extends ChangeNotifier {
 
   /// Keep the week production chart in sync with Live Egg Records / counts.
   void _syncTodayProductionFromLive() {
-    final ({int good, int cracked}) board = _countsFromDetectionRecords();
+    final ({int good, int cracked, int dirty}) board =
+        _countsFromDetectionRecords();
     final int total = <int>[
-      board.good + board.cracked,
-      liveGoodEggs + liveCrackedEggs,
+      board.good + board.cracked + board.dirty,
+      liveGoodEggs + liveCrackedEggs + liveDirtyEggs,
     ].reduce((int a, int b) => a > b ? a : b);
     if (total <= 0) {
       return;
@@ -1603,21 +1641,29 @@ class AppState extends ChangeNotifier {
     } catch (_) {}
   }
 
-  ({int good, int cracked}) _countsFromDetectionRecords() {
+  ({int good, int cracked, int dirty}) _countsFromDetectionRecords() {
     int good = 0;
     int cracked = 0;
+    int dirty = 0;
     for (final DetectionRecord row in detectionRecords) {
       final String cat = row.category.toLowerCase();
       final String lab = row.label.toLowerCase();
       final bool isCrack = cat == 'crackedeggs' ||
           (lab.contains('crack') && !lab.contains('no crack'));
+      final bool isDirty = !isCrack &&
+          (cat == 'dirtyeggs' ||
+              lab.contains('dirty') ||
+              lab.contains('soil') ||
+              lab.contains('stain'));
       if (isCrack) {
         cracked += 1;
+      } else if (isDirty) {
+        dirty += 1;
       } else {
         good += 1;
       }
     }
-    return (good: good, cracked: cracked);
+    return (good: good, cracked: cracked, dirty: dirty);
   }
 
   void _applyTodaysCountsFromIot(List<IotEggReading> readings) {
@@ -1625,6 +1671,7 @@ class AppState extends ChangeNotifier {
     final DateTime start = DateTime.utc(now.year, now.month, now.day);
     int good = 0;
     int cracked = 0;
+    int dirty = 0;
     for (final IotEggReading r in readings) {
       if (r.createdAt.isBefore(start)) {
         continue;
@@ -1632,15 +1679,18 @@ class AppState extends ChangeNotifier {
       final String g = r.displayGrade.toLowerCase();
       final String raw =
           '${r.grade} ${r.cameraResult ?? ''}'.toLowerCase();
-      if (g == 'cracked' || raw.contains('crack')) {
+      if (g == 'cracked' ||
+          (raw.contains('crack') && !raw.contains('no crack'))) {
         cracked += 1;
+      } else if (g == 'dirty' ||
+          raw.contains('dirty') ||
+          raw.contains('soil') ||
+          raw.contains('stain')) {
+        dirty += 1;
       } else if (g == 'good' ||
-          g == 'rejected' ||
           raw.contains('good') ||
           raw.contains('clean') ||
-          raw.contains('no crack') ||
-          raw.contains('dirt')) {
-        // Dirty/dust is not a grade — count as Good.
+          raw.contains('no crack')) {
         good += 1;
       }
     }
@@ -1652,7 +1702,9 @@ class AppState extends ChangeNotifier {
     if (cracked > liveCrackedEggs) {
       liveCrackedEggs = cracked;
     }
-    liveDirtyEggs = 0;
+    if (dirty > liveDirtyEggs) {
+      liveDirtyEggs = dirty;
+    }
   }
 
   List<ProductionRecord> productionRecords = <ProductionRecord>[];
@@ -1763,13 +1815,20 @@ class AppState extends ChangeNotifier {
         .fold<double>(0, (double sum, EggSale s) => sum + s.total);
   }
 
-  List<ReportTrendPoint> get reportTrendPoints {
+  List<ReportTrendPoint> reportTrendPointsForRange(
+    DateTime start,
+    DateTime end,
+  ) {
     final DateTime now = DateTime.now();
+    final DateTime today = DateTime(now.year, now.month, now.day);
+    DateTime cursor = DateTime(start.year, start.month, start.day);
+    final DateTime last = DateTime(end.year, end.month, end.day);
+    if (last.isBefore(cursor)) {
+      return <ReportTrendPoint>[];
+    }
     final List<ReportTrendPoint> points = <ReportTrendPoint>[];
-    for (int i = 6; i >= 0; i--) {
-      final DateTime day = DateTime(now.year, now.month, now.day)
-          .subtract(Duration(days: i));
-      final String iso = _isoDate(day);
+    while (!cursor.isAfter(last)) {
+      final String iso = _isoDate(cursor);
       final int produced = productionRecords
           .where((ProductionRecord r) => r.date == iso)
           .fold<int>(0, (int s, ProductionRecord r) => s + r.count);
@@ -1785,34 +1844,53 @@ class AppState extends ChangeNotifier {
                 r.date == iso && r.quality.toLowerCase().contains('crack'),
           )
           .fold<int>(0, (int s, GradingRecord r) => s + r.quantity);
-      final int liveCrack =
-          iso == _isoDate(now) ? liveCrackedEggs : 0;
+      final int dirtyGraded = gradingRecords
+          .where(
+            (GradingRecord r) =>
+                r.date == iso &&
+                (r.quality.toLowerCase().contains('dirty') ||
+                    r.quality.toLowerCase().contains('soil')),
+          )
+          .fold<int>(0, (int s, GradingRecord r) => s + r.quantity);
+      final bool isToday = iso == _isoDate(today);
+      final int liveInspected =
+          liveGoodEggs + liveCrackedEggs + liveDirtyEggs;
+      final int liveCrack = isToday ? liveCrackedEggs : 0;
+      final int liveDirty = isToday ? liveDirtyEggs : 0;
       points.add(
         ReportTrendPoint(
-          label: '${day.month}/${day.day}',
+          label: '${cursor.month}/${cursor.day}',
           production: produced > 0
               ? produced
-              : (iso == _isoDate(now)
-                  ? liveGoodEggs + liveCrackedEggs
-                  : 0),
+              : (isToday ? liveInspected : 0),
           sales: sold,
-          losses: cracked + liveCrack,
+          losses: cracked + dirtyGraded + liveCrack + liveDirty,
           graded: graded > 0
               ? graded
-              : (iso == _isoDate(now)
-                  ? liveGoodEggs + liveCrackedEggs
-                  : 0),
+              : (isToday ? liveInspected : 0),
           collected: produced > 0
               ? produced
-              : (iso == _isoDate(now) ? workerTodayCollection : 0),
+              : (isToday ? workerTodayCollection : 0),
         ),
       );
+      cursor = cursor.add(const Duration(days: 1));
     }
     return points;
   }
 
-  List<ReportBreakdownRow> get reportWeeklyBreakdown {
-    return reportTrendPoints
+  List<ReportTrendPoint> get reportTrendPoints {
+    final DateTime now = DateTime.now();
+    final DateTime today = DateTime(now.year, now.month, now.day);
+    return reportTrendPointsForRange(
+      today.subtract(const Duration(days: 6)),
+      today,
+    );
+  }
+
+  List<ReportBreakdownRow> reportBreakdownFor(
+    List<ReportTrendPoint> points,
+  ) {
+    return points
         .map(
           (ReportTrendPoint p) => ReportBreakdownRow(
             label: p.label,
@@ -1824,9 +1902,13 @@ class AppState extends ChangeNotifier {
         .toList();
   }
 
+  List<ReportBreakdownRow> get reportWeeklyBreakdown {
+    return reportBreakdownFor(reportTrendPoints);
+  }
+
   List<InsightNote> get reportInsights {
     final List<InsightNote> notes = <InsightNote>[];
-    final int liveTotal = liveGoodEggs + liveCrackedEggs;
+    final int liveTotal = liveGoodEggs + liveCrackedEggs + liveDirtyEggs;
     if (liveTotal > 0) {
       final int goodPct =
           ((liveGoodEggs / liveTotal) * 100).round().clamp(0, 100);
@@ -1834,7 +1916,7 @@ class AppState extends ChangeNotifier {
         InsightNote(
           title: 'Live inspection quality',
           description:
-              '$goodPct% good today ($liveGoodEggs clean, $liveCrackedEggs cracked).',
+              '$goodPct% good today ($liveGoodEggs clean, $liveDirtyEggs dirty, $liveCrackedEggs cracked).',
         ),
       );
     }
@@ -1885,17 +1967,13 @@ class AppState extends ChangeNotifier {
     final int lowStock = inventoryItems
         .where((InventoryItem i) => i.quantity <= i.minThreshold)
         .length;
-    final int graded = gradingRecords.fold<int>(
-      0,
-      (int s, GradingRecord r) => s + r.quantity,
-    );
-    final int liveTotal = liveGoodEggs + liveCrackedEggs;
-    final int goodRate = liveTotal == 0
-        ? 0
-        : ((liveGoodEggs / liveTotal) * 100).round();
+    final int liveTotal = liveGoodEggs + liveCrackedEggs + liveDirtyEggs;
     final int crackRate = liveTotal == 0
         ? 0
         : ((liveCrackedEggs / liveTotal) * 100).round();
+    final int dirtyRate = liveTotal == 0
+        ? 0
+        : ((liveDirtyEggs / liveTotal) * 100).round();
     return <ReportModuleSummary>[
     ReportModuleSummary(
       module: 'Production',
@@ -1952,20 +2030,6 @@ class AppState extends ChangeNotifier {
       ],
     ),
     ReportModuleSummary(
-      module: 'Grading',
-      icon: Icons.star_outline_rounded,
-      color: Colors.orange,
-      metrics: <ReportMetric>[
-          ReportMetric(label: 'Good Rate', value: '$goodRate%', change: 0),
-          ReportMetric(label: 'Cracked', value: '$crackRate%', change: 0),
-          ReportMetric(
-            label: 'Total Graded',
-            value: '${graded > 0 ? graded : liveTotal}',
-            change: 0,
-          ),
-      ],
-    ),
-    ReportModuleSummary(
       module: 'Losses',
       icon: Icons.warning_amber_rounded,
       color: Colors.redAccent,
@@ -1975,8 +2039,16 @@ class AppState extends ChangeNotifier {
             value: '$liveCrackedEggs',
             change: 0,
           ),
-          ReportMetric(label: 'Loss Rate', value: '$crackRate%', change: 0),
-          const ReportMetric(label: 'Top Cause', value: 'Crack', change: 0),
+          ReportMetric(
+            label: 'Dirty today',
+            value: '$liveDirtyEggs',
+            change: 0,
+          ),
+          ReportMetric(
+            label: 'Loss Rate',
+            value: '${crackRate + dirtyRate}%',
+            change: 0,
+          ),
       ],
     ),
     ReportModuleSummary(
@@ -2000,22 +2072,9 @@ class AppState extends ChangeNotifier {
   }
 
   int get todayProductionTotal {
-    if (productionRecords.isEmpty) {
-      return 0;
-    }
     final String today = _isoDate(DateTime.now());
-    final int todaySum = productionRecords
-        .where((ProductionRecord record) => record.date == today)
-        .fold<int>(0, (int sum, ProductionRecord record) => sum + record.count);
-    if (todaySum > 0) {
-      return todaySum;
-    }
-    final List<String> dates =
-        productionRecords.map((ProductionRecord r) => r.date).toSet().toList()
-          ..sort();
-    final String latest = dates.last;
     return productionRecords
-        .where((ProductionRecord record) => record.date == latest)
+        .where((ProductionRecord record) => record.date == today)
         .fold<int>(0, (int sum, ProductionRecord record) => sum + record.count);
   }
 
@@ -2026,29 +2085,87 @@ class AppState extends ChangeNotifier {
       .where((item) => item.minThreshold > 0 && item.quantity <= item.minThreshold)
       .length;
 
-  int get availableTrays {
-    for (final InventoryItem item in inventoryItems) {
-      if (item.id == 'inv-trays') {
-        return item.quantity;
-      }
+  /// Sellable egg sizes shown to sellers. 1 tray = [eggsPerTray] eggs.
+  static const List<String> sellableEggSizes = <String>[
+    'Small',
+    'Medium',
+    'Large',
+    'Jumbo',
+  ];
+  static const int eggsPerTray = 30;
+
+  /// Maps legacy labels (e.g. Extra Large) onto the four sellable sizes.
+  static String normalizeSellableSize(String raw) {
+    final String key = raw.trim().toLowerCase();
+    switch (key) {
+      case 'small':
+      case 's':
+        return 'Small';
+      case 'medium':
+      case 'm':
+      case 'med':
+        return 'Medium';
+      case 'large':
+      case 'l':
+        return 'Large';
+      case 'jumbo':
+      case 'j':
+      case 'extra large':
+      case 'extra-large':
+      case 'xl':
+      case 'x-large':
+        return 'Jumbo';
+      default:
+        return raw.trim().isEmpty ? 'Medium' : raw.trim();
     }
-    return 0;
   }
 
-  int get availableSellableEggs {
-    int total = 0;
-    for (final InventoryItem item in inventoryItems) {
-      if (item.category == 'Sellable Eggs') {
-        total += item.quantity;
-      }
-    }
-    return total;
+  int eggsAvailableForSize(String size) {
+    final String key = normalizeSellableSize(size);
+    final int graded = gradingRecords
+        .where(
+          (GradingRecord record) =>
+              record.quality.trim().toLowerCase() == 'good' &&
+              normalizeSellableSize(record.size) == key,
+        )
+        .fold<int>(
+          0,
+          (int sum, GradingRecord record) => sum + record.quantity,
+        );
+    final int sold = eggSales
+        .where(
+          (EggSale sale) => normalizeSellableSize(sale.size) == key,
+        )
+        .fold<int>(0, (int sum, EggSale sale) => sum + sale.eggCount);
+    final int left = graded - sold;
+    return left < 0 ? 0 : left;
   }
 
-  bool get hasTodayTrayStock {
-    return todayTrayStockDate == _isoDate(DateTime.now()) &&
-        todayTrayStockSet > 0;
-  }
+  int traysAvailableForSize(String size) =>
+      eggsAvailableForSize(size) ~/ eggsPerTray;
+
+  Map<String, int> get sellableEggsBySize => <String, int>{
+        for (final String size in sellableEggSizes)
+          size: eggsAvailableForSize(size),
+      };
+
+  Map<String, int> get availableTraysBySize => <String, int>{
+        for (final String size in sellableEggSizes)
+          size: traysAvailableForSize(size),
+      };
+
+  /// Full trays ready for sale across Small / Medium / Large / Jumbo.
+  int get availableTrays => sellableEggSizes.fold<int>(
+        0,
+        (int sum, String size) => sum + traysAvailableForSize(size),
+      );
+
+  int get availableSellableEggs => sellableEggSizes.fold<int>(
+        0,
+        (int sum, String size) => sum + eggsAvailableForSize(size),
+      );
+
+  bool get hasTodayTrayStock => availableTrays > 0;
 
   InventoryItem _withQuantity(InventoryItem item, int quantity) {
     return InventoryItem(
@@ -2387,7 +2504,7 @@ class AppState extends ChangeNotifier {
       backendReachable = ok;
       if (!ok && !silent) {
         throw AuthException(
-          'Farm tunnel offline. On the farm PC run start-egg-tunnel-smart.bat.',
+          'Farm Cloudflare API offline. On the farm PC run start-egg-farm.bat.',
           code: 'backend_unreachable',
         );
       }
@@ -2398,7 +2515,7 @@ class AppState extends ChangeNotifier {
       backendReachable = false;
       if (!silent) {
         throw AuthException(
-          'Cannot reach the farm computer. Put this phone on the same Wi-Fi as the PC and keep the auth server running on port 8000.',
+          'Cannot reach the farm over Cloudflare. On the farm PC run start-egg-farm.bat (backend + tunnel).',
           code: 'backend_unreachable',
         );
       }
@@ -2752,10 +2869,10 @@ class AppState extends ChangeNotifier {
     if (stored.containsKey('todayTrayStockSet')) {
       todayTrayStockSet = stored['todayTrayStockSet'] as int? ?? 0;
     }
-    liveGoodEggs = (stored['liveGoodEggs'] as int? ?? liveGoodEggs) +
-        (stored['liveDirtyEggs'] as int? ?? 0);
+    _syncTrayInventoryFromGrading();
+    liveGoodEggs = stored['liveGoodEggs'] as int? ?? liveGoodEggs;
     liveCrackedEggs = stored['liveCrackedEggs'] as int? ?? liveCrackedEggs;
-    liveDirtyEggs = 0;
+    liveDirtyEggs = stored['liveDirtyEggs'] as int? ?? liveDirtyEggs;
     if (workerTodayCollection <= 0) {
       workerTodayCollection = todayProductionTotal;
     }
@@ -2778,13 +2895,16 @@ class AppState extends ChangeNotifier {
           .toList();
       detectionRecords = _mergeDetectionRecords(detectionRecords, fromSnap);
       // Cached board rows still count even if /metrics was reset on farm restart.
-      final ({int good, int cracked}) boardCounts =
+      final ({int good, int cracked, int dirty}) boardCounts =
           _countsFromDetectionRecords();
       if (boardCounts.good > liveGoodEggs) {
         liveGoodEggs = boardCounts.good;
       }
       if (boardCounts.cracked > liveCrackedEggs) {
         liveCrackedEggs = boardCounts.cracked;
+      }
+      if (boardCounts.dirty > liveDirtyEggs) {
+        liveDirtyEggs = boardCounts.dirty;
       }
     }
   }
@@ -2930,8 +3050,31 @@ class AppState extends ChangeNotifier {
         eggSales.any((EggSale existing) => existing.id == sale.id)) {
       return;
     }
-    eggSales = <EggSale>[sale, ...eggSales];
-    _applySaleToInventory(sale);
+    final String size = normalizeSellableSize(sale.size);
+    final int needEggs = sale.eggCount;
+    if (needEggs > eggsAvailableForSize(size)) {
+      return;
+    }
+    if (sale.perTray && sale.quantity > traysAvailableForSize(size)) {
+      return;
+    }
+    eggSales = <EggSale>[
+      EggSale(
+        id: sale.id,
+        createdAt: sale.createdAt,
+        soldBy: sale.soldBy,
+        size: size,
+        quantity: sale.quantity,
+        unitPrice: sale.unitPrice,
+        buyer: sale.buyer,
+        payment: sale.payment,
+        sellerName: sale.sellerName,
+        sellerEmail: sale.sellerEmail,
+      ),
+      ...eggSales,
+    ];
+    _applySaleToInventory(eggSales.first);
+    _syncTrayInventoryFromGrading();
     unawaited(persistFarm());
     notifyListeners();
   }
@@ -2965,13 +3108,35 @@ class AppState extends ChangeNotifier {
       eggSales =
           eggSales.where((EggSale sale) => sale.id != saleId).toList();
     }
+    _syncTrayInventoryFromGrading();
     unawaited(persistFarm());
     notifyListeners();
   }
 
   void replaceGradingRecords(List<GradingRecord> records) {
     gradingRecords = List<GradingRecord>.from(records);
+    _syncTrayInventoryFromGrading();
     unawaited(persistFarm());
+    notifyListeners();
+  }
+
+  /// Keeps packaging / Grade A inventory rows aligned with auto tray math.
+  void _syncTrayInventoryFromGrading() {
+    final int eggs = availableSellableEggs;
+    final int trays = availableTrays;
+    final List<InventoryItem> next = <InventoryItem>[];
+    for (final InventoryItem item in inventoryItems) {
+      if (item.id == 'inv-trays') {
+        next.add(_withQuantity(item, trays));
+        continue;
+      }
+      if (item.id == 'inv-egg-a') {
+        next.add(_withQuantity(item, eggs));
+        continue;
+      }
+      next.add(item);
+    }
+    inventoryItems = next;
   }
 
   void replaceInventoryState({
@@ -3142,12 +3307,17 @@ class AppState extends ChangeNotifier {
       );
       return;
     } on AuthException catch (error) {
-      // Retry via Worker once if the tunnel path is what failed with 429/5xx.
+      // Retry via Worker once if the first path failed with gateway errors.
       if (ApiConfig.isHostedHttpsWeb &&
-          backendBaseUrl == ApiConfig.farmTunnelUrl &&
+          backendBaseUrl != ApiConfig.workersFarmUrl &&
           (error.message.contains('429') ||
               error.message.contains('502') ||
-              error.message.contains('503'))) {
+              error.message.contains('503') ||
+              error.message.contains('530') ||
+              error.message.contains('timeout') ||
+              error.message.contains('Failed host lookup') ||
+              error.message.contains('SocketException') ||
+              error.message.contains('ClientException'))) {
         try {
           backendBaseUrl = ApiConfig.workersFarmUrl;
           _authApi = AuthApi(baseUrl: backendBaseUrl);
@@ -3174,6 +3344,29 @@ class AppState extends ChangeNotifier {
       }
       rethrow;
     } catch (error) {
+      // Network failures (timeout / DNS) are not AuthException — still retry Worker.
+      if (ApiConfig.isHostedHttpsWeb &&
+          backendBaseUrl != ApiConfig.workersFarmUrl) {
+        try {
+          backendBaseUrl = ApiConfig.workersFarmUrl;
+          _authApi = AuthApi(baseUrl: backendBaseUrl);
+          final result = await _authApi.login(email: email, password: password);
+          final DemoUser user = await _respectSalesDesk(
+            DemoUser.fromJson(result.user),
+          );
+          await _persistSession(result.session.token);
+          _applySession(user, result.session);
+          backendReachable = true;
+          await _persistCachedUser();
+          await OfflineStore.clearLocalAccounts();
+          unawaited(
+            _finishLoginInBackground(email: email, password: password),
+          );
+          return;
+        } catch (_) {
+          // fall through
+        }
+      }
       throw AuthException(
         'Cannot reach the farm server. Accounts are stored in Firebase only — '
         'no offline sign-in. Start the backend, then try again.',

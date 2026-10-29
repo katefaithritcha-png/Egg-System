@@ -1,18 +1,15 @@
-# Egg camera model (Teachable Machine)
+# Egg camera models
 
-Classes used by `/watch` and the GATE servo:
+ESP32-CAM pushes JPEG only. Classification runs on the laptop.
 
-| Index | Label in `labels.txt` | Camera meaning | GATE |
-|------:|----------------------|----------------|------|
-| 0 | Empty Model | No egg | Middle |
-| 1 | No Crack Egg | Clean | Full left |
-| 2 | Crack Egg | Crack | Full right |
-| 3 | Dirty Egg | Dirty | Full right |
+| File / folder | Role |
+|---------------|------|
+| `crackegg.tflite` | **New** YOLO — Crack only (replaces old crack class) |
+| `dirty.tflite` | **New** YOLO — Dirty only (replaces old dirty class) |
+| `savedmodel/` | **Kept** Teachable Machine — Empty + Clean (No Crack) |
+| `labels.txt` | UI labels: Empty / No Crack / Crack / Dirty |
 
-Files:
-
-- `savedmodel/` — TensorFlow SavedModel loaded by `backend/live_inspection_backend.py`
-- `labels.txt` — class names (must stay in this order)
-- `keras_model.h5` — original Keras export (reference)
-
-The live backend prefers `models/savedmodel` over any copy in Downloads.
+Decision order:
+1. If crack TFLite is strong → Crack Egg  
+2. Else if dirty TFLite is strong → Dirty Egg  
+3. Else Empty vs Clean from `savedmodel/`

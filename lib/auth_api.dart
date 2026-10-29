@@ -160,7 +160,7 @@ class AuthApi {
             <String, String>{'email': email, 'password': password},
           ),
         )
-        .timeout(const Duration(seconds: 15));
+        .timeout(const Duration(seconds: 45));
     return _loginResult(_object(response));
   }
 

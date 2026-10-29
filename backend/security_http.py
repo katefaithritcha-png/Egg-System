@@ -47,13 +47,10 @@ def apply_security_headers(response):
 def cors_origins() -> list[str] | str:
     raw = os.environ.get('CORS_ALLOW_ORIGINS', '').strip()
     if not raw or raw == '*':
-        # Dev default: common Flutter web + localhost. Tighten in production via .env.
-        # Flutter web uses a new localhost port every run. Allow any local port.
+        # Cloudflare-only — UI Worker + farm tunnel. No localhost / LAN.
         return [
-            r'http://127\.0\.0\.1(:\d+)?',
-            r'http://localhost(:\d+)?',
-            'http://192.168.1.53:8000',
-            'http://192.168.11.212:8000',
+            'https://egg-system.paghasianjustine.workers.dev',
+            'https://egg-farm.eggsorting.site',
         ]
     return [o.strip() for o in raw.split(',') if o.strip()]
 
@@ -99,8 +96,17 @@ def device_token_ok(req: Request | None = None) -> bool:
     ).strip()
     if expected:
         return bool(got) and hmac.compare_digest(got, expected)
-    # Dev fallback: only private/LAN clients when token not configured
-    return _is_private_ip(_client_ip())
+    # Dev fallback: LAN, or Cloudflare Tunnel/Worker when no token is set.
+    ip = _client_ip()
+    if _is_private_ip(ip):
+        return True
+    # Mirror FastAPI gate: CF headers mean the request came through the tunnel.
+    return bool(
+        (req.headers.get('Cf-Connecting-Ip') if req else None)
+        or (req.headers.get('CF-Ray') if req else None)
+        or (req.headers.get('cf-connecting-ip') if req else None)
+        or (req.headers.get('cf-ray') if req else None)
+    )
 
 
 def allow_local_browser(app: Flask) -> None:

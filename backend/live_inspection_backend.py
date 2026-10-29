@@ -10,10 +10,26 @@ import sys
 import threading
 import time
 
+from dotenv import load_dotenv
+
+# Load backend/.env before auth/Firebase imports. Ignore a leaked AUTH_TESTING=1
+# from a parent test shell unless .env intentionally enables it.
+_BACKEND_DIR_BOOT = Path(__file__).resolve().parent
+_ENV_PATH = _BACKEND_DIR_BOOT / '.env'
+_testing_in_dotenv = False
+if _ENV_PATH.is_file():
+    for _line in _ENV_PATH.read_text(encoding='utf-8').splitlines():
+        _stripped = _line.strip()
+        if _stripped and not _stripped.startswith('#') and _stripped.startswith('AUTH_TESTING='):
+            _testing_in_dotenv = _stripped.split('=', 1)[1].strip().strip('"\'') == '1'
+            break
+load_dotenv(_ENV_PATH)
+if not _testing_in_dotenv:
+    os.environ.pop('AUTH_TESTING', None)
+
 import cv2
 import numpy as np
 import requests
-import tensorflow as tf
 from a2wsgi import WSGIMiddleware
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -42,34 +58,45 @@ from security_http import cors_origins, farm_device_token
 
 # ESP32-CAM serves still JPEGs on port 82 (/jpg). Port 81 is mjpeg/HTML only.
 ESP32_STREAM_URL = os.environ.get('ESP32_STREAM_URL', 'http://192.168.11.237:82/jpg')
-# Prefer project-bundled Teachable Machine export (Empty / No Crack / Crack / Dirty).
+# Hybrid models: YOLO TFLite = crack/dirty only; SavedModel = Empty + Clean stay.
 _BACKEND_DIR = Path(__file__).resolve().parent
 _PROJECT_ROOT = _BACKEND_DIR.parent
-_MODEL_CANDIDATES = (
-    _PROJECT_ROOT / 'models' / 'savedmodel',
-    Path(r'C:\Users\ADMIN\Downloads\converted_savedmodel\model.savedmodel'),
-)
-_LABEL_CANDIDATES = (
-    _PROJECT_ROOT / 'models' / 'labels.txt',
-    Path(r'C:\Users\ADMIN\Downloads\converted_savedmodel\labels.txt'),
-)
-MODEL_DIR = next((p for p in _MODEL_CANDIDATES if p.exists()), _MODEL_CANDIDATES[0])
-LABELS_PATH = next((p for p in _LABEL_CANDIDATES if p.exists()), _LABEL_CANDIDATES[0])
+CRACK_TFLITE = _PROJECT_ROOT / 'models' / 'crackegg.tflite'
+DIRTY_TFLITE = _PROJECT_ROOT / 'models' / 'dirty.tflite'
+SAVEDMODEL_DIR = _PROJECT_ROOT / 'models' / 'savedmodel'
+LABELS_PATH = _PROJECT_ROOT / 'models' / 'labels.txt'
+# Kept for older call sites that still print MODEL_DIR.
+MODEL_DIR = SAVEDMODEL_DIR
 
 CONFIDENCE_THRESHOLD = 55.0
-CRACK_SCORE_MIN = 78.0  # blurry frames used to false-crack at ~62
-DIRTY_SCORE_MIN = 68.0
-REJECT_MARGIN = 10.0
-INSPECT_WINDOW_SEC = 4.0
-# Full 5s camera watch, then instantly commit Clean/Crack to /records.
-# Clean weight stays pending until the same egg hits the HX711 load cell.
-SCAN_SEC = 5.0
-INSPECT_GIVE_UP_SEC = 5.0
+CRACK_SCORE_MIN = float(os.environ.get('CRACK_SCORE_MIN', '45.0'))
+DIRTY_SCORE_MIN = float(os.environ.get('DIRTY_SCORE_MIN', '45.0'))
+REJECT_MARGIN = 8.0
+YOLO_IMG_SIZE = 640
+YOLO_CONF_MIN = float(os.environ.get('YOLO_CONF_MIN', '0.35'))
+INSPECT_WINDOW_SEC = 2.5
+# Short camera watch, then commit Clean/Crack. Early-exit when votes are clear
+# so a moving egg is not stuck on DETECTING while it leaves the FOV.
+# Weight stays pending until the same egg (Clean/Crack/Dirty) hits the HX711.
+# Full camera watch before Clean / Crack / Dirty is locked.
+SCAN_SEC = float(os.environ.get('SCAN_SEC', '5.0'))
+# Do not early-exit before SCAN_SEC unless explicitly configured lower.
+SCAN_EARLY_SEC = float(os.environ.get('SCAN_EARLY_SEC', '5.0'))
+INSPECT_GIVE_UP_SEC = 6.0
 ROBOFLOW_TIMEOUT_SEC = 1.0
 # 0 = off for live speed. Roboflow was stacking with /jpg pulls and lagging the CAM.
 ROBOFLOW_EVERY_N = int(os.environ.get('ROBOFLOW_EVERY_N', '0'))
 GRAB_SLEEP_SEC = 0.01
-CLASSIFY_SLEEP_SEC = 0.03  # leave CPU/Wi‑Fi headroom so /watch stays smooth
+# Vision ticks must stay near-zero sleep — any pause here delays tracker vs live.
+CLASSIFY_SLEEP_SEC = float(os.environ.get('CLASSIFY_SLEEP_SEC', '0.02'))
+CLASSIFY_HEAVY_SLEEP_SEC = float(os.environ.get('CLASSIFY_HEAVY_SLEEP_SEC', '0.40'))
+# Crack/Dirty YOLO TFLite — needed so dirty/crack eggs are not labeled Clean.
+# Set CLASSIFY_TF=0 only for live-debug (vision/track only).
+CLASSIFY_TF = os.environ.get('CLASSIFY_TF', '1').strip().lower() not in (
+    '0', 'false', 'no',
+)
+# Clear sticky Clean→scale wait so the next egg can detect (was 120s).
+AWAIT_WEIGHT_TIMEOUT_SEC = float(os.environ.get('AWAIT_WEIGHT_TIMEOUT_SEC', '8'))
 
 # How many recent detection records to keep for the /records endpoint.
 MAX_RECORDS = 200
@@ -96,8 +123,6 @@ _cors = cors_origins()
 _cors_list = [o for o in _cors if not o.startswith('r\'') and '*' not in o] if isinstance(_cors, list) else ['*']
 # Regex origins from security_http are for flask-cors; FastAPI wants plain strings.
 _cors_list = [
-    'http://192.168.11.212:8000',
-    'http://192.168.1.53:8000',
     'https://egg-system.paghasianjustine.workers.dev',
     'https://egg-farm.eggsorting.site',
 ]
@@ -118,6 +143,10 @@ app.add_middleware(
         'X-Device-Token',
         'Cache-Control',
         'Pragma',
+    ],
+    expose_headers=[
+        'X-Egg-Frame',
+        'X-Frame-Age-Ms',
     ],
 )
 
@@ -157,7 +186,8 @@ def _device_token_ok(request: Request) -> bool:
     ).strip()
     if expected:
         return bool(got) and hmac.compare_digest(got, expected)
-    return _is_private_ip(_client_ip(request))
+    # No token configured: allow LAN, or Cloudflare Tunnel (extender isolation path).
+    return _is_private_ip(_client_ip(request)) or _from_cloudflare(request)
 
 
 @app.middleware('http')
@@ -266,7 +296,7 @@ def _save_live_detections() -> None:
             payload = {
                 'goodEggs': int(metrics.get('goodEggs') or 0),
                 'crackedEggs': int(metrics.get('crackedEggs') or 0),
-                'dirtyEggs': 0,
+                'dirtyEggs': int(metrics.get('dirtyEggs') or 0),
                 'records': list(detection_records),
                 'savedAt': time.strftime('%Y-%m-%dT%H:%M:%S'),
             }
@@ -290,29 +320,25 @@ def _apply_live_board_payload(data: dict) -> None:
             detection_records.append(row)
     metrics['goodEggs'] = int(data.get('goodEggs') or 0)
     metrics['crackedEggs'] = int(data.get('crackedEggs') or 0)
-    old_dirty = int(data.get('dirtyEggs') or 0)
-    if old_dirty:
-        metrics['goodEggs'] += old_dirty
-    metrics['dirtyEggs'] = 0
-    for row in detection_records:
-        if str(row.get('category') or '') == 'dirtyEggs':
-            row['category'] = 'goodEggs'
-        lab = str(row.get('label') or '')
-        if 'dirty' in lab.lower():
-            row['label'] = 'Clean'
+    metrics['dirtyEggs'] = int(data.get('dirtyEggs') or 0)
     good_n = 0
     crack_n = 0
+    dirty_n = 0
     for row in detection_records:
         cat = str(row.get('category') or '').lower()
         lab = str(row.get('label') or '').lower()
         if cat == 'crackedeggs' or ('crack' in lab and 'no crack' not in lab):
             crack_n += 1
+        elif cat == 'dirtyeggs' or 'dirty' in lab or 'soil' in lab or 'stain' in lab:
+            dirty_n += 1
         else:
             good_n += 1
     if good_n > int(metrics.get('goodEggs') or 0):
         metrics['goodEggs'] = good_n
     if crack_n > int(metrics.get('crackedEggs') or 0):
         metrics['crackedEggs'] = crack_n
+    if dirty_n > int(metrics.get('dirtyEggs') or 0):
+        metrics['dirtyEggs'] = dirty_n
     if detection_records:
         last = detection_records[-1]
         lab = str(last.get('label') or '')
@@ -348,7 +374,7 @@ def _load_live_detections() -> None:
                     farm_store.save_live_board({
                         'goodEggs': int(metrics.get('goodEggs') or 0),
                         'crackedEggs': int(metrics.get('crackedEggs') or 0),
-                        'dirtyEggs': 0,
+                        'dirtyEggs': int(metrics.get('dirtyEggs') or 0),
                         'records': list(detection_records),
                         'savedAt': time.strftime('%Y-%m-%dT%H:%M:%S'),
                     })
@@ -403,7 +429,7 @@ _pending_weight: float | None = None   # set by POST /weight, consumed once
 _last_live_weight_at = 0.0  # monotonic time of last non-empty scale reading
 _LIVE_WEIGHT_HOLD_SEC = 0.4  # drop stale grams fast so empty belt is not an egg
 
-# One camera egg → one system record. Clean eggs wait for the same egg on the scale.
+# One camera egg → one system record. Clean/Crack/Dirty all wait for the same egg on the scale.
 _egg_pipe_lock = threading.Lock()
 _egg_pipe = {
     'id': '',
@@ -591,7 +617,9 @@ def _label_from_camera(cam: str) -> str:
     low = (cam or '').lower()
     if 'crack' in low and 'no crack' not in low:
         return 'Crack Egg'
-    if 'clean' in low or 'good' in low or 'no crack' in low or 'dirty' in low:
+    if 'dirty' in low or 'soil' in low or 'stain' in low:
+        return 'Dirty Egg'
+    if 'clean' in low or 'good' in low or 'no crack' in low:
         return 'Clean Egg'
     if cam and 'egg' in low:
         return cam
@@ -643,11 +671,26 @@ def _public_metrics() -> dict:
     # Re-arm weigh pipe from orphan pending camera rows (timeout / FOV clear).
     _restore_pipe_from_pending()
     payload = dict(metrics)
+    with _raw_lock:
+        raw_at = _last_raw_at
+        has_raw = bool(_last_raw)
+    frame_age = (time.monotonic() - raw_at) if raw_at else 999.0
+    frame_live = bool(has_raw and frame_age <= LIVE_VIEW_MAX_AGE_SEC)
     payload['hardwareOnline'] = hardware
     payload['hardwareDevice'] = _esp32_device
-    payload['connected'] = bool(metrics.get('connected') or hardware)
-    if hardware and not metrics.get('connected'):
-        payload['status'] = f'{_esp32_device} powered on and connected to Wi-Fi'
+    # connected / LIVE = fresh JPEG only — never heartbeat-only (that made the
+    # UI show green LIVE over "Connecting camera…").
+    payload['connected'] = frame_live
+    payload['cameraConnected'] = frame_live
+    payload['frameLive'] = frame_live
+    payload['frameAgeMs'] = int(round(min(frame_age, 99.0) * 1000))
+    metrics['connected'] = frame_live
+    if hardware and not frame_live:
+        payload['status'] = (
+            f'{_esp32_device} on Wi-Fi — waiting for internet camera frames'
+        )
+    elif not hardware and not frame_live:
+        payload['status'] = 'Running — waiting for ESP32-CAM'
     with _egg_pipe_lock:
         awaiting = bool(_egg_pipe.get('awaiting_weight'))
         pipe_cam = str(_egg_pipe.get('camera') or '')
@@ -709,12 +752,10 @@ def correct_scale_grams(grams: float) -> float:
 def classify_size(grams: float) -> str:
     """
     Map a weight in grams to a size-class string matching the Flutter enum.
-        peewee      is not used
-        small       <= 47.0 g
-        medium      47.1 – 54.0 g
-        large       54.1 – 61.3 g
-        extraLarge  61.4 – 68.5 g
-        jumbo       > 68.5 g
+        small   <= 47.0 g
+        medium  <= 54.0 g
+        large   <= 61.3 g
+        jumbo   > 61.3 g
     """
     if grams <= 47.0:
         return 'small'
@@ -722,8 +763,6 @@ def classify_size(grams: float) -> str:
         return 'medium'
     if grams <= 61.3:
         return 'large'
-    if grams <= 70.0:
-        return 'extraLarge'
     return 'jumbo'
 
 
@@ -783,23 +822,123 @@ def load_labels(path: Path):
         return result
 
 
+# TFLite YOLO = crack/dirty only. SavedModel = Empty + No Crack (Clean) stay.
+_crack_it = None
+_dirty_it = None
+_crack_in = None
+_crack_out = None
+_dirty_in = None
+_dirty_out = None
+_tflite_lock = threading.Lock()
+signature = None
+input_name = 'images'
+input_shape = (224, 224, 3)  # Teachable Machine Empty/Clean
+
+
+def _make_tflite(path: Path):
+    import tensorflow as tf  # lazy
+    if not path.is_file():
+        raise FileNotFoundError(f'TFLite model missing: {path}')
+    it = tf.lite.Interpreter(model_path=str(path), num_threads=2)
+    it.allocate_tensors()
+    return it, it.get_input_details()[0], it.get_output_details()[0]
+
+
 def load_model():
+    """Load new crack/dirty YOLO TFLite + keep Empty/Clean Teachable Machine SavedModel."""
+    global _crack_it, _dirty_it, _crack_in, _crack_out, _dirty_in, _dirty_out
     global signature, input_name, input_shape
-    model = tf.saved_model.load(str(MODEL_DIR))
+    import tensorflow as tf  # lazy
+
+    _crack_it, _crack_in, _crack_out = _make_tflite(CRACK_TFLITE)
+    _dirty_it, _dirty_in, _dirty_out = _make_tflite(DIRTY_TFLITE)
+    print(
+        f'[model] crack/dirty TFLite ready '
+        f'({CRACK_TFLITE.name}, {DIRTY_TFLITE.name})',
+        flush=True,
+    )
+
+    if not SAVEDMODEL_DIR.is_dir():
+        raise FileNotFoundError(
+            f'Empty/Clean SavedModel missing: {SAVEDMODEL_DIR}'
+        )
+    model = tf.saved_model.load(str(SAVEDMODEL_DIR))
     signatures = getattr(model, 'signatures', None)
     if signatures is None or 'serving_default' not in signatures:
-        raise RuntimeError('SavedModel does not expose a serving_default signature')
+        raise RuntimeError('SavedModel missing serving_default signature')
     signature = signatures['serving_default']
     input_signature = signature.structured_input_signature[1]
     if not input_signature:
-        raise RuntimeError('SavedModel serving_default signature has no inputs.')
+        raise RuntimeError('SavedModel serving_default has no inputs')
     input_name, input_spec = next(iter(input_signature.items()))
     input_shape = tuple(input_spec.shape[1:])
     if len(input_shape) != 3:
-        raise RuntimeError(f'Unsupported model input shape: {input_shape}')
+        raise RuntimeError(f'Unsupported SavedModel input shape: {input_shape}')
+    print(
+        f'[model] Empty/Clean SavedModel ready shape={input_shape}',
+        flush=True,
+    )
+
+
+def _letterbox_bgr(frame, size: int = YOLO_IMG_SIZE):
+    h, w = frame.shape[:2]
+    r = min(size / float(h), size / float(w))
+    nh, nw = max(1, int(round(h * r))), max(1, int(round(w * r)))
+    resized = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
+    canvas = np.full((size, size, 3), 114, dtype=np.uint8)
+    top = (size - nh) // 2
+    left = (size - nw) // 2
+    canvas[top:top + nh, left:left + nw] = resized
+    return canvas, r, left, top
+
+
+def _yolo_nchw(frame_bgr, focus=None):
+    source = frame_bgr
+    if focus is not None and frame_bgr is not None and getattr(frame_bgr, 'size', 0):
+        h, w = frame_bgr.shape[:2]
+        x1, y1, x2, y2 = [int(round(v)) for v in focus]
+        bw = max(8, x2 - x1)
+        bh = max(8, y2 - y1)
+        pad_x = int(bw * 0.12)
+        pad_y = int(bh * 0.12)
+        x1 = max(0, min(w - 2, x1 - pad_x))
+        y1 = max(0, min(h - 2, y1 - pad_y))
+        x2 = max(x1 + 2, min(w, x2 + pad_x))
+        y2 = max(y1 + 2, min(h, y2 + pad_y))
+        crop = frame_bgr[y1:y2, x1:x2]
+        if crop.size > 0:
+            source = crop
+    canvas, _, _, _ = _letterbox_bgr(source, YOLO_IMG_SIZE)
+    rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    # NCHW for Ultralytics TFLite export.
+    return np.expand_dims(np.transpose(rgb, (2, 0, 1)), axis=0)
+
+
+def _yolo_max_score(interpreter, in_detail, out_detail, nchw: np.ndarray) -> float:
+    """Return best objectness/class score 0..100 from YOLO TFLite [1,5,N] output."""
+    interpreter.set_tensor(in_detail['index'], nchw)
+    interpreter.invoke()
+    out = interpreter.get_tensor(out_detail['index'])
+    arr = np.squeeze(out)
+    if arr.ndim != 2:
+        return 0.0
+    # Ultralytics export is usually (5, N) or (4+nc, N). Take last row(s) as score.
+    if arr.shape[0] in (5, 6) or arr.shape[0] < arr.shape[1]:
+        scores = arr[4:].max(axis=0)
+    else:
+        # (N, 5)
+        scores = arr[:, 4:].max(axis=1) if arr.shape[1] >= 5 else arr.max(axis=1)
+    if scores.size == 0:
+        return 0.0
+    best = float(np.max(scores))
+    # Some exports are already 0..1; rare exports use logits — clamp.
+    if best > 1.5:
+        best = 1.0 / (1.0 + np.exp(-min(best, 20.0)))
+    return max(0.0, min(100.0, best * 100.0))
 
 
 def preprocess_frame(frame):
+    """Teachable Machine NHWC crop for Empty/Clean SavedModel."""
     h, w = frame.shape[:2]
     ch, cw = max(int(h * 0.84), 32), max(int(w * 0.84), 32)
     y0 = max((h - ch) // 2, 0)
@@ -818,7 +957,13 @@ def _tensor_from_bgr(bgr):
     return np.expand_dims(arr, axis=0)
 
 
-def _local_classify(frame, focus=None):
+def _empty_clean_from_savedmodel(frame, focus=None) -> tuple[float, float]:
+    """Return (empty_pct, clean_pct) from the kept Teachable Machine SavedModel."""
+    if signature is None:
+        # Fallback if SavedModel failed to load — egg focus ⇒ clean-ish.
+        if focus is not None:
+            return 10.0, 70.0
+        return 80.0, 20.0
     source = frame
     if focus is not None and frame is not None and getattr(frame, 'size', 0):
         h, w = frame.shape[:2]
@@ -838,24 +983,77 @@ def _local_classify(frame, focus=None):
         input_data = preprocess_frame(frame)
     else:
         input_data = _tensor_from_bgr(source)
+    import tensorflow as tf
     outputs = signature(**{input_name: tf.constant(input_data)})
-    output_tensor = next(iter(outputs.values()))
-    predictions = output_tensor.numpy()
+    predictions = next(iter(outputs.values())).numpy()
     if predictions.ndim == 2 and predictions.shape[0] == 1:
         predictions = predictions[0]
-    # Dataset order must match Teachable Machine export:
-    # 0 Empty Model | 1 No Crack Egg (Clean) | 2 Crack Egg | 3 Dirty Egg
-    class_names = labels if labels else [
-        'Empty Model', 'No Crack Egg', 'Crack Egg', 'Dirty Egg',
-    ]
-    scores = {}
-    n = min(len(class_names), len(predictions))
-    for i in range(n):
-        scores[class_names[i]] = float(predictions[i]) * 100.0
-    idx = int(np.argmax(predictions))
-    label = class_names[idx] if idx < len(class_names) else f'Class_{idx}'
-    confidence = float(predictions[idx]) * 100.0
-    return label, confidence, scores
+    # 0 Empty | 1 No Crack (Clean) | 2 Crack | 3 Dirty — only keep 0 and 1.
+    empty = float(predictions[0]) * 100.0 if len(predictions) > 0 else 0.0
+    clean = float(predictions[1]) * 100.0 if len(predictions) > 1 else 0.0
+    return empty, clean
+
+
+_yolo_flip = 0
+
+
+_sm_live_tick = 0
+
+
+def _local_classify(frame, focus=None):
+    """Crack/dirty from YOLO TFLite; Empty/Clean from shell path (+ rare SavedModel).
+
+    Runs only ONE YOLO net per call. Skips SavedModel on most ticks so CAM
+    push is not GIL-starved (that was freezing /live.jpg and dropping tracks).
+    """
+    global _yolo_flip, _sm_live_tick
+    crack = 0.0
+    dirty = 0.0
+    if _crack_it is not None and _dirty_it is not None:
+        nchw = _yolo_nchw(frame, focus)
+        with _tflite_lock:
+            _yolo_flip += 1
+            if _yolo_flip % 2 == 1:
+                crack = _yolo_max_score(_crack_it, _crack_in, _crack_out, nchw)
+            else:
+                dirty = _yolo_max_score(_dirty_it, _dirty_in, _dirty_out, nchw)
+
+    # New models win for defects — skip SavedModel on this tick (saves latency).
+    if crack >= CRACK_SCORE_MIN and crack >= dirty + REJECT_MARGIN * 0.5:
+        scores = {
+            'Empty Model': 0.0,
+            'No Crack Egg': max(0.0, 100.0 - crack),
+            'Crack Egg': crack,
+            'Dirty Egg': dirty,
+        }
+        return 'Crack Egg', crack, scores
+    if dirty >= DIRTY_SCORE_MIN and dirty >= crack:
+        scores = {
+            'Empty Model': 0.0,
+            'No Crack Egg': max(0.0, 100.0 - dirty),
+            'Crack Egg': crack,
+            'Dirty Egg': dirty,
+        }
+        return 'Dirty Egg', dirty, scores
+
+    # Live path never runs SavedModel — TF predict holds the GIL and stalls
+    # CAM HTTPS /api/frame (laggy live + broken tracker). Shell vision in
+    # _ingest_jpeg owns Empty/Clean; YOLO above owns Crack/Dirty.
+    _sm_live_tick += 1
+    empty, clean = 5.0, max(55.0, 100.0 - max(crack, dirty))
+    scores = {
+        'Empty Model': empty,
+        'No Crack Egg': clean,
+        'Crack Egg': crack,
+        'Dirty Egg': dirty,
+    }
+    if focus is not None:
+        return 'No Crack Egg', clean, scores
+    if clean >= empty and clean >= CONFIDENCE_THRESHOLD:
+        return 'No Crack Egg', clean, scores
+    if empty >= CONFIDENCE_THRESHOLD:
+        return 'Empty Model', empty, scores
+    return 'Empty Model', empty, scores
 
 
 def _merge_scores(base: dict, extra: dict | None) -> dict:
@@ -933,11 +1131,10 @@ def counting_category(label: str):
     """
     Map a model label to a metrics bucket.
 
-    System grades are Clean + Crack only (dust/Dirty is not a grade):
         0 Empty Model  → skip (no egg present)
         1 No Crack Egg → goodEggs
         2 Crack Egg    → crackedEggs
-        3 Dirty Egg    → goodEggs (ignored; treated as Clean)
+        3 Dirty Egg    → dirtyEggs
     """
     s = label.lower()
 
@@ -946,9 +1143,8 @@ def counting_category(label: str):
         return 'goodEggs'
     if 'crack' in s or 'broken' in s:
         return 'crackedEggs'
-    # Dirty / dust / stain is not part of the product — count as Clean.
     if 'dirty' in s or 'soiled' in s or 'stain' in s or 'dirt' in s:
-        return 'goodEggs'
+        return 'dirtyEggs'
     if 'good' in s or 'ok' in s or 'healthy' in s or 'clean' in s:
         return 'goodEggs'
 
@@ -1073,9 +1269,11 @@ def _apply_inspect_frame(label: str, confidence: float, scores: dict | None = No
         if voted is None and elapsed < INSPECT_WINDOW_SEC:
             return
         if voted is None:
-            if _inspect['best_crack'] > 0.0:
+            if _inspect['best_crack'] >= CRACK_SCORE_MIN:
                 voted = 'Crack Egg'
-            elif max(_inspect['best_good'], _inspect['best_dirty']) >= 45.0:
+            elif _inspect['best_dirty'] >= DIRTY_SCORE_MIN:
+                voted = 'Dirty Egg'
+            elif _inspect['best_good'] >= 45.0:
                 voted = 'No Crack Egg'
             else:
                 return
@@ -1083,8 +1281,11 @@ def _apply_inspect_frame(label: str, confidence: float, scores: dict | None = No
         if cat == 'crackedEggs' and _inspect['best_crack'] > 0.0:
             _finish_inspect(True, 'Crack Egg')
             return
+        if cat == 'dirtyEggs' and _inspect['best_dirty'] >= DIRTY_SCORE_MIN:
+            _finish_inspect(True, 'Dirty Egg')
+            return
         if cat == 'goodEggs' and (
-            max(_inspect['best_good'], _inspect['best_dirty']) >= 50.0
+            _inspect['best_good'] >= 50.0
             or elapsed >= INSPECT_WINDOW_SEC
         ):
             _finish_inspect(False, 'No Crack Egg')
@@ -1173,10 +1374,10 @@ _track = {
     'vy': 0.0,
     'confirmed': False,
 }
-TRACK_MISS_MAX = 5           # empty belt must drop track fast (was 18 → stuck CLEAN)
-TRACK_MATCH_PX = 220.0       # eggs move on belt — not giant jumps to fixtures
-TRACK_SEARCH_PAD = 0.55
-TRACK_COAST_DECAY = 0.80
+TRACK_MISS_MAX = 10          # tunnel gaps ~1–2s; keep coast so lock does not blink
+TRACK_MATCH_PX = 260.0       # eggs move on belt — not giant jumps to fixtures
+TRACK_SEARCH_PAD = 0.70
+TRACK_COAST_DECAY = 0.85
 
 
 def _egg_color_mask(crop, wood_cols: int = 0):
@@ -1337,22 +1538,22 @@ def _detect_egg_boxes_in_roi(frame, x0, y0, x1, y1) -> list[tuple[int, int, int,
         box = (x0 + x, y0 + y, x0 + x + bw, y0 + y + bh)
         if _box_is_metal_or_belt(frame, box):
             continue
-        # Egg only — shell + oval + not metal/belt (already checked).
-        # Shell fill: high enough to skip pad wrinkles, low enough for glare eggs.
-        if not _box_is_egg_shell(frame, box, min_shell=0.30):
+        # Soft JPEG over tunnel is blurry — shell fill must stay loose or lock never starts.
+        if not _box_is_egg_shell(frame, box, min_shell=0.14):
             continue
         if not _box_looks_like_egg(frame, box):
             continue
         area = float((box[2] - box[0]) * (box[3] - box[1]))
         # Ignore debris; allow close-up eggs that fill most of the FOV.
         frame_area = float(max(w * h, 1))
-        if area < 0.020 * frame_area or area > 0.78 * frame_area:
+        # Allow smaller / edge-entry eggs so lock starts as soon as it enters FOV.
+        if area < 0.008 * frame_area or area > 0.88 * frame_area:
             continue
         if _box_is_wood_board(frame, box):
             continue
         roi = frame[max(0, box[1]):min(h, box[3]), max(0, box[0]):min(w, box[2])]
         glow = float(np.mean(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY))) if roi.size else 0.0
-        if glow < 85.0:
+        if glow < 55.0:
             continue  # pale shell vs dark empty pad
         scored.append((area * (1.0 + glow / 255.0), box))
     scored.sort(key=lambda t: t[0], reverse=True)
@@ -1482,12 +1683,12 @@ def _box_looks_like_egg(frame, box) -> bool:
     if roi.size == 0:
         return False
     mean_v = float(np.mean(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)))
-    if mean_v < 95.0:
+    if mean_v < 70.0:
         return False  # egg shell is bright vs dark empty pad
     mask = _egg_color_mask(roi)
     egg_px = cv2.countNonZero(mask)
-    # Real shell fills most of the oval; pad wrinkles leave a sparse mask.
-    if egg_px < 0.18 * roi.shape[0] * roi.shape[1]:
+    # Soft JPEG: shell fill looks thinner — keep loose so tracker can lock.
+    if egg_px < 0.10 * roi.shape[0] * roi.shape[1]:
         return False
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
@@ -1511,7 +1712,7 @@ def _box_is_egg_shell(frame, box, min_shell: float = 0.20) -> bool:
     if cx < w * _zoom_u(0.04) or cx > w * _zoom_u(0.98) or cy < h * 0.05:
         return False
     frac = ((x2 - x1) * (y2 - y1)) / float(max(w * h, 1))
-    if frac < 0.018 or frac > 0.72:
+    if frac < 0.008 or frac > 0.88:
         return False
     if _box_is_wood_board(frame, box):
         return False
@@ -1519,7 +1720,7 @@ def _box_is_egg_shell(frame, box, min_shell: float = 0.20) -> bool:
     if crop.size == 0:
         return False
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    if float(np.mean(gray)) < 85.0:
+    if float(np.mean(gray)) < 60.0:
         return False  # must be bright shell, not dark empty pad
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
     mask = _egg_color_mask(crop)
@@ -1635,7 +1836,8 @@ def _update_tracker(cands, keep: bool = False, frame=None):
             # Follow motion faster so the box stays on a rolling egg.
             _track['vx'] = 0.45 * float(_track.get('vx') or 0.0) + 0.55 * (ncx - pcx)
             _track['vy'] = 0.45 * float(_track.get('vy') or 0.0) + 0.55 * (ncy - pcy)
-            alpha = 0.22  # trust new detection more when egg is moving
+            # Almost snap to new box — heavy smoothing made the box chase behind the egg.
+            alpha = 0.08
             _track['box'] = tuple(
                 alpha * old + (1.0 - alpha) * new
                 for old, new in zip(prev, picked)
@@ -1741,12 +1943,10 @@ def pick_quality(
     seen_egg: bool = True,
     model_label: str = '',
 ) -> tuple[str, float]:
-    """Camera: Crack or Clean only when an egg is confirmed. Else Empty."""
+    """Camera: Crack / Dirty / Clean when an egg is confirmed. Else Empty."""
     global _empty_dirty_ema
     scores = scores or {}
     good, crack, dirty = _score_buckets(scores)
-    # Dirty model score folds into Clean — dust is not a grade.
-    good = max(good, dirty)
     empty = _empty_score(scores)
     cat = counting_category(model_label)
 
@@ -1756,13 +1956,21 @@ def pick_quality(
         return 'Empty Model', 0.0
 
     # If Empty wins clearly, do not invent Clean on a non-egg.
-    if empty >= max(good, crack) + 15.0 and empty >= 55.0:
+    if empty >= max(good, crack, dirty) + 15.0 and empty >= 55.0:
         return 'Empty Model', 0.0
 
-    # Crack must clearly beat clean — weak/blurry model scores stay Empty.
-    if crack >= CRACK_SCORE_MIN and crack >= good + 12.0:
+    # Prefer explicit model label when it already named a defect.
+    if cat == 'crackedEggs' and crack >= CRACK_SCORE_MIN:
         return 'Crack Egg', crack
-    if good >= 55.0 and good >= crack + 8.0:
+    if cat == 'dirtyEggs' and dirty >= DIRTY_SCORE_MIN:
+        return 'Dirty Egg', dirty
+
+    # Crack / Dirty must beat Clean — never fold Dirty into Clean.
+    if crack >= CRACK_SCORE_MIN and crack >= dirty and crack >= good + 8.0:
+        return 'Crack Egg', crack
+    if dirty >= DIRTY_SCORE_MIN and dirty >= crack and dirty >= good + 8.0:
+        return 'Dirty Egg', dirty
+    if good >= 55.0 and good >= crack + 8.0 and good >= dirty + 8.0:
         return 'Clean Egg', good
     return 'Empty Model', 0.0
 
@@ -1770,11 +1978,12 @@ def pick_quality(
 _last_count_at = 0.0
 _last_seen_egg = False
 _egg_in_view = False
-# Egg must show on this many frames in a row before a scan starts.
-EGG_CONFIRM_FRAMES = 2  # solid egg frames before 5s scan (blocks one-frame glare)
+# Lock on first solid oval — waiting 2+ frames made moving eggs look late.
+EGG_CONFIRM_FRAMES = 1
 _classify_tick = 0
 # After that, this many missed frames in a row still count as the same egg.
-EGG_LOST_GRACE = 3
+# Tunnel gaps ~1–2s — allow more miss frames so a moving egg stays locked.
+EGG_LOST_GRACE = 8
 _egg_streak = 0
 _egg_lost = 0
 _scan_lock = threading.Lock()
@@ -1840,11 +2049,10 @@ def _egg_interior(crop, margin: int):
     return solid[pad:-pad, pad:-pad] > 0
 
 
-# Thin dark line = crack. A hairline is darker than the shell next to it.
-# Blurry JPEG + soft shadows were false-CRACK on clean eggs — keep these strict.
-CRACK_MIN_CONTRAST = 26.0
-CRACK_MIN_LEN_FRAC = 0.18
-CRACK_MIN_ELONG = 3.8
+# Thin dark line = crack. Soft JPEG (HQVGA Q~14) blurs hairlines — slightly looser.
+CRACK_MIN_CONTRAST = 20.0
+CRACK_MIN_LEN_FRAC = 0.14
+CRACK_MIN_ELONG = 3.2
 _crack_dbg_at = 0.0
 
 
@@ -1946,8 +2154,10 @@ def _shell_quality(frame, box) -> str:
             _crack_dbg_at = now
             print(f'[crack] thin line len={length:.0f}px contrast={contrast:.0f}', flush=True)
         return 'crack'
-    # Dust / stain is not a grade — treat as clean shell.
-    if dark <= 0.12 or stain >= 0.10:
+    # Real stain / soil patch → Dirty (do not fold into Clean).
+    if stain >= 0.08 and dark >= 0.04:
+        return 'dirty'
+    if dark <= 0.10 and stain < 0.06:
         return 'clean'
     return ''
 
@@ -1955,12 +2165,16 @@ def _shell_quality(frame, box) -> str:
 def _apply_shell(scores: dict, shell: str) -> dict:
     out = dict(scores or {})
     if shell == 'clean':
-        out['No Crack Egg'] = max(float(out.get('No Crack Egg', 0.0)), 82.0)
-        out['Crack Egg'] = min(float(out.get('Crack Egg', 0.0)), 25.0)
-        out['Dirty Egg'] = min(float(out.get('Dirty Egg', 0.0)), 25.0)
+        # Soft prior only — never crush YOLO crack/dirty (soft JPEG false-clean).
+        out['No Crack Egg'] = max(float(out.get('No Crack Egg', 0.0)), 70.0)
     elif shell == 'crack':
         out['Crack Egg'] = max(float(out.get('Crack Egg', 0.0)), 80.0)
         out['No Crack Egg'] = min(float(out.get('No Crack Egg', 0.0)), 30.0)
+        out['Dirty Egg'] = min(float(out.get('Dirty Egg', 0.0)), 30.0)
+    elif shell == 'dirty':
+        out['Dirty Egg'] = max(float(out.get('Dirty Egg', 0.0)), 80.0)
+        out['No Crack Egg'] = min(float(out.get('No Crack Egg', 0.0)), 30.0)
+        out['Crack Egg'] = min(float(out.get('Crack Egg', 0.0)), 30.0)
     return out
 
 
@@ -1968,18 +2182,18 @@ def _camera_quality_name(label: str) -> str:
     low = (label or '').lower()
     if 'crack' in low and 'no crack' not in low:
         return 'Crack'
-    if 'clean' in low or 'no crack' in low or 'dirty' in low or 'good' in low:
+    if 'dirty' in low or 'soil' in low or 'stain' in low:
+        return 'Dirty'
+    if 'clean' in low or 'no crack' in low or 'good' in low:
         return 'Clean'
     return 'Pending'
 
 
 def _commit_camera_detection(label: str, confidence: float = 80.0) -> str | None:
-    """One visible egg → one Firebase record (Clean / Crack only)."""
+    """One visible egg → one Firebase record (Clean / Crack / Dirty)."""
     global _last_count_at, _clean_hold_until, _reject_hold_until, _pending_weight
     cat = counting_category(label)
-    if cat == 'dirtyEggs':
-        cat = 'goodEggs'
-    if cat not in ('goodEggs', 'crackedEggs'):
+    if cat not in ('goodEggs', 'crackedEggs', 'dirtyEggs'):
         return None
     cam = _camera_quality_name(label)
     now = time.monotonic()
@@ -1988,7 +2202,7 @@ def _commit_camera_detection(label: str, confidence: float = 80.0) -> str | None
         if (
             _egg_pipe.get('awaiting_weight')
             and _egg_pipe.get('id')
-            and (now - float(_egg_pipe.get('opened_at') or 0.0)) < 120.0
+            and (now - float(_egg_pipe.get('opened_at') or 0.0)) < AWAIT_WEIGHT_TIMEOUT_SEC
         ):
             print(
                 f'[egg] still waiting weight for {_egg_pipe["id"][:8]}... '
@@ -1996,8 +2210,14 @@ def _commit_camera_detection(label: str, confidence: float = 80.0) -> str | None
                 flush=True,
             )
             return str(_egg_pipe['id'])
+        # Timed-out wait — free pipe so tracker/detect can run on the next egg.
+        if _egg_pipe.get('awaiting_weight'):
+            _egg_pipe['awaiting_weight'] = False
+            _egg_pipe['id'] = ''
+            print('[egg] cleared stale awaiting_weight — ready to detect', flush=True)
         rid = uuid.uuid4().hex
-        await_w = cat == 'goodEggs'  # Clean may get grams later; already in Firebase.
+        # Clean / Crack / Dirty all get grams when this egg hits the load cell.
+        await_w = True
         _egg_pipe['id'] = rid
         _egg_pipe['camera'] = cam
         _egg_pipe['category'] = cat
@@ -2017,10 +2237,10 @@ def _commit_camera_detection(label: str, confidence: float = 80.0) -> str | None
     sorting = sorting_result_for(cat)
     # Firebase immediately for Good, Cracked, and Dirty (one doc per egg).
     # Placeholder grams (>0) so older Firestore rules still accept the create;
-    # Good eggs get real weight when the same egg hits the load cell.
+    # real weight attaches when the same egg hits the load cell.
     remember_sorted_egg(
         weight=0.01,
-        size_class='pending' if await_w else 'N/A',
+        size_class='pending',
         camera_result=cam,
         sorting_result=sorting,
         record_id=rid,
@@ -2034,32 +2254,30 @@ def _commit_camera_detection(label: str, confidence: float = 80.0) -> str | None
         'confidence': round(float(confidence or 80.0), 1),
         'category': cat,
         'weightGrams': None,
-        'sizeClass': 'pending' if await_w else 'N/A',
-        'awaitingWeight': await_w,
+        'sizeClass': 'pending',
+        'awaitingWeight': True,
     })
     # Immediate Live Inspection HUD — do not wait for the next classify tick.
     if cat == 'goodEggs':
         metrics['lastLabel'] = 'Clean Egg'
+    elif cat == 'dirtyEggs':
+        metrics['lastLabel'] = 'Dirty Egg'
     else:
         metrics['lastLabel'] = 'Crack Egg'
     metrics['lastConfidence'] = round(float(confidence or 80.0), 1)
-    metrics['status'] = (
-        f'{cam} recorded — waiting for weight' if await_w else f'{cam} recorded'
-    )
-    if await_w:
-        # Drop stale pad grams so weight cannot attach until THIS egg reaches
-        # the load cell and DevKit POSTs /weight with commitEgg.
-        with _weight_lock:
-            _pending_weight = None
-        # Weight stays pending until HX711 posts grams for this same egg.
-        metrics['lastSizeClass'] = 'pending'
-        metrics['lastWeightGrams'] = 0.0
-        metrics['lastMeasurementStatus'] = 'pending'
+    metrics['status'] = f'{cam} recorded — waiting for weight'
+    # Drop stale pad grams so weight cannot attach until THIS egg reaches
+    # the load cell and DevKit POSTs /weight with commitEgg.
+    with _weight_lock:
+        _pending_weight = None
+    metrics['lastSizeClass'] = 'pending'
+    metrics['lastWeightGrams'] = 0.0
+    metrics['lastMeasurementStatus'] = 'pending'
     # Sync disk immediately so hard refresh / tunnel blips cannot lose the row.
     _save_live_detections()
     print(
         f'[egg] CAMERA {cam} → recorded id={rid[:8]}... '
-        f'({"weight pending → load cell" if await_w else "reject recorded"})',
+        f'(weight pending → load cell)',
         flush=True,
     )
     return rid
@@ -2072,7 +2290,7 @@ def _attach_scale_to_camera_egg(
     measurement_status: str = 'uncalibrated',
     device_id: str = 'egg-devkit',
 ) -> str | None:
-    """Same egg: fill weight/size on the open Clean camera record."""
+    """Same egg: fill weight/size on the open Clean/Crack/Dirty camera record."""
     with _egg_pipe_lock:
         rid = str(_egg_pipe.get('id') or '')
         awaiting = bool(_egg_pipe.get('awaiting_weight'))
@@ -2142,38 +2360,48 @@ def _attach_scale_to_camera_egg(
 def _scan_decision(now: float, elapsed: float) -> tuple[str, float]:
     crack_n = int(_scan['crack_n'])
     dirty_n = int(_scan['dirty_n'])
-    good_n = int(_scan['good_n']) + dirty_n  # dust votes count as Clean
+    good_n = int(_scan['good_n'])
     hits = int(_scan['hits'])
-    # After the full 5s watch: always record Clean or Crack (never drop the egg).
-    # Dust/Dirty is not a grade — folds into Clean.
-    if crack_n >= 2 and crack_n > good_n:
-        label, conf = 'Crack Egg', max(_scan['crack'], 70.0)
-    elif good_n >= 2 and good_n >= crack_n:
-        label, conf = 'Clean Egg', max(_scan['good'], _scan['dirty'], 60.0)
-    elif hits >= 3 and crack_n > good_n:
-        label, conf = 'Crack Egg', max(_scan['crack'], 65.0)
+    crack_sc = float(_scan['crack'])
+    dirty_sc = float(_scan['dirty'])
+    good_sc = float(_scan['good'])
+    # After the watch: Clean / Crack / Dirty — never fold Dirty into Clean.
+    if crack_n >= 2 and crack_n >= dirty_n and crack_n > good_n:
+        label, conf = 'Crack Egg', max(crack_sc, 70.0)
+    elif dirty_n >= 2 and dirty_n >= crack_n and dirty_n > good_n:
+        label, conf = 'Dirty Egg', max(dirty_sc, 70.0)
+    elif crack_sc >= CRACK_SCORE_MIN and crack_sc >= dirty_sc + 5.0 and crack_sc >= good_sc + 8.0:
+        label, conf = 'Crack Egg', max(crack_sc, 68.0)
+    elif dirty_sc >= DIRTY_SCORE_MIN and dirty_sc >= crack_sc + 5.0 and dirty_sc >= good_sc + 8.0:
+        label, conf = 'Dirty Egg', max(dirty_sc, 68.0)
+    elif good_n >= 2 and good_n >= crack_n and good_n >= dirty_n:
+        label, conf = 'Clean Egg', max(good_sc, 60.0)
+    elif hits >= 3 and crack_n > good_n and crack_n >= dirty_n:
+        label, conf = 'Crack Egg', max(crack_sc, 65.0)
+    elif hits >= 3 and dirty_n > good_n and dirty_n >= crack_n:
+        label, conf = 'Dirty Egg', max(dirty_sc, 65.0)
     elif hits >= 3:
-        # Tracked egg for the window, no clear crack majority → Clean.
-        label, conf = 'Clean Egg', max(_scan['good'], _scan['dirty'], 55.0)
+        # Tracked egg, no defect majority → Clean.
+        label, conf = 'Clean Egg', max(good_sc, 55.0)
     else:
         _reset_scan()
         return 'Empty Model', 0.0
     _scan['decided'] = label
-    _scan['hold_until'] = now + 45.0  # Clean may take time to reach the load cell
+    _scan['hold_until'] = now + 45.0  # Egg may take time to reach the load cell
     _scan['committed'] = False
-    # Station layout: Clean → LEFT, Crack → RIGHT (matches DevKit GATE).
-    side = 'full right' if label == 'Crack Egg' else 'full left'
+    # Station layout: Clean → LEFT, Crack/Dirty → RIGHT (matches DevKit GATE).
+    side = 'full left' if label == 'Clean Egg' else 'full right'
     print(
         f'[scan] done {elapsed:.1f}s -> {label}  gate {side}  '
         f'shell c={crack_n} d={dirty_n} g={good_n} hits={hits}  '
-        f'crack={_scan["crack"]:.0f} dirty={_scan["dirty"]:.0f} good={_scan["good"]:.0f}',
+        f'crack={crack_sc:.0f} dirty={dirty_sc:.0f} good={good_sc:.0f}',
         flush=True,
     )
     return label, max(conf, 1.0)
 
 
 def _scan_egg(seen: bool, scores: dict | None, shell: str = '') -> tuple[str, float]:
-    """Watch a real egg for 5 seconds. The classifier alone cannot keep an empty belt."""
+    """Watch a real egg briefly, then Clean/Crack. Early-exit when votes agree."""
     now = time.monotonic()
     with _scan_lock:
         if _scan['decided']:
@@ -2196,18 +2424,24 @@ def _scan_egg(seen: bool, scores: dict | None, shell: str = '') -> tuple[str, fl
             if _scan['start'] <= 0.0:
                 _scan['start'] = now
                 _scan['logged'] = -1
-                print(f'[scan] egg seen - counting {SCAN_SEC:.1f}s then Clean/Crack', flush=True)
+                print(f'[scan] egg seen - counting {SCAN_SEC:.1f}s then Clean/Crack/Dirty', flush=True)
             _scan['crack'] = max(_scan['crack'], crack)
             _scan['dirty'] = max(_scan['dirty'], dirty)
-            _scan['good'] = max(_scan['good'], good, dirty)
-            # Shell vision only — TF often says Crack on a clean/blurry egg.
-            # Dust/Dirty shell votes count as Clean (not a system grade).
-            if shell == 'crack':
+            _scan['good'] = max(_scan['good'], good)
+            # Shell + model votes: Crack / Dirty / Clean are separate grades.
+            # Model defects beat a soft shell=='clean' (blurry JPEG false-clean).
+            if shell == 'crack' or (crack >= CRACK_SCORE_MIN and crack >= dirty + 5.0 and crack >= good + 8.0):
                 _scan['crack_n'] = int(_scan['crack_n']) + 1
-            elif shell in ('clean', 'dirty'):
-                _scan['good_n'] = int(_scan['good_n']) + 1
-            elif good >= 65.0 and good >= crack + 10.0:
-                # Ambiguous vision: only TF-strong good may vote Clean.
+            elif shell == 'dirty' or (dirty >= DIRTY_SCORE_MIN and dirty >= crack + 5.0 and dirty >= good + 8.0):
+                _scan['dirty_n'] = int(_scan['dirty_n']) + 1
+            elif (
+                crack < CRACK_SCORE_MIN
+                and dirty < DIRTY_SCORE_MIN
+                and (
+                    shell == 'clean'
+                    or (good >= 65.0 and good >= crack + 10.0 and good >= dirty + 10.0)
+                )
+            ):
                 _scan['good_n'] = int(_scan['good_n']) + 1
             # else: no vote — empty-pad glare must not pile into Clean
         elif _scan['start'] <= 0.0:
@@ -2219,22 +2453,38 @@ def _scan_egg(seen: bool, scores: dict | None, shell: str = '') -> tuple[str, fl
         else:
             _scan['misses'] = int(_scan['misses']) + 1
         elapsed = now - _scan['start']
-        sec = int(elapsed)
-        if sec != _scan['logged'] and sec < int(SCAN_SEC):
+        sec = int(elapsed * 10)  # 0.1s ticks while the short scan runs
+        if sec != _scan['logged'] and elapsed < SCAN_SEC:
             _scan['logged'] = sec
-            print(
-                f'[scan] {sec}s / {int(SCAN_SEC)}s  '
-                f'crack={_scan["crack"]:.0f} good={_scan["good"]:.0f}  '
-                f'shell c={_scan["crack_n"]} g={_scan["good_n"]}',
-                flush=True,
+            if sec % 5 == 0:  # print ~every 0.5s
+                print(
+                    f'[scan] {elapsed:.1f}s / {SCAN_SEC:.1f}s  '
+                    f'crack={_scan["crack"]:.0f} dirty={_scan["dirty"]:.0f} '
+                    f'good={_scan["good"]:.0f}  '
+                    f'shell c={_scan["crack_n"]} d={_scan["dirty_n"]} g={_scan["good_n"]}',
+                    flush=True,
+                )
+        crack_n = int(_scan['crack_n'])
+        dirty_n = int(_scan['dirty_n'])
+        good_n = int(_scan['good_n'])
+        hits = int(_scan['hits'])
+        # Only after full SCAN_SEC (SCAN_EARLY_SEC defaults to same) unless all
+        # three vote buckets clearly agree earlier.
+        early_ready = (
+            elapsed >= SCAN_EARLY_SEC
+            and hits >= 4
+            and (
+                (crack_n >= 4 and crack_n > good_n and crack_n > dirty_n)
+                or (dirty_n >= 4 and dirty_n > good_n and dirty_n > crack_n)
+                or (good_n >= 4 and crack_n == 0 and dirty_n == 0)
             )
-        # Full 5s detection only — then decide + record instantly (weight still pending).
-        if elapsed < SCAN_SEC:
-            return 'Scanning', 0.0
-        if int(_scan['hits']) < 3:
-            _reset_scan()
-            return 'Empty Model', 0.0
-        return _scan_decision(now, elapsed)
+        )
+        if early_ready or elapsed >= SCAN_SEC:
+            if hits < 3:
+                _reset_scan()
+                return 'Empty Model', 0.0
+            return _scan_decision(now, elapsed)
+        return 'Scanning', 0.0
 
 
 def _jpg_url(stream_url: str) -> str:
@@ -2472,13 +2722,30 @@ def _overlay_live(frame, label: str, confidence: float, scores: dict | None = No
 def _ingest_jpeg(data: bytes) -> tuple[str, float, bool, bool, str, float]:
     global _last_count_at, _last_jpeg, _last_jpeg_at
     arr = np.frombuffer(data, dtype=np.uint8)
-    frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if frame is None:
+    full = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if full is None:
         return '', 0.0, False, False, '', 0.0
     global _egg_streak, _egg_lost
 
-    # 1) Detect egg on the belt only.
-    fresh = _detect_egg_boxes(frame)
+    # Detect on half-res (short GIL), track/shell on full-res boxes.
+    fh, fw = full.shape[:2]
+    if fw >= 240:
+        small = cv2.resize(full, (max(1, fw // 2), max(1, fh // 2)), interpolation=cv2.INTER_AREA)
+        sh, sw = small.shape[:2]
+        sx = fw / float(sw)
+        sy = fh / float(sh)
+
+        def _up(box):
+            x1, y1, x2, y2 = box
+            return (
+                int(round(x1 * sx)), int(round(y1 * sy)),
+                int(round(x2 * sx)), int(round(y2 * sy)),
+            )
+
+        fresh = [_up(b) for b in _detect_egg_boxes(small)]
+    else:
+        fresh = _detect_egg_boxes(full)
+    frame = full
     # 2) Always search near the predicted track when following — merge with fresh
     #    so a distant false detect cannot steal / drop a moving egg.
     with _track_lock:
@@ -2487,12 +2754,13 @@ def _ingest_jpeg(data: bytes) -> tuple[str, float, bool, bool, str, float]:
     near = _search_egg_near(frame, prev_box) if had_track else []
     detect_cands = _merge_track_candidates(fresh, near) if had_track else list(fresh)
 
-    # Keep ONLY confirmed egg ovals — drop metal, wood, belt, hands, fixtures.
+    # Soft JPEG over tunnel is blurry — looser shell gates so tracker can lock.
     egg_only: list = []
+    shell_need = 0.14 if not had_track else 0.18
     for box in detect_cands:
         if _box_is_metal_or_belt(frame, box):
             continue
-        if not _box_is_egg_shell(frame, box, min_shell=0.30):
+        if not _box_is_egg_shell(frame, box, min_shell=shell_need):
             continue
         if not _box_looks_like_egg(frame, box):
             continue
@@ -2521,7 +2789,7 @@ def _ingest_jpeg(data: bytes) -> tuple[str, float, bool, bool, str, float]:
             or _box_is_wood_board(frame, track_box)
             or (
                 detect_cands
-                and not _box_is_egg_shell(frame, track_box, min_shell=0.30)
+                and not _box_is_egg_shell(frame, track_box, min_shell=0.12)
             )
         ):
             _clear_tracker()
@@ -2534,11 +2802,11 @@ def _ingest_jpeg(data: bytes) -> tuple[str, float, bool, bool, str, float]:
             _clear_tracker()
 
     with _track_lock:
-        # Allow 1–2 miss frames so a blink does not drop DETECTING → waiting egg.
+        # Allow several miss frames so tunnel blinks do not drop DETECTING.
         tracking = (
             _track['box'] is not None
             and bool(_track.get('confirmed'))
-            and (bool(detect_cands) or int(_track.get('miss') or 0) < 2)
+            and (bool(detect_cands) or int(_track.get('miss') or 0) < 6)
         )
         if tracking:
             track_box = _track['box']
@@ -2546,15 +2814,16 @@ def _ingest_jpeg(data: bytes) -> tuple[str, float, bool, bool, str, float]:
         else:
             track_box = None
             track_id = 0
-            if not detect_cands and int(_track.get('miss') or 0) >= 2:
+            if not detect_cands and int(_track.get('miss') or 0) >= 6:
                 _track['confirmed'] = False
                 _track['box'] = None
 
     # Egg-only gate for count/detect — never scan belt/wood/metal as an egg.
+    # Soft shell fill (0.22) so a just-arrived egg is not dropped on glare.
     egg_visual = bool(
         tracking
         and track_box is not None
-        and _box_is_egg_shell(frame, track_box, min_shell=0.30)
+        and _box_is_egg_shell(frame, track_box, min_shell=0.12)
         and not _box_is_metal_or_belt(frame, track_box)
         and not _box_is_wood_board(frame, track_box)
     )
@@ -2564,14 +2833,14 @@ def _ingest_jpeg(data: bytes) -> tuple[str, float, bool, bool, str, float]:
         tracking = False
     shaped_now = [tuple(int(round(v)) for v in track_box)] if egg_visual else []
 
-    # Classify sparsely so TF never piles up behind a laggy Wi‑Fi push.
-    # Empty belt: almost never run TF (vision already said no egg) → less hang.
-    # Vision oval = egg. TF is optional — if the model is down, still DETECT.
+    # Never run TF before the egg is locked — TF was blocking first detect.
+    # Default CLASSIFY_TF=0: shell vision only (smooth live over tunnel).
     global _classify_tick
     _classify_tick += 1
-    run_model = (egg_visual and _classify_tick % 3 == 1) or (
-        (not egg_visual) and bool(detect_cands) and _classify_tick % 5 == 1
-    )
+    # Skip paint encode on live path — re-JPEG made motion look late. HUD uses
+    # live-status; pixels stay the newest raw CAM push.
+    # During the 5s scan, run crack/dirty nets often enough to vote.
+    run_model = bool(CLASSIFY_TF) and bool(egg_visual) and (_classify_tick % 4 == 1)
     label = str(metrics.get('lastLabel') or 'Empty Model')
     confidence = float(metrics.get('lastConfidence') or 0.0)
     scores: dict = {}
@@ -2605,77 +2874,78 @@ def _ingest_jpeg(data: bytes) -> tuple[str, float, bool, bool, str, float]:
         _last_seen_egg = True
         with _egg_pipe_lock:
             scale_busy = bool(_egg_pipe.get('awaiting_weight'))
-        if scale_busy:
-            # 1 egg = 1 detect = 1 weigh. Keep showing Clean (not DETECTING).
-            with _scan_lock:
-                _reset_scan()
+            opened_at = float(_egg_pipe.get('opened_at') or 0.0)
+        # Always run shell scan while locked — sticky scale-await used to skip
+        # this and freeze DETECTING. _commit_camera_detection still dedupes.
+        if scale_busy and opened_at and (time.monotonic() - opened_at) > AWAIT_WEIGHT_TIMEOUT_SEC:
             with _egg_pipe_lock:
-                pipe_cam = str(_egg_pipe.get('camera') or 'Clean')
-            picked = 'Crack Egg' if 'crack' in pipe_cam.lower() else 'Clean Egg'
-            pconf = 80.0
-            scanning = False
-            metrics['lastLabel'] = picked
-            metrics['lastConfidence'] = 80.0
-            shown = _camera_label(picked) or 'Clean'
-            cat = counting_category(picked)
-            reject = cat == 'crackedEggs'
-            identified = True
-        else:
-            raw_good, raw_crack, raw_dirty = _score_buckets(scores)
-            shell = _shell_quality(frame, shaped_now[0]) if shaped_now else ''
-            # Never let the TF model alone force CRACK — it false-fires on blur/glare.
-            # Dust/Dirty model scores are ignored (not a system grade).
+                _egg_pipe['awaiting_weight'] = False
+                _egg_pipe['id'] = ''
+            scale_busy = False
+            print('[egg] cleared awaiting_weight during view — resuming detect', flush=True)
+        raw_good, raw_crack, raw_dirty = _score_buckets(scores)
+        shell = _shell_quality(frame, shaped_now[0]) if shaped_now else ''
+        # Model-only dirty/crack when shell vision is unsure (soft JPEG).
+        if shaped_now and shell == '':
             if (
-                shaped_now
-                and shell == ''
-                and raw_dirty >= 78.0
-                and raw_dirty >= raw_crack + 8.0
-                and raw_dirty >= raw_good + 10.0
+                raw_crack >= CRACK_SCORE_MIN
+                and raw_crack >= raw_dirty + 5.0
+                and raw_crack >= raw_good + 8.0
             ):
-                shell = 'clean'
-            # No TF scores: still classify from shell vision so CLEAN/CRACK show up.
-            if shell and not scores:
-                scores = _apply_shell({}, shell)
-            elif shell:
-                scores = _apply_shell(scores, shell)
-            picked, pconf = _scan_egg(True, scores, shell)
-            scanning = picked == 'Scanning'
-            commit_now = False
-            commit_label = ''
-            commit_conf = 0.0
-            with _scan_lock:
-                if _scan['decided']:
-                    picked = _scan['decided']
-                    pconf = max(pconf, 80.0)
-                    _scan['last_seen'] = time.monotonic()
-                    scanning = False
-                    if not _scan.get('committed'):
-                        _scan['committed'] = True
-                        commit_now = True
-                        commit_label = picked
-                        commit_conf = pconf
-                elif _scan['start'] > 0.0:
-                    picked = 'Scanning'
-                    scanning = True
-            if commit_now:
-                _commit_camera_detection(commit_label, commit_conf)
-            if scanning or is_empty_frame(picked) or picked == 'Waiting Scale':
-                picked = 'Scanning' if scanning else ('Waiting Scale' if picked == 'Waiting Scale' else 'Egg')
-                pconf = max(pconf, 1.0)
-            cat = counting_category(picked)
-            reject = cat == 'crackedEggs'
-            identified = cat in ('crackedEggs', 'goodEggs')
-            if reject:
-                metrics['lastLabel'] = picked
-            elif cat == 'goodEggs':
-                metrics['lastLabel'] = 'Clean Egg'
-                picked = 'Clean Egg'
-            else:
-                metrics['lastLabel'] = 'Scanning' if scanning else picked
-            metrics['lastConfidence'] = round(max(pconf, 1.0), 1)
-            shown = _camera_label(picked) or ('Waiting' if picked == 'Waiting Scale' else 'Clean')
-            # Do NOT attach weight while the egg is still in the camera FOV.
-            # Grams must come from DevKit POST /weight after the egg reaches the pad.
+                shell = 'crack'
+            elif (
+                raw_dirty >= DIRTY_SCORE_MIN
+                and raw_dirty >= raw_crack + 5.0
+                and raw_dirty >= raw_good + 8.0
+            ):
+                shell = 'dirty'
+        # Shell vision + model scores feed Clean / Crack / Dirty.
+        if shell and not scores:
+            scores = _apply_shell({}, shell)
+        elif shell:
+            scores = _apply_shell(scores, shell)
+        picked, pconf = _scan_egg(True, scores, shell)
+        scanning = picked == 'Scanning'
+        commit_now = False
+        commit_label = ''
+        commit_conf = 0.0
+        with _scan_lock:
+            if _scan['decided']:
+                picked = _scan['decided']
+                pconf = max(pconf, 80.0)
+                _scan['last_seen'] = time.monotonic()
+                scanning = False
+                if not _scan.get('committed'):
+                    _scan['committed'] = True
+                    commit_now = True
+                    commit_label = picked
+                    commit_conf = pconf
+            elif _scan['start'] > 0.0:
+                picked = 'Scanning'
+                scanning = True
+        if commit_now:
+            _commit_camera_detection(commit_label, commit_conf)
+        if scanning or is_empty_frame(picked) or picked == 'Waiting Scale':
+            picked = 'Scanning' if scanning else ('Waiting Scale' if picked == 'Waiting Scale' else 'Egg')
+            pconf = max(pconf, 1.0)
+        cat = counting_category(picked)
+        reject = cat == 'crackedEggs'
+        identified = cat in ('crackedEggs', 'dirtyEggs', 'goodEggs')
+        if cat == 'crackedEggs':
+            metrics['lastLabel'] = 'Crack Egg'
+            picked = 'Crack Egg'
+        elif cat == 'dirtyEggs':
+            metrics['lastLabel'] = 'Dirty Egg'
+            picked = 'Dirty Egg'
+        elif cat == 'goodEggs':
+            metrics['lastLabel'] = 'Clean Egg'
+            picked = 'Clean Egg'
+        else:
+            metrics['lastLabel'] = 'Scanning' if scanning else picked
+        metrics['lastConfidence'] = round(max(pconf, 1.0), 1)
+        shown = _camera_label(picked) or ('Waiting' if picked == 'Waiting Scale' else 'Clean')
+        # Do NOT attach weight while the egg is still in the camera FOV.
+        # Grams must come from DevKit POST /weight after the egg reaches the pad.
     else:
         with _scan_lock:
             _reset_scan()
@@ -2760,8 +3030,37 @@ def _stream_url(jpg_url: str) -> str:
 
 
 def grab_worker():
-    """Live = CAM POST /api/frame. Rare :82 pull only if push is dead (don't fight Wi‑Fi)."""
-    print('[worker] live = CAM PUSH /api/frame (pull :82 only as rare backup)', flush=True)
+    """Internet / tunnel mode: wait for CAM HTTPS POST /api/frame only.
+
+    Extender AP isolation blocks PC→CAM :82 pulls. Pulling just wastes time and
+    made the dashboard show Connecting camera… / frozen frames.
+    """
+    push_only = os.environ.get('CAM_PUSH_ONLY', '1').strip() not in ('0', 'false', 'no')
+    if push_only:
+        print('[worker] live = INTERNET CAM PUSH only (no LAN :82 pull)', flush=True)
+        stale_log_at = 0.0
+        while True:
+            try:
+                with _raw_lock:
+                    raw_age = (time.monotonic() - _last_raw_at) if _last_raw_at else 999.0
+                if raw_age < 2.0:
+                    time.sleep(0.15)
+                    continue
+                now = time.monotonic()
+                if now - stale_log_at > 8.0:
+                    stale_log_at = now
+                    print(
+                        f'[worker] waiting for CAM tunnel POST /api/frame '
+                        f'(age={raw_age:.1f}s) — keep cloudflared + CAM online',
+                        flush=True,
+                    )
+                time.sleep(0.5)
+            except Exception as exc:
+                print(f'[worker] grab_worker recovered: {exc}', flush=True)
+                time.sleep(0.5)
+        return
+
+    print('[worker] live = CAM PUSH; pull :82 when frames go stale', flush=True)
     global _cam_pick
     fail = 0
     sess = requests.Session()
@@ -2769,37 +3068,32 @@ def grab_worker():
     sess.mount('http://', adapter)
     while True:
         try:
-            online = _hardware_online()
             with _raw_lock:
                 raw_age = (time.monotonic() - _last_raw_at) if _last_raw_at else 999.0
-            # Healthy push — never pull (laptop→CAM :82 steals Wi‑Fi and causes lag).
-            if raw_age < 3.0:
-                time.sleep(0.25)
+            if raw_age < 2.0:
+                time.sleep(0.2)
                 continue
-            if not online:
-                time.sleep(1.5)
-                continue
-            # Push missing >3s — one rare :82 pull (often blocked by AP isolation).
             jpg_url = _jpg_url(_grab_urls()[_cam_pick % len(_grab_urls())])
             try:
-                r = sess.get(jpg_url, timeout=(0.4, 1.0), headers={'Connection': 'close'})
+                r = sess.get(jpg_url, timeout=(0.4, 0.8), headers={'Connection': 'close'})
                 body = r.content or b''
                 if r.status_code == 200 and len(body) >= 200 and body[:2] == b'\xff\xd8':
                     _store_live_jpeg(body)
                     fail = 0
-                else:
-                    raise RuntimeError(f'bad jpg {r.status_code} {len(body)}')
+                    time.sleep(0.08)
+                    continue
+                raise RuntimeError(f'bad jpg {r.status_code} {len(body)}')
             except Exception as exc:
                 fail += 1
-                if fail == 1 or fail % 20 == 0:
+                if fail == 1 or fail % 15 == 0:
                     print(
-                        f'[worker] waiting CAM push (pull blocked/slow): {exc}',
+                        f'[worker] no CAM frames (push dead / :82 blocked): {exc}',
                         flush=True,
                     )
-                if fail % 8 == 0:
+                if fail % 6 == 0:
                     _discover_cam_async()
                     _cam_pick += 1
-                time.sleep(1.5)
+                time.sleep(1.0)
         except Exception as exc:
             print(f'[worker] grab_worker recovered: {exc}', flush=True)
             time.sleep(0.5)
@@ -2863,7 +3157,7 @@ _sane_tick = 0
 
 def _jpeg_frame_sane(jpg: bytes, deep: bool = False) -> bool:
     """Fast EOI check always; full magenta decode only occasionally (deep=True)."""
-    if not jpg or len(jpg) < 800 or jpg[:2] != b'\xff\xd8':
+    if not jpg or len(jpg) < 200 or jpg[:2] != b'\xff\xd8':
         return False
     if b'\xff\xd9' not in jpg[-96:]:
         return False
@@ -2892,12 +3186,12 @@ def _jpeg_frame_sane(jpg: bytes, deep: bool = False) -> bool:
 
 def _store_live_jpeg(jpg: bytes) -> None:
     global _last_raw, _last_raw_at, _preview, _preview_at, _raw_seq, _sane_tick
-    if not jpg or len(jpg) < 800 or jpg[:2] != b'\xff\xd8':
+    if not jpg or len(jpg) < 200 or jpg[:2] != b'\xff\xd8':
         return
-    # Hot path: EOI only. Deep magenta check ~every 12th frame so live stays smooth.
+    # Hot path (often on asyncio): EOI only. Deep magenta decode belongs in
+    # classify_worker — never on /api/frame or the event loop wedges.
     _sane_tick += 1
-    deep = (_sane_tick % 12 == 1)
-    if not _jpeg_frame_sane(jpg, deep=deep):
+    if not _jpeg_frame_sane(jpg, deep=False):
         return
     now = time.monotonic()
     with _raw_lock:
@@ -2907,43 +3201,68 @@ def _store_live_jpeg(jpg: bytes) -> None:
         _preview_at = now
         _raw_seq += 1
         seq = _raw_seq
-    # Paint track box when confirmed; _paint_view_fast returns RAW instantly if no track
-    # (empty belt stays smooth). Overlay was disabled for lag and looked like "no tracker".
-    _publish_view(jpg, seq, paint=True)
+    # Always publish RAW on the CAM push path — paint/decode here stalled HTTP
+    # and made the egg look late on /live.jpg while the CAM waited for 200 OK.
+    _publish_view(jpg, seq, paint=False)
     if seq == 1 or seq % 40 == 0:
         print(f'[live] got JPEG {len(jpg)}B from CAM (seq={seq})', flush=True)
 
 
 def classify_worker():
-    """Classify newest frame only. Skip stale frames so live view does not lag."""
+    """Classify newest frame only. Skip stale frames so live view does not lag.
+
+    TF predict holds the GIL and freezes uvicorn's event loop in-process.
+    Cap each tick and always sleep afterward so /live.jpg stays reachable.
+    """
+    enabled = os.environ.get('CLASSIFY_ENABLED', '1').strip().lower() not in (
+        '0', 'false', 'no',
+    )
+    if not enabled:
+        print('[worker] classify DISABLED (CLASSIFY_ENABLED=0) — live view only', flush=True)
+        while True:
+            time.sleep(2.0)
+            with _raw_lock:
+                raw_at = _last_raw_at
+            age = (time.monotonic() - raw_at) if raw_at else 999.0
+            if age >= TRACK_STALE_CLEAR_SEC:
+                _clear_tracker()
+        return
     last = b''
     last_seq = -1
     while True:
         with _raw_lock:
             data = _last_raw
             seq = _raw_seq
+            raw_at = _last_raw_at
+        age = (time.monotonic() - raw_at) if raw_at else 999.0
+        if age >= TRACK_STALE_CLEAR_SEC:
+            _clear_tracker()
         if not data or data is last or seq == last_seq:
             time.sleep(0.01)
             continue
         # Drop backlog: if many frames arrived while TF ran, jump to newest.
         last = data
         last_seq = seq
+        t0 = time.monotonic()
         try:
             _ingest_jpeg(data)
-            # Re-paint newest RAW with updated track (box/label). Cheap when no track.
-            with _raw_lock:
-                newest = _last_raw
-                newest_seq = _raw_seq
-            if newest and newest_seq == seq:
-                _publish_view(newest, newest_seq, paint=True)
+            # Do NOT paint over live view — decode/draw made the egg look late.
+            # Live pixels stay the newest raw from /api/frame only.
         except Exception as exc:
             print(f'[worker] classify fail: {exc}', flush=True)
+        took = time.monotonic() - t0
+        heavy = bool(CLASSIFY_TF) and took >= 0.12
         # After classify, prefer the freshest raw (do not process a queue of old frames).
         with _raw_lock:
             if _raw_seq != last_seq:
                 last = b''  # force take newest next loop
+                if heavy:
+                    time.sleep(min(1.0, CLASSIFY_HEAVY_SLEEP_SEC))
                 continue
-        time.sleep(CLASSIFY_SLEEP_SEC)
+        if heavy:
+            time.sleep(min(1.0, CLASSIFY_HEAVY_SLEEP_SEC))
+        else:
+            time.sleep(CLASSIFY_SLEEP_SEC)
 
 
 def stream_worker():
@@ -3072,8 +3391,8 @@ def _hardware_status_response(body: dict | None = None):
         pipe_cam = str(_egg_pipe.get('camera') or '')
         awaiting_weight = bool(_egg_pipe.get('awaiting_weight'))
         opened_at = float(_egg_pipe.get('opened_at') or 0.0)
-        # Match DevKit WEIGH_ARMED_MS (120s) so late pad locks still link.
-        if awaiting_weight and opened_at and (now - opened_at) > 120.0:
+        # Short timeout so live detect/tracker is not stuck on "Clean / wait scale".
+        if awaiting_weight and opened_at and (now - opened_at) > AWAIT_WEIGHT_TIMEOUT_SEC:
             timed_id = pipe_id
             _egg_pipe['awaiting_weight'] = False
             _egg_pipe['id'] = ''
@@ -3081,14 +3400,16 @@ def _hardware_status_response(body: dict | None = None):
             pipe_id = ''
             for rec in detection_records:
                 if str(rec.get('id') or '') == timed_id:
-                    # Clear sticky await so the next egg can detect; /weight can
-                    # still attach later via unweighted-row fallback.
                     rec['awaitingWeight'] = False
                     if rec.get('weightGrams') is None:
                         rec['sizeClass'] = 'pending'
                     break
             _save_live_detections()
-            print('[egg] awaiting_weight timed out (120s) — next egg may detect', flush=True)
+            print(
+                f'[egg] awaiting_weight timed out ({AWAIT_WEIGHT_TIMEOUT_SEC:.0f}s) '
+                '— next egg may detect',
+                flush=True,
+            )
     if egg_seen and awaiting_weight and pipe_cam:
         pl = pipe_cam.lower()
         if 'crack' in pl or 'dirty' in pl:
@@ -3419,14 +3740,12 @@ def _merge_detection_rows(incoming: list) -> int:
         cat = str(item.get('category') or '')
         if not cat:
             low = lab.lower()
-            cat = (
-                'crackedEggs'
-                if ('crack' in low and 'no crack' not in low)
-                else 'goodEggs'
-            )
-        if cat == 'dirtyEggs':
-            cat = 'goodEggs'
-            lab = 'Clean'
+            if 'crack' in low and 'no crack' not in low:
+                cat = 'crackedEggs'
+            elif 'dirty' in low or 'soil' in low or 'stain' in low:
+                cat = 'dirtyEggs'
+            else:
+                cat = 'goodEggs'
         row = {
             'id': rid,
             'timestamp': str(item.get('timestamp') or time.strftime('%Y-%m-%d %H:%M:%S')),
@@ -3465,15 +3784,19 @@ def _merge_detection_rows(incoming: list) -> int:
     detection_records.extend(ordered)
     good_n = 0
     crack_n = 0
+    dirty_n = 0
     for row in detection_records:
         cat = str(row.get('category') or '').lower()
         lab = str(row.get('label') or '').lower()
         if cat == 'crackedeggs' or ('crack' in lab and 'no crack' not in lab):
             crack_n += 1
+        elif cat == 'dirtyeggs' or 'dirty' in lab or 'soil' in lab or 'stain' in lab:
+            dirty_n += 1
         else:
             good_n += 1
     metrics['goodEggs'] = max(int(metrics.get('goodEggs') or 0), good_n)
     metrics['crackedEggs'] = max(int(metrics.get('crackedEggs') or 0), crack_n)
+    metrics['dirtyEggs'] = max(int(metrics.get('dirtyEggs') or 0), dirty_n)
     _save_live_detections()
     return added
 
@@ -3495,6 +3818,7 @@ async def restore_records(request: Request):
         'total': len(detection_records),
         'goodEggs': int(metrics.get('goodEggs') or 0),
         'crackedEggs': int(metrics.get('crackedEggs') or 0),
+        'dirtyEggs': int(metrics.get('dirtyEggs') or 0),
     }
 
 
@@ -3524,16 +3848,29 @@ def api_egg_sync():
 
 
 @app.get('/health')
-def get_health():
-    payload = _public_metrics()
-    cam = bool(metrics.get('connected'))
-    hw = bool(payload['hardwareOnline'])
+async def get_health():
+    # Stay on the event loop — never touch _public_metrics / threadpool.
+    # A hung sync /health + /stream workers wedged the whole farm under tunnel load.
+    now = time.monotonic()
+    with _raw_lock:
+        raw_at = _last_raw_at
+        has_raw = bool(_last_raw)
+    frame_age = (now - raw_at) if raw_at else 999.0
+    cam = bool(has_raw and frame_age <= LIVE_VIEW_MAX_AGE_SEC)
+    hw = _hardware_online()
     return {
         'backend': 'ready',
-        'connected': cam,  # same key as /metrics so hosted clients stay LIVE
+        'ok': True,
+        'connected': cam,
         'cameraConnected': cam,
         'hardwareOnline': hw,
-        'status': payload['status'] if (cam or hw) else 'Running — waiting for ESP32-CAM',
+        'frameLive': cam,
+        'frameAgeMs': int(round(min(frame_age, 99.0) * 1000)),
+        'status': (
+            'Running'
+            if (cam or hw)
+            else 'Running — waiting for ESP32-CAM'
+        ),
     }
 
 
@@ -3550,16 +3887,29 @@ def _jpeg_response(data: bytes):
     )
 
 
+_PLACEHOLDER_JPEG: bytes | None = None
+
+
 def _placeholder_jpeg():
-    """Calm blank only — never put flash/power troubleshooting text on /watch."""
-    img = np.zeros((480, 800, 3), dtype=np.uint8)
+    """Calm blank only — never put flash/power troubleshooting text on /watch.
+
+    Cached once. Re-encoding 800x480 on every /live.jpg poll blocked the
+    asyncio loop under tunnel load and made health + live.jpg time out.
+    """
+    global _PLACEHOLDER_JPEG
+    cached = _PLACEHOLDER_JPEG
+    if cached:
+        return cached
+    img = np.zeros((240, 400, 3), dtype=np.uint8)
     img[:] = (28, 24, 22)
     cv2.putText(
-        img, "Connecting camera…", (36, 250),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (200, 196, 190), 2, cv2.LINE_AA,
+        img, "Waiting for internet camera...", (18, 128),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 196, 190), 1, cv2.LINE_AA,
     )
-    ok, buf = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-    return buf.tobytes() if ok else b''
+    ok, buf = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+    cached = buf.tobytes() if ok else b''
+    _PLACEHOLDER_JPEG = cached
+    return cached
 
 
 def _preview_jpeg(data: bytes) -> tuple[bytes, tuple[int, int]]:
@@ -3639,7 +3989,8 @@ def _pull_cam_jpeg_once() -> bytes:
     try:
         _pull_at = time.monotonic()
         url = _cam_jpg_url()
-        r = _jpg_session.get(url, timeout=(2.0, 6.0), headers={'Connection': 'close'})
+        # Short timeouts — unreachable LAN CAM must not block grab_worker.
+        r = _jpg_session.get(url, timeout=(0.4, 0.8), headers={'Connection': 'close'})
         if r.status_code == 200 and len(r.content) >= 200 and r.content[:2] == b'\xff\xd8':
             _store_live_jpeg(r.content)
             return r.content
@@ -3651,58 +4002,86 @@ def _pull_cam_jpeg_once() -> bytes:
         return _last_raw or b''
 
 
-# Fresh enough to count as live. Allow short Wi‑Fi gaps without flashing blank.
-LIVE_VIEW_MAX_AGE_SEC = 6.0
-# Keep showing the last good picture during longer blips (no error card on /watch).
+# Tunnel HTTPS from ESP32 is bursty on weak internet. LIVE badge uses a short
+# window; /live.jpg keeps the last real picture much longer so the UI does not
+# flash the "Waiting for internet camera" placeholder over a good frame.
+# Short LIVE window — old frames must not look like a live hand-in-view stream.
+# Realtime egg detect over tunnel: LIVE while frames arrive (~1–2 fps).
+# Do NOT clear the egg tracker from /live.jpg polls — UI hits this many times
+# per second and was wiping DETECTING between pushes.
+LIVE_VIEW_MAX_AGE_SEC = 3.5
 LIVE_VIEW_HOLD_SEC = 60.0
+# Only drop track when the CAM stream is truly gone (not a 2s tunnel gap).
+TRACK_STALE_CLEAR_SEC = 8.0
 
 
-def _latest_view_jpeg() -> bytes:
-    """Prefer a live frame; on brief drops hold last picture; never show tip cards."""
+def _latest_view_jpeg() -> tuple[bytes, str, int]:
+    """Return (jpeg, kind, age_ms). kind: live | hold | wait.
+
+    Never pull CAM :82 here. Extender AP isolation makes LAN :82 hang.
+    Never decode/encode here — request path must stay microseconds.
+    Prefer painted overlay only when it matches the newest raw seq — otherwise
+    a stale paint freezes the live view while CAM keeps pushing.
+    """
     now = time.monotonic()
     with _raw_lock:
         raw_at = _last_raw_at
         has_raw = bool(_last_raw)
         raw = _last_raw if has_raw else b''
-    age = (now - raw_at) if raw_at else 999.0
+        raw_seq = _raw_seq
     with _view_lock:
-        view = _view_jpeg
-    if age <= LIVE_VIEW_MAX_AGE_SEC:
+        view = _view_jpeg if _view_jpeg and _view_jpeg[:2] == b'\xff\xd8' else b''
+        view_seq = _view_seq
+    age = (now - raw_at) if raw_at else 999.0
+    age_ms = int(round(min(age, 999.0) * 1000))
+    # Fresh raw wins. Painted box is OK only for the same frame seq.
+    if view and view_seq == raw_seq:
+        show = view
+    else:
+        show = raw or view
+    if has_raw and age <= LIVE_VIEW_MAX_AGE_SEC:
         metrics['connected'] = True
-        if view:
-            return view
-        if raw:
-            return raw
-    # Frame went stale — pull once from CAM :82 before giving up.
-    if age > 1.2:
-        pulled = _pull_cam_jpeg_once()
-        if pulled and pulled[:2] == b'\xff\xd8':
-            metrics['connected'] = True
-            with _view_lock:
-                if _view_jpeg:
-                    return _view_jpeg
-            return pulled
-    if age >= 2.5:
-        _clear_tracker()
-    # Hold last good JPEG so /watch stays on picture, not an error screen.
-    if has_raw and age <= LIVE_VIEW_HOLD_SEC:
-        metrics['connected'] = age <= LIVE_VIEW_MAX_AGE_SEC
-        return view or raw
+        return show or raw, 'live', age_ms
+    # Defer tracker clear off the /live.jpg hot path — UI polls this hard.
+    if has_raw and age <= LIVE_VIEW_HOLD_SEC and raw[:2] == b'\xff\xd8':
+        # Keep last real pixels on slow links — do not swap in placeholder.
+        metrics['connected'] = False
+        return show or raw, 'hold', age_ms
     metrics['connected'] = False
-    return _placeholder_jpeg()
+    return _placeholder_jpeg(), 'wait', age_ms
 
 
 @app.get('/live.jpg')
 @app.get('/live.jpgg')
-def live_jpg():
-    # No-store still so the browser never shows a buffered old frame.
-    return _jpeg_response(_latest_view_jpeg())
+async def live_jpg():
+    # Async + zero OpenCV on this path so tunnel polls cannot wedge uvicorn.
+    data, kind, age_ms = _latest_view_jpeg()
+    return Response(
+        content=data,
+        media_type='image/jpeg',
+        headers={
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Expose-Headers': 'X-Egg-Frame, X-Frame-Age-Ms',
+            'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+            'Pragma': 'no-cache',
+            'Expires': '0',
+            # Drop idle tunnel sockets quickly so CF cannot pin the origin.
+            'Connection': 'close',
+            'X-Egg-Frame': kind,
+            'X-Frame-Age-Ms': str(age_ms),
+        },
+    )
 
 
 @app.get('/stream')
-def proxy_stream():
-    """MJPEG: emit ONLY when a new frame arrives — never replay the same JPEG
-    (replaying filled the browser buffer → hand stayed after you moved)."""
+async def proxy_stream(request: Request):
+    """LAN MJPEG only. Cloudflare must use /live.jpg — open /stream pins workers."""
+    if _from_cloudflare(request):
+        return JSONResponse(
+            {'error': 'use /live.jpg over tunnel', 'code': 'stream_disabled'},
+            status_code=404,
+        )
+
     def generate():
         seen = -1
         while True:
@@ -3710,16 +4089,16 @@ def proxy_stream():
             with _raw_lock:
                 raw_at = _last_raw_at
                 raw = _last_raw
+                seq = _raw_seq
             age = (now - raw_at) if raw_at else 999.0
-            with _view_lock:
-                data = _view_jpeg
-                seq = _view_seq
-            if age > LIVE_VIEW_MAX_AGE_SEC or not data:
-                # Hold last real frame — never replace with troubleshooting JPEG.
-                if raw and age <= LIVE_VIEW_HOLD_SEC and raw[:2] == b'\xff\xd8':
-                    data = raw
-                else:
-                    data = _placeholder_jpeg()
+            # Stream newest raw only — never the painted/view copy.
+            if raw and age <= LIVE_VIEW_MAX_AGE_SEC and raw[:2] == b'\xff\xd8':
+                data = raw
+            elif raw and age <= LIVE_VIEW_HOLD_SEC and raw[:2] == b'\xff\xd8':
+                data = raw
+                seq = -1
+            else:
+                data = _placeholder_jpeg()
                 seq = -1
             if data and seq != seen:
                 seen = seq
@@ -3729,7 +4108,7 @@ def proxy_stream():
                     + data + b'\r\n'
                 )
             else:
-                time.sleep(0.008)
+                time.sleep(0.02)
 
     return StreamingResponse(
         generate(),
@@ -3760,7 +4139,8 @@ def live_status():
         and (not _last_raw or _last_raw[:2] == b'\xff\xd8')
     )
     hb_live = _hardware_online()
-    if not frame_live and frame_age > 2.0:
+    # Realtime detect: only clear after a long CAM gap (not every /metrics poll).
+    if not frame_live and frame_age > TRACK_STALE_CLEAR_SEC:
         _clear_tracker()
     metrics['connected'] = bool(frame_live)
     egg_now = bool(_egg_in_view)
@@ -3833,11 +4213,8 @@ def live_status():
     }
 
 
-@app.get('/watch')
-@app.get('/live')
-@app.get('/camera')
-def live_watch():
-    page = """<!doctype html>
+# Served from the threaded front door too — CF /watch must not wait on busy uvicorn.
+_WATCH_PAGE_HTML = """<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
@@ -3863,14 +4240,14 @@ def live_watch():
 <script>
 const cam = document.getElementById('cam');
 const hud = document.getElementById('hud');
-// v4: one in-flight /live.jpg (no abort spam) — fixes Cloudflare lag + false offline.
+// v5: front-door /watch + one in-flight /live.jpg (no CF 502 on busy uvicorn).
 let pulling = false;
 let lastBlobAt = 0;
 async function pullFrame() {
   if (pulling) return;
   pulling = true;
   try {
-    const r = await fetch('/live.jpg?t=' + Date.now() + '&v=4', {
+    const r = await fetch('/live.jpg?t=' + Date.now() + '&v=5', {
       cache: 'no-store',
       headers: { 'Cache-Control': 'no-cache' },
     });
@@ -3885,8 +4262,9 @@ async function pullFrame() {
   } catch (e) {}
   finally { pulling = false; }
 }
-setInterval(pullFrame, 120);
+setInterval(pullFrame, 140);
 pullFrame();
+setInterval(pullFrame, 280);
 async function hudTick() {
   try {
     const s = await fetch('/live-status?t=' + Date.now(), {cache:'no-store'});
@@ -3895,16 +4273,24 @@ async function hudTick() {
       hud.className = '';
       const age = (typeof j.frameAgeMs === 'number') ? j.frameAgeMs : 9999;
       const blobAge = lastBlobAt ? (Date.now() - lastBlobAt) : 99999;
-      // Hold last picture through short CAM Wi‑Fi gaps — never flash tip cards.
       const hasPic = (!!(j.frameLive) && age < 8000) || blobAge < 8000;
-      const eggOn = !!(j.tracking || j.scanning);
+      const eggOn = !!(j.tracking || j.scanning || j.awaitingWeight);
+      const pipe = String(j.pipeCamera || '').toLowerCase();
       if (!hasPic) {
-        hud.textContent = j.hardwareOnline ? 'connecting…' : 'connecting…';
+        hud.textContent = 'connecting…';
+      } else if (j.awaitingWeight) {
+        if (j.quality === 'crack' || pipe === 'crack') {
+          hud.className = 'crack';
+          hud.textContent = 'CRACK — waiting scale';
+        } else if (j.quality === 'dirty' || pipe === 'dirty') {
+          hud.className = 'dirty';
+          hud.textContent = 'DIRTY — waiting scale';
+        } else {
+          hud.className = 'clean';
+          hud.textContent = 'CLEAN — waiting scale';
+        }
       } else if (!eggOn || j.quality === 'empty') {
         hud.textContent = 'waiting egg';
-      } else if (j.awaitingWeight && (j.quality === 'clean' || j.pipeCamera === 'Clean')) {
-        hud.className = 'clean';
-        hud.textContent = 'CLEAN — waiting scale';
       } else if (j.quality === 'clean') {
         hud.className = 'clean';
         hud.textContent = 'CLEAN';
@@ -3917,7 +4303,7 @@ async function hudTick() {
       } else if (j.quality === 'scanning' || j.scanning) {
         hud.className = 'scanning';
         const left = (typeof j.scanLeft === 'number') ? j.scanLeft : 0;
-        const total = (typeof j.scanTotal === 'number' && j.scanTotal > 0) ? j.scanTotal : 2.0;
+        const total = (typeof j.scanTotal === 'number' && j.scanTotal > 0) ? j.scanTotal : 5.0;
         const done = Math.min(total, Math.max(0, total - left));
         hud.textContent = 'DETECTING… ' + done.toFixed(1) + 's / ' + total.toFixed(1) + 's';
       } else {
@@ -3931,8 +4317,14 @@ hudTick();
 </script>
 </body>
 </html>"""
+
+
+@app.get('/watch')
+@app.get('/live')
+@app.get('/camera')
+def live_watch():
     return HTMLResponse(
-        content=page,
+        content=_WATCH_PAGE_HTML,
         headers={
             'Access-Control-Allow-Origin': '*',
             'Cache-Control': 'no-store',
@@ -3992,15 +4384,21 @@ async def receive_frame(request: Request):
     """ESP32-CAM pushes JPEG here. Store fast; classify_worker does the heavy work."""
     data = await request.body()
     if len(data) < 200 or data[:2] != b'\xff\xd8':
-        return JSONResponse({'ok': False, 'error': 'empty'}, status_code=400)
-    # Store only — keep response tiny so CAM can push ~every 30 ms.
+        return Response(status_code=400)
+    # Empty 200 — any JSON/lock work here delayed the next CAM frame.
     _store_live_jpeg(data)
-    scanning, _ = _scan_active()
-    return {
-        'ok': True,
-        'eggSeen': bool(_egg_in_view) or scanning,
-        'scanning': scanning,
-    }
+    # Tiny body + explicit keep-alive so CF/tunnel can reuse the ESP32 TLS
+    # session (full handshake each frame = multi-second lag).
+    return Response(
+        content=b'ok',
+        status_code=200,
+        media_type='text/plain',
+        headers={
+            'Connection': 'keep-alive',
+            'Keep-Alive': 'timeout=30, max=1000',
+            'Content-Length': '2',
+        },
+    )
 
 
 @app.post('/weight')
@@ -4095,17 +4493,14 @@ async def receive_weight(request: Request):
             with _weight_lock:
                 _pending_weight = None
         if not linked:
-            # Last chance: newest unweighted Clean row (pending or timed-out).
+            # Last chance: newest unweighted Clean/Crack/Dirty row.
             pending = _latest_pending_detection()
             if pending is None:
                 for rec in reversed(list(detection_records)):
                     if rec.get('weightGrams') is not None:
                         continue
                     cat = str(rec.get('category') or '')
-                    lab = str(rec.get('label') or '').lower()
-                    if cat == 'crackedEggs' or (
-                        'crack' in lab and 'no crack' not in lab
-                    ):
+                    if cat not in ('goodEggs', 'crackedEggs', 'dirtyEggs'):
                         continue
                     pending = rec
                     break
@@ -4113,10 +4508,14 @@ async def receive_weight(request: Request):
                 with _egg_pipe_lock:
                     _egg_pipe['id'] = str(pending.get('id'))
                     cam = str(pending.get('label') or 'Clean')
-                    _egg_pipe['camera'] = (
-                        'Crack' if 'crack' in cam.lower() and 'no crack' not in cam.lower()
-                        else 'Clean'
-                    )
+                    low = cam.lower()
+                    if 'dirty' in low or 'soil' in low or 'stain' in low:
+                        pipe_cam = 'Dirty'
+                    elif 'crack' in low and 'no crack' not in low:
+                        pipe_cam = 'Crack'
+                    else:
+                        pipe_cam = 'Clean'
+                    _egg_pipe['camera'] = pipe_cam
                     _egg_pipe['category'] = str(pending.get('category') or 'goodEggs')
                     _egg_pipe['awaiting_weight'] = True
                     _egg_pipe['weighed'] = False
@@ -4208,14 +4607,39 @@ def ensure_background_thread():
 @app.on_event('startup')
 def _on_startup():
     global labels
+    classify_on = os.environ.get('CLASSIFY_ENABLED', '1').strip().lower() not in (
+        '0', 'false', 'no',
+    )
     if not labels:
         print('Loading labels...')
-        labels = load_labels(LABELS_PATH)
+        labels = load_labels(LABELS_PATH) if LABELS_PATH.is_file() else [
+            'Empty Model', 'No Crack Egg', 'Crack Egg', 'Dirty Egg',
+        ]
         print(f'Labels loaded: {labels}')
-        print('Loading SavedModel...')
-        load_model()
-        print('Model loaded.')
-        print('Roboflow model egg-defect-detection-sznlj/1 (key from backend/.env)')
+        if classify_on:
+            print('Loading models: crack/dirty TFLite + Empty/Clean SavedModel...')
+            load_model()
+            print('Hybrid detectors ready.')
+        else:
+            print(
+                'Models SKIPPED (CLASSIFY_ENABLED=0) — live camera only',
+                flush=True,
+            )
+    # Drop sticky Clean→scale wait from prior runs so tracker can lock immediately.
+    with _egg_pipe_lock:
+        _egg_pipe['id'] = ''
+        _egg_pipe['camera'] = ''
+        _egg_pipe['category'] = ''
+        _egg_pipe['awaiting_weight'] = False
+        _egg_pipe['weighed'] = False
+        _egg_pipe['opened_at'] = 0.0
+    for rec in detection_records:
+        if rec.get('awaitingWeight'):
+            rec['awaitingWeight'] = False
+    try:
+        _save_live_detections()
+    except Exception:
+        pass
     ensure_background_thread()
 
 
@@ -4259,23 +4683,233 @@ async def farm_snapshot_get(request: Request):
 app.mount('/auth', WSGIMiddleware(_PrependAuthPath(_auth_flask)))
 
 
+def _front_health_bytes() -> bytes:
+    now = time.monotonic()
+    with _raw_lock:
+        raw_at = _last_raw_at
+        has_raw = bool(_last_raw)
+    frame_age = (now - raw_at) if raw_at else 999.0
+    cam = bool(has_raw and frame_age <= LIVE_VIEW_MAX_AGE_SEC)
+    payload = {
+        'backend': 'ready',
+        'ok': True,
+        'connected': cam,
+        'cameraConnected': cam,
+        'hardwareOnline': _hardware_online(),
+        'frameLive': cam,
+        'frameAgeMs': int(round(min(frame_age, 99.0) * 1000)),
+        'status': (
+            'Running'
+            if cam
+            else 'Running — waiting for ESP32-CAM'
+        ),
+    }
+    return json.dumps(payload).encode('utf-8')
+
+
+def _start_tunnel_front_door(public_host: str, public_port: int, inner_port: int) -> None:
+    """Threaded :public_port so cloudflared backpressure cannot freeze uvicorn.
+
+    Proven: with cloudflared stopped, asyncio /live.jpg was 2–7ms; with it up,
+    the same loop stalled for seconds because slow CF socket writes blocked
+    the single event loop. Live + CAM push run in their own threads here.
+    """
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib import error as urlerror
+    from urllib import request as urlrequest
+
+    inner = f'http://127.0.0.1:{inner_port}'
+
+    class FrontHandler(BaseHTTPRequestHandler):
+        protocol_version = 'HTTP/1.1'
+
+        def log_message(self, fmt, *args):  # noqa: N802
+            return
+
+        def _send(self, code: int, body: bytes, headers: dict[str, str]) -> None:
+            self.send_response(code)
+            for key, val in headers.items():
+                self.send_header(key, val)
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            if body and self.command != 'HEAD':
+                self.wfile.write(body)
+
+        def do_OPTIONS(self):  # noqa: N802
+            self._send(204, b'', {
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+                'Access-Control-Allow-Headers': '*',
+            })
+
+        def do_HEAD(self):  # noqa: N802
+            self.do_GET()
+
+        def do_GET(self):  # noqa: N802
+            path = (self.path or '/').split('?', 1)[0]
+            if path in ('/live.jpg', '/live.jpgg'):
+                data, kind, age_ms = _latest_view_jpeg()
+                self._send(200, data, {
+                    'Content-Type': 'image/jpeg',
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Expose-Headers': 'X-Egg-Frame, X-Frame-Age-Ms',
+                    'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+                    'X-Egg-Frame': kind,
+                    'X-Frame-Age-Ms': str(age_ms),
+                })
+                return
+            if path == '/health':
+                body = _front_health_bytes()
+                self._send(200, body, {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*',
+                    'Cache-Control': 'no-store',
+                })
+                return
+            if path in ('/watch', '/live', '/camera'):
+                body = _WATCH_PAGE_HTML.encode('utf-8')
+                self._send(200, body, {
+                    'Content-Type': 'text/html; charset=utf-8',
+                    'Access-Control-Allow-Origin': '*',
+                    'Cache-Control': 'no-store',
+                    'Connection': 'close',
+                })
+                return
+            if path == '/live-status':
+                try:
+                    body = json.dumps(live_status()).encode('utf-8')
+                except Exception:
+                    body = b'{"ok":false}'
+                self._send(200, body, {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*',
+                    'Cache-Control': 'no-store',
+                    'Connection': 'close',
+                })
+                return
+            if path in ('/api/ping', '/ping'):
+                body = json.dumps({'ok': True, 't': time.time()}).encode('utf-8')
+                self._send(200, body, {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*',
+                })
+                return
+            self._proxy()
+
+        def do_POST(self):  # noqa: N802
+            path = (self.path or '/').split('?', 1)[0]
+            if path in ('/api/frame', '/frame'):
+                try:
+                    length = int(self.headers.get('Content-Length') or 0)
+                except ValueError:
+                    length = 0
+                # Cap read so a stuck CAM cannot pin a worker thread forever.
+                length = max(0, min(length, 512_000))
+                body = self.rfile.read(length) if length else b''
+                if len(body) < 200 or body[:2] != b'\xff\xd8':
+                    self._send(400, b'bad', {'Content-Type': 'text/plain'})
+                    return
+                _store_live_jpeg(body)
+                self._send(200, b'ok', {
+                    'Content-Type': 'text/plain',
+                    'Connection': 'keep-alive',
+                    'Keep-Alive': 'timeout=30, max=1000',
+                })
+                return
+            self._proxy()
+
+        def _proxy(self) -> None:
+            url = inner + (self.path or '/')
+            data = None
+            if self.command in ('POST', 'PUT', 'PATCH'):
+                try:
+                    length = int(self.headers.get('Content-Length') or 0)
+                except ValueError:
+                    length = 0
+                data = self.rfile.read(length) if length > 0 else None
+            headers = {
+                k: v for k, v in self.headers.items()
+                if k.lower() not in ('host', 'content-length', 'connection')
+            }
+            req = urlrequest.Request(
+                url, data=data, headers=headers, method=self.command,
+            )
+            try:
+                # Short timeout — CF 502 beats a hung origin under TF/GIL load.
+                with urlrequest.urlopen(req, timeout=8) as resp:
+                    payload = resp.read()
+                    self.send_response(resp.status)
+                    for key, val in resp.headers.items():
+                        if key.lower() in (
+                            'transfer-encoding', 'connection', 'content-length',
+                        ):
+                            continue
+                        self.send_header(key, val)
+                    self.send_header('Content-Length', str(len(payload)))
+                    self.end_headers()
+                    if self.command != 'HEAD':
+                        self.wfile.write(payload)
+            except urlerror.HTTPError as exc:
+                payload = exc.read() or b''
+                self.send_response(exc.code)
+                self.send_header('Content-Type', exc.headers.get(
+                    'Content-Type', 'text/plain',
+                ))
+                self.send_header('Content-Length', str(len(payload)))
+                self.end_headers()
+                if payload and self.command != 'HEAD':
+                    self.wfile.write(payload)
+            except Exception:
+                self._send(502, b'origin', {'Content-Type': 'text/plain'})
+
+    httpd = ThreadingHTTPServer((public_host, public_port), FrontHandler)
+    httpd.daemon_threads = True
+    print(
+        f'[front] threaded live door on {public_host}:{public_port} '
+        f'(inner uvicorn 127.0.0.1:{inner_port})',
+        flush=True,
+    )
+    httpd.serve_forever()
+
+
 if __name__ == '__main__':
     import os
+    import socket
     import uvicorn
 
-    # App binds :8001. farm_gateway.py stays on :8000 for cloudflared so
-    # backend restarts return HTTP 503 instead of TCP "connection refused".
-    port = int(os.environ.get('FARM_APP_PORT', '8001'))
-    print(f'Live app (LAN) http://192.168.11.212:8000  (gateway → :{port})')
-    print('Public camera  http://192.168.11.212:8000/watch')
-    print('Farm tunnel    https://egg-farm.eggsorting.site')
-    print('Storage        Firebase Firestore only')
-    print('Engine         FastAPI + uvicorn')
-    # Bind loopback only — farm_gateway exposes LAN/tunnel on :8000.
-    uvicorn.run(
-        'live_inspection_backend:app',
-        host='127.0.0.1',
-        port=port,
-        reload=False,
-        log_level='info',
-    )
+    # cloudflared → threaded :8000 front (live.jpg / api/frame) → uvicorn :8001
+    port = int(os.environ.get('FARM_APP_PORT', '8000'))
+    host = os.environ.get('FARM_APP_HOST', '0.0.0.0')
+    inner_port = int(os.environ.get('FARM_INNER_PORT', '8001'))
+    print('Public live API  https://egg-farm.eggsorting.site')
+    print('Hosted UI        https://egg-system.paghasianjustine.workers.dev')
+    print('Storage          Firebase Firestore only')
+    print(f'Tunnel origin   {host}:{port} threaded front → 127.0.0.1:{inner_port}')
+    _placeholder_jpeg()
+
+    def _run_inner() -> None:
+        # Pass the app object (not 'module:app' string) so CAM frames stored by
+        # the threaded front share the same _last_raw as classify_worker.
+        # String import loaded a second module copy → live.jpg worked, detect did not.
+        uvicorn.run(
+            app,
+            host='127.0.0.1',
+            port=inner_port,
+            reload=False,
+            log_level='warning',
+            access_log=False,
+            timeout_keep_alive=5,
+            limit_concurrency=64,
+        )
+
+    threading.Thread(target=_run_inner, name='uvicorn-inner', daemon=True).start()
+    for _ in range(80):
+        time.sleep(0.25)
+        try:
+            with socket.create_connection(('127.0.0.1', inner_port), timeout=0.3):
+                break
+        except OSError:
+            continue
+    else:
+        print('[front] WARNING: inner uvicorn not ready — starting front anyway', flush=True)
+    _start_tunnel_front_door(host, port, inner_port)

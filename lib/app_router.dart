@@ -7,6 +7,7 @@ import 'api_config.dart';
 import 'app_state.dart';
 import 'auth_api.dart';
 import 'csv_download.dart';
+import 'egg_breakpoints.dart';
 import 'iot_egg_reading.dart';
 import 'flutter_conversion.dart';
 import 'live_cam_mjpeg.dart';
@@ -555,11 +556,15 @@ class _AuthScreenState extends State<AuthScreen> {
         return;
       }
       setState(() => _error = error.message);
-    } catch (_) {
+    } catch (error) {
       if (!mounted) {
         return;
       }
-      setState(() => _error = 'Wrong email or password.');
+      setState(() {
+        _error = error is AuthException
+            ? error.message
+            : 'Cannot reach the farm server. Check your connection and try again.';
+      });
     } finally {
       if (mounted) {
         setState(() => _submitting = false);
@@ -645,9 +650,10 @@ class _AuthScreenState extends State<AuthScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final EdgeInsets viewInsets = MediaQuery.viewInsetsOf(context);
     return Scaffold(
       backgroundColor: const Color(0xFF1A120C),
-      resizeToAvoidBottomInset: false,
+      resizeToAvoidBottomInset: true,
       body: Stack(
         fit: StackFit.expand,
         children: <Widget>[
@@ -669,16 +675,28 @@ class _AuthScreenState extends State<AuthScreen> {
             ),
           ),
           SafeArea(
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
-              child: Center(
-                child: FittedBox(
-                  fit: BoxFit.scaleDown,
-                  child: SizedBox(
-                    width: 420,
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                    children: <Widget>[
+            child: LayoutBuilder(
+              builder: (BuildContext context, BoxConstraints constraints) {
+                final double formWidth =
+                    constraints.maxWidth.clamp(0, 420).toDouble();
+                return SingleChildScrollView(
+                  padding: EdgeInsets.fromLTRB(
+                    20,
+                    12,
+                    20,
+                    12 + viewInsets.bottom,
+                  ),
+                  child: ConstrainedBox(
+                    constraints: BoxConstraints(
+                      minHeight: constraints.maxHeight - 24,
+                    ),
+                    child: Center(
+                      child: SizedBox(
+                        width: formWidth,
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          mainAxisSize: MainAxisSize.min,
+                          children: <Widget>[
                       ClipOval(
                         child: Image.asset(
                           'assets/egg-logo.png',
@@ -699,33 +717,15 @@ class _AuthScreenState extends State<AuthScreen> {
                         ),
                       ),
                       const SizedBox(height: 8),
-                      const Row(
-                        children: <Widget>[
-                          Expanded(
-                            child: Divider(
-                              color: Color(0xFFE8B84A),
-                              thickness: 1.2,
-                            ),
-                          ),
-                          Padding(
-                            padding: EdgeInsets.symmetric(horizontal: 8),
-                            child: Text(
-                              'EGG SIZING, SORTING & INVENTORY SYSTEM',
-                              style: TextStyle(
-                                color: Color(0xFFE8B84A),
-                                fontSize: 10,
-                                fontWeight: FontWeight.w700,
-                                letterSpacing: 0.3,
-                              ),
-                            ),
-                          ),
-                          Expanded(
-                            child: Divider(
-                              color: Color(0xFFE8B84A),
-                              thickness: 1.2,
-                            ),
-                          ),
-                        ],
+                      const Text(
+                        'EGG SIZING, SORTING & INVENTORY SYSTEM',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          color: Color(0xFFE8B84A),
+                          fontSize: 10,
+                          fontWeight: FontWeight.w700,
+                          letterSpacing: 0.3,
+                        ),
                       ),
                       const SizedBox(height: 22),
                       DecoratedBox(
@@ -834,48 +834,62 @@ class _AuthScreenState extends State<AuthScreen> {
                     ),
                     const SizedBox(height: 8),
                     if (!_workerSignUp)
-                    Row(
-                      children: <Widget>[
-                        SizedBox(
-                          width: 22,
-                          height: 22,
-                          child: Checkbox(
-                            value: _rememberMe,
-                            onChanged: (bool? value) {
-                              setState(() => _rememberMe = value ?? false);
-                            },
-                            activeColor: _orange,
-                            side: const BorderSide(color: Color(0xFFB7AA9A)),
-                            materialTapTargetSize:
-                                MaterialTapTargetSize.shrinkWrap,
-                            visualDensity: VisualDensity.compact,
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 4,
+                        crossAxisAlignment: WrapCrossAlignment.center,
+                        alignment: WrapAlignment.spaceBetween,
+                        children: <Widget>[
+                          Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: <Widget>[
+                              SizedBox(
+                                width: 22,
+                                height: 22,
+                                child: Checkbox(
+                                  value: _rememberMe,
+                                  onChanged: (bool? value) {
+                                    setState(
+                                      () => _rememberMe = value ?? false,
+                                    );
+                                  },
+                                  activeColor: _orange,
+                                  side: const BorderSide(
+                                    color: Color(0xFFB7AA9A),
+                                  ),
+                                  materialTapTargetSize:
+                                      MaterialTapTargetSize.shrinkWrap,
+                                  visualDensity: VisualDensity.compact,
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              const Text(
+                                'Remember me',
+                                style: TextStyle(color: _muted, fontSize: 14),
+                              ),
+                            ],
                           ),
-                        ),
-                        const SizedBox(width: 8),
-                        const Text(
-                          'Remember me',
-                          style: TextStyle(color: _muted, fontSize: 14),
-                        ),
-                        const Spacer(),
-                        TextButton(
-                          onPressed: () => Navigator.of(
-                            context,
-                          ).pushNamed(AppPaths.forgotPassword),
-                          style: TextButton.styleFrom(
-                            foregroundColor: _orange,
-                            padding: const EdgeInsets.symmetric(horizontal: 4),
-                          ),
-                          child: const Text(
-                            'Forgot Password?',
-                            style: TextStyle(
-                              color: _orange,
-                              fontWeight: FontWeight.w600,
-                              fontSize: 14,
+                          TextButton(
+                            onPressed: () => Navigator.of(
+                              context,
+                            ).pushNamed(AppPaths.forgotPassword),
+                            style: TextButton.styleFrom(
+                              foregroundColor: _orange,
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 4,
+                              ),
+                            ),
+                            child: const Text(
+                              'Forgot Password?',
+                              style: TextStyle(
+                                color: _orange,
+                                fontWeight: FontWeight.w600,
+                                fontSize: 14,
+                              ),
                             ),
                           ),
-                        ),
-                      ],
-                    ),
+                        ],
+                      ),
                     if (_error != null) ...<Widget>[
                       const SizedBox(height: 8),
                       Text(
@@ -893,7 +907,8 @@ class _AuthScreenState extends State<AuthScreen> {
                       style: FilledButton.styleFrom(
                         backgroundColor: _orange,
                         foregroundColor: const Color(0xFF2A2118),
-                        disabledBackgroundColor: _orange.withValues(alpha: 0.55),
+                        disabledBackgroundColor:
+                            _orange.withValues(alpha: 0.55),
                         padding: const EdgeInsets.symmetric(vertical: 16),
                         shape: RoundedRectangleBorder(
                           borderRadius: BorderRadius.circular(10),
@@ -943,16 +958,18 @@ class _AuthScreenState extends State<AuthScreen> {
                         ),
                       ],
                     ),
-                  ],
-                ),
-              ),
-            ),
-          ),
-                      ],
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                          ],
+                        ),
+                      ),
                     ),
                   ),
-                ),
-              ),
+                );
+              },
             ),
           ),
         ],
@@ -1867,7 +1884,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
             _DashboardStat(
               label: 'Grading Progress',
               value:
-                  '${appState.liveGoodEggs > 0 ? ((appState.liveGoodEggs / (appState.liveGoodEggs + appState.liveCrackedEggs).clamp(1, 999999)) * 100).toStringAsFixed(0) : '0'}%',
+                  '${appState.liveGoodEggs > 0 ? ((appState.liveGoodEggs / (appState.liveGoodEggs + appState.liveCrackedEggs + appState.liveDirtyEggs).clamp(1, 999999)) * 100).toStringAsFixed(0) : '0'}%',
               unit: 'Good Quality',
               icon: Icons.fact_check_outlined,
               accent: _DashboardPalette.primary,
@@ -1876,7 +1893,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
             _DashboardStat(
               label: 'Damaged / Rejected',
               value: appState.workerDamagedCount.toString(),
-              unit: 'Eggs Today',
+              unit: 'Cracked + Dirty',
               icon: Icons.warning_amber_rounded,
               accent: _DashboardPalette.warning,
               route: AppPaths.grading,
@@ -1905,8 +1922,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
             ),
             _DashboardStat(
               label: 'Damaged / Rejected',
-              value: '${appState.liveCrackedEggs}',
-              unit: 'Eggs Today',
+              value: '${appState.liveCrackedEggs + appState.liveDirtyEggs}',
+              unit: 'Cracked + Dirty',
               icon: Icons.warning_amber_rounded,
               accent: _DashboardPalette.warning,
               route: AppPaths.grading,
@@ -1969,7 +1986,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
       selectedRoute: AppPaths.dashboard,
       body: LayoutBuilder(
         builder: (BuildContext context, BoxConstraints constraints) {
-          final bool split = constraints.maxWidth >= 1040;
           final Widget links = _QuickLinkGrid(items: quickLinks);
           final Widget inspect = _LiveInspectionLedger(appState: appState);
           final Widget analytics = _EggAnalyticsBoard(appState: appState);
@@ -1993,23 +2009,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
               const _DashboardHeading('Modules'),
               links,
               const SizedBox(height: 16),
-              if (split)
-                Row(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: <Widget>[
-                    Expanded(flex: 7, child: inspect),
-                    const SizedBox(width: 16),
-                    Expanded(
-                      flex: 5,
-                      child: _WorkerNotificationCard(appState: appState),
-                    ),
-                  ],
-                )
-              else ...<Widget>[
-                inspect,
-                const SizedBox(height: 16),
-                _WorkerNotificationCard(appState: appState),
-              ],
+              inspect,
               const SizedBox(height: 10),
               zoneLine,
               const SizedBox(height: 16),
@@ -2151,31 +2151,7 @@ class ProductionScreen extends StatefulWidget {
 }
 
 class _ProductionScreenState extends State<ProductionScreen> {
-  static const List<String> _timeSlots = <String>[
-    'Morning',
-    'Afternoon',
-    'Evening',
-  ];
-  static const List<String> _sources = <String>[
-    'Coop A',
-    'Coop B',
-    'Coop C',
-    'Coop D',
-    'Cage 1',
-    'Cage 2',
-  ];
-  static const int _maxCount = 50000;
-  static const int _maxSourceLength = 50;
-
-  final TextEditingController _customSourceController = TextEditingController();
-  final TextEditingController _countController = TextEditingController();
-
   late List<_ProductionEntry> _records;
-  late DateTime _selectedDate;
-  String _selectedTimeSlot = _timeSlots.first;
-  String _selectedSource = _sources.first;
-  bool _showForm = false;
-  Map<String, String> _errors = <String, String>{};
 
   @override
   void initState() {
@@ -2190,16 +2166,6 @@ class _ProductionScreenState extends State<ProductionScreen> {
           ),
         )
         .toList();
-    _selectedDate = _records.isEmpty
-        ? DateTime.now()
-        : _parseIsoDate(_records.first.date);
-  }
-
-  @override
-  void dispose() {
-    _customSourceController.dispose();
-    _countController.dispose();
-    super.dispose();
   }
 
   String get _activeDateString {
@@ -2223,9 +2189,6 @@ class _ProductionScreenState extends State<ProductionScreen> {
     (int sum, _ProductionEntry record) => sum + record.count,
   );
 
-  int get _uniqueSources =>
-      _records.map((record) => record.source).toSet().length;
-
   List<MapEntry<String, _DailyTotal>> get _dailyTotals {
     final Map<String, _DailyTotal> grouped = <String, _DailyTotal>{};
     for (final _ProductionEntry record in _records) {
@@ -2244,120 +2207,8 @@ class _ProductionScreenState extends State<ProductionScreen> {
     return entries;
   }
 
-  Future<void> _pickDate() async {
-    final DateTime? picked = await showDatePicker(
-      context: context,
-      initialDate: _selectedDate,
-      firstDate: DateTime(2024),
-      lastDate: DateTime.now(),
-      builder: (BuildContext context, Widget? child) {
-        return Theme(
-          data: Theme.of(context).copyWith(
-            colorScheme: const ColorScheme.dark(
-              primary: _DashboardPalette.primary,
-              onPrimary: _DashboardPalette.primaryForeground,
-              surface: Color(0xFF2A211C),
-              onSurface: _DashboardPalette.foreground,
-            ),
-            dialogTheme: const DialogThemeData(
-              backgroundColor: Color(0xFF2A211C),
-            ),
-          ),
-          child: child!,
-        );
-      },
-    );
-    if (picked != null) {
-      setState(() {
-        _selectedDate = picked;
-        _errors.remove('date');
-      });
-    }
-  }
-
-  void _toggleForm() {
-    setState(() {
-      _showForm = !_showForm;
-      if (!_showForm) {
-        _errors = <String, String>{};
-      }
-    });
-  }
-
-  void _addRecord() {
-    final Map<String, String> errors = <String, String>{};
-    final int? count = int.tryParse(_countController.text.trim());
-    final String source = _selectedSource == '__custom'
-        ? _customSourceController.text.trim()
-        : _selectedSource;
-
-    if (count == null || count <= 0) {
-      errors['count'] = 'Enter a valid egg count';
-    } else if (count > _maxCount) {
-      errors['count'] = 'Max $_maxCount per entry';
-    }
-
-    if (source.isEmpty) {
-      errors['source'] = 'Select or enter a source';
-    } else if (source.length > _maxSourceLength) {
-      errors['source'] = 'Max $_maxSourceLength characters';
-    }
-
-    if (errors.isNotEmpty) {
-      setState(() => _errors = errors);
-      return;
-    }
-
-    final _ProductionEntry newRecord = _ProductionEntry(
-      id: 'manual-${DateTime.now().microsecondsSinceEpoch}',
-      date: _toIsoDate(_selectedDate),
-      timeSlot: _selectedTimeSlot,
-      source: source,
-      count: count!,
-      method: 'Manual',
-    );
-
-    setState(() {
-      _records = <_ProductionEntry>[newRecord, ..._records];
-      _countController.clear();
-      _customSourceController.clear();
-      _selectedSource = _sources.first;
-      _selectedTimeSlot = _timeSlots.first;
-      _showForm = false;
-      _errors = <String, String>{};
-    });
-    _persistProduction();
-  }
-
-  void _deleteRecord(String id) {
-    setState(() {
-      _records = _records
-          .where((_ProductionEntry record) => record.id != id)
-          .toList();
-    });
-    _persistProduction();
-  }
-
-  void _persistProduction() {
-    widget.appState.replaceProductionRecords(
-      _records
-          .map(
-            (_ProductionEntry record) => ProductionRecord(
-              id: record.id,
-              date: record.date,
-              timeSlot: record.timeSlot,
-              source: record.source,
-              count: record.count,
-              method: record.method,
-            ),
-          )
-          .toList(),
-    );
-  }
-
   @override
   Widget build(BuildContext context) {
-    final bool narrow = MediaQuery.sizeOf(context).width < 760;
     final List<_ProductionStat> stats = <_ProductionStat>[
       _ProductionStat(
         icon: Icons.egg_alt_outlined,
@@ -2379,13 +2230,6 @@ class _ProductionScreenState extends State<ProductionScreen> {
         label: 'All-Time Total',
         value: _allTimeTotal.toString(),
         suffix: 'eggs',
-      ),
-      _ProductionStat(
-        icon: Icons.home_work_outlined,
-        iconColor: _DashboardPalette.primary,
-        label: 'Active Sources',
-        value: _uniqueSources.toString(),
-        suffix: 'coops/cages',
       ),
     ];
 
@@ -2426,7 +2270,7 @@ class _ProductionScreenState extends State<ProductionScreen> {
                     ),
                     const SizedBox(height: 4),
                     Text(
-                      'IoT-enhanced egg counting and collection tracking',
+                      'Automatic egg counting from live inspection — view only',
                       style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                         color: _DashboardPalette.mutedForeground,
                       ),
@@ -2434,85 +2278,10 @@ class _ProductionScreenState extends State<ProductionScreen> {
                   ],
                 ),
               ),
-              if (!narrow)
-                FilledButton.icon(
-                  onPressed: _toggleForm,
-                  style: FilledButton.styleFrom(
-                    backgroundColor: _DashboardPalette.primary,
-                    foregroundColor: _DashboardPalette.primaryForeground,
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 18,
-                      vertical: 16,
-                    ),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(16),
-                    ),
-                  ),
-                  icon: Icon(
-                    _showForm ? Icons.close_rounded : Icons.add_rounded,
-                  ),
-                  label: Text(_showForm ? 'Close Entry' : 'Manual Entry'),
-                ),
             ],
           ),
-          if (narrow) ...<Widget>[
-            const SizedBox(height: 16),
-            SizedBox(
-              width: double.infinity,
-              child: FilledButton.icon(
-                onPressed: _toggleForm,
-                style: FilledButton.styleFrom(
-                  backgroundColor: _DashboardPalette.primary,
-                  foregroundColor: _DashboardPalette.primaryForeground,
-                  padding: const EdgeInsets.symmetric(vertical: 16),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(16),
-                  ),
-                ),
-                icon: Icon(_showForm ? Icons.close_rounded : Icons.add_rounded),
-                label: Text(_showForm ? 'Close Entry' : 'Manual Entry'),
-              ),
-            ),
-          ],
           const SizedBox(height: 20),
           _ProductionStatGrid(stats: stats),
-          if (_showForm) ...<Widget>[
-            const SizedBox(height: 20),
-            _GlassSection(
-              title: 'Manual Production Entry',
-              titleIcon: Icons.edit_note_rounded,
-              child: _ProductionForm(
-                selectedDate: _selectedDate,
-                selectedTimeSlot: _selectedTimeSlot,
-                selectedSource: _selectedSource,
-                customSourceController: _customSourceController,
-                countController: _countController,
-                errors: _errors,
-                timeSlots: _timeSlots,
-                sources: _sources,
-                onPickDate: _pickDate,
-                onTimeSlotChanged: (String? value) {
-                  if (value == null) {
-                    return;
-                  }
-                  setState(() {
-                    _selectedTimeSlot = value;
-                  });
-                },
-                onSourceChanged: (String? value) {
-                  if (value == null) {
-                    return;
-                  }
-                  setState(() {
-                    _selectedSource = value;
-                    _errors.remove('source');
-                  });
-                },
-                onCancel: _toggleForm,
-                onSubmit: _addRecord,
-              ),
-            ),
-          ],
           const SizedBox(height: 20),
           _GlassSection(
             title: 'Daily Totals',
@@ -2525,161 +2294,10 @@ class _ProductionScreenState extends State<ProductionScreen> {
           const SizedBox(height: 20),
           _GlassSection(
             title: 'Collection Records',
-            child: _ProductionRecordsTable(
-              records: _records,
-              onDelete: _deleteRecord,
-            ),
+            child: _ProductionRecordsTable(records: _records),
           ),
         ],
       ),
-    );
-  }
-}
-
-class _ProductionForm extends StatelessWidget {
-  const _ProductionForm({
-    required this.selectedDate,
-    required this.selectedTimeSlot,
-    required this.selectedSource,
-    required this.customSourceController,
-    required this.countController,
-    required this.errors,
-    required this.timeSlots,
-    required this.sources,
-    required this.onPickDate,
-    required this.onTimeSlotChanged,
-    required this.onSourceChanged,
-    required this.onCancel,
-    required this.onSubmit,
-  });
-
-  final DateTime selectedDate;
-  final String selectedTimeSlot;
-  final String selectedSource;
-  final TextEditingController customSourceController;
-  final TextEditingController countController;
-  final Map<String, String> errors;
-  final List<String> timeSlots;
-  final List<String> sources;
-  final VoidCallback onPickDate;
-  final ValueChanged<String?> onTimeSlotChanged;
-  final ValueChanged<String?> onSourceChanged;
-  final VoidCallback onCancel;
-  final VoidCallback onSubmit;
-
-  @override
-  Widget build(BuildContext context) {
-    return LayoutBuilder(
-      builder: (BuildContext context, BoxConstraints constraints) {
-        final bool wide = constraints.maxWidth >= 1040;
-        final bool medium = constraints.maxWidth >= 640;
-        final double width = wide
-            ? (constraints.maxWidth - 36) / 4
-            : medium
-            ? (constraints.maxWidth - 12) / 2
-            : constraints.maxWidth;
-
-        return Column(
-          children: <Widget>[
-            Wrap(
-              spacing: 12,
-              runSpacing: 12,
-              children: <Widget>[
-                SizedBox(
-                  width: width,
-                  child: _ProductionField(
-                    label: 'Collection Date',
-                    errorText: errors['date'],
-                    child: _PickerButton(
-                      text: _formatLongDate(selectedDate),
-                      icon: Icons.calendar_month_outlined,
-                      onPressed: onPickDate,
-                    ),
-                  ),
-                ),
-                SizedBox(
-                  width: width,
-                  child: _ProductionField(
-                    label: 'Time of Collection',
-                    child: _DropdownShell(
-                      value: selectedTimeSlot,
-                      items: timeSlots,
-                      onChanged: onTimeSlotChanged,
-                    ),
-                  ),
-                ),
-                SizedBox(
-                  width: width,
-                  child: _ProductionField(
-                    label: 'Source (Coop/Cage)',
-                    errorText: errors['source'],
-                    child: Column(
-                      children: <Widget>[
-                        _DropdownShell(
-                          value: selectedSource,
-                          items: <String>[...sources, '__custom'],
-                          labels: <String, String>{
-                            '__custom': 'Other (custom)',
-                          },
-                          onChanged: onSourceChanged,
-                        ),
-                        if (selectedSource == '__custom') ...<Widget>[
-                          const SizedBox(height: 10),
-                          _ProductionTextField(
-                            controller: customSourceController,
-                            hintText: 'Enter source name',
-                          ),
-                        ],
-                      ],
-                    ),
-                  ),
-                ),
-                SizedBox(
-                  width: width,
-                  child: _ProductionField(
-                    label: 'Egg Count',
-                    errorText: errors['count'],
-                    child: _ProductionTextField(
-                      controller: countController,
-                      hintText: 'e.g. 320',
-                      keyboardType: TextInputType.number,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 16),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.end,
-              children: <Widget>[
-                TextButton(
-                  onPressed: onCancel,
-                  child: const Text(
-                    'Cancel',
-                    style: TextStyle(color: _DashboardPalette.mutedForeground),
-                  ),
-                ),
-                const SizedBox(width: 12),
-                FilledButton(
-                  onPressed: onSubmit,
-                  style: FilledButton.styleFrom(
-                    backgroundColor: _DashboardPalette.primary,
-                    foregroundColor: _DashboardPalette.primaryForeground,
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 18,
-                      vertical: 14,
-                    ),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(14),
-                    ),
-                  ),
-                  child: const Text('Record Production'),
-                ),
-              ],
-            ),
-          ],
-        );
-      },
     );
   }
 }
@@ -2726,7 +2344,10 @@ class _DailyTotalCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final bool active = date == activeDateString;
     return Container(
-      width: 240,
+      width: MediaQuery.sizeOf(context).width < EggBreakpoints.compact
+          ? MediaQuery.sizeOf(context).width - 48
+          : 240,
+      constraints: const BoxConstraints(maxWidth: 420),
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
         color: active
@@ -2794,13 +2415,9 @@ class _DailyTotalCard extends StatelessWidget {
 }
 
 class _ProductionRecordsTable extends StatelessWidget {
-  const _ProductionRecordsTable({
-    required this.records,
-    required this.onDelete,
-  });
+  const _ProductionRecordsTable({required this.records});
 
   final List<_ProductionEntry> records;
-  final ValueChanged<String> onDelete;
 
   @override
   Widget build(BuildContext context) {
@@ -2836,7 +2453,6 @@ class _ProductionRecordsTable extends StatelessWidget {
             DataColumn(label: Text('Source')),
             DataColumn(numeric: true, label: Text('Count')),
             DataColumn(label: Text('Method')),
-            DataColumn(label: Text('')),
           ],
           rows: records
               .map(
@@ -2860,14 +2476,6 @@ class _ProductionRecordsTable extends StatelessWidget {
                     ),
                     DataCell(Text(record.count.toString())),
                     DataCell(_MethodChip(method: record.method)),
-                    DataCell(
-                      IconButton(
-                        onPressed: () => onDelete(record.id),
-                        icon: const Icon(Icons.delete_outline_rounded),
-                        color: _DashboardPalette.mutedForeground,
-                        tooltip: 'Delete',
-                      ),
-                    ),
                   ],
                 ),
               )
@@ -2888,7 +2496,7 @@ class _ProductionStatGrid extends StatelessWidget {
     return LayoutBuilder(
       builder: (BuildContext context, BoxConstraints constraints) {
         final bool large = constraints.maxWidth >= 1080;
-        final bool medium = constraints.maxWidth >= 680;
+        final bool medium = constraints.maxWidth >= EggBreakpoints.compact;
         final double width = large
             ? (constraints.maxWidth - 36) / 4
             : medium
@@ -3281,28 +2889,43 @@ class _GradingScreenState extends State<GradingScreen> {
     'Small',
     'Medium',
     'Large',
-    'Extra Large',
+    'Jumbo',
   ];
   static const List<String> _qualities = <String>[
     'Good',
     'Cracked',
+    'Dirty',
     'Rejected',
   ];
-  static const int _maxQuantity = 50000;
-  static const int _maxNameLength = 50;
-
-  final TextEditingController _quantityController = TextEditingController();
-  final TextEditingController _gradedByController = TextEditingController();
 
   late List<_GradingEntry> _records;
-  String _selectedSize = 'Medium';
-  String _selectedQuality = 'Good';
-  bool _showForm = false;
-  Map<String, String> _errors = <String, String>{};
+  late DateTime _qualityDate;
+  late DateTime _sizeDate;
 
   @override
   void initState() {
     super.initState();
+    final DateTime today = DateTime.now();
+    _qualityDate = DateTime(today.year, today.month, today.day);
+    _sizeDate = DateTime(today.year, today.month, today.day);
+    widget.appState.addListener(_onAppState);
+    _reloadRecords();
+  }
+
+  @override
+  void dispose() {
+    widget.appState.removeListener(_onAppState);
+    super.dispose();
+  }
+
+  void _onAppState() {
+    if (!mounted) {
+      return;
+    }
+    setState(_reloadRecords);
+  }
+
+  void _reloadRecords() {
     _records = widget.appState.gradingRecords
         .map(
           (GradingRecord record) => _GradingEntry(
@@ -3317,14 +2940,6 @@ class _GradingScreenState extends State<GradingScreen> {
           ),
         )
         .toList();
-    _gradedByController.text = widget.appState.currentUser?.name ?? '';
-  }
-
-  @override
-  void dispose() {
-    _quantityController.dispose();
-    _gradedByController.dispose();
-    super.dispose();
   }
 
   String get _activeDateString {
@@ -3339,6 +2954,16 @@ class _GradingScreenState extends State<GradingScreen> {
   List<_GradingEntry> get _todayRecords => _records
       .where((_GradingEntry record) => record.date == _activeDateString)
       .toList();
+
+  List<_GradingEntry> _recordsOn(DateTime day) {
+    final String iso = _toIsoDate(day);
+    return _records
+        .where((_GradingEntry record) => record.date == iso)
+        .toList();
+  }
+
+  bool _isSameDay(DateTime a, DateTime b) =>
+      a.year == b.year && a.month == b.month && a.day == b.day;
 
   int get _collectedToday => widget.appState.todayProductionTotal;
 
@@ -3358,14 +2983,6 @@ class _GradingScreenState extends State<GradingScreen> {
   int get _batchCount =>
       _todayRecords.map((record) => record.batchId).toSet().length;
 
-  String get _nextBatch {
-    final String datePortion = _activeDateString
-        .replaceAll('-', '')
-        .substring(4);
-    final String sequence = (_batchCount + 1).toString().padLeft(2, '0');
-    return 'B-$datePortion-$sequence';
-  }
-
   double get _gradedRatio {
     if (_collectedToday <= 0) {
       return 0;
@@ -3373,117 +2990,153 @@ class _GradingScreenState extends State<GradingScreen> {
     return (_todayGraded / _collectedToday).clamp(0, 1).toDouble();
   }
 
-  Map<String, int> _breakdownByQuality() {
-    return <String, int>{
-      for (final String quality in _qualities)
-        quality: _todayRecords
-            .where((record) => record.quality == quality)
-            .fold<int>(
-              0,
-              (int sum, _GradingEntry record) => sum + record.quantity,
-            ),
-    };
+  String _normalizeQuality(String raw) {
+    final String q = raw.trim().toLowerCase();
+    if (q.contains('good') || q.contains('clean')) {
+      return 'Good';
+    }
+    if (q.contains('crack')) {
+      return 'Cracked';
+    }
+    if (q.contains('dirty') || q.contains('soil') || q.contains('stain')) {
+      return 'Dirty';
+    }
+    if (q.contains('reject') || q.contains('empty') || q.contains('waste')) {
+      return 'Rejected';
+    }
+    return raw.trim().isEmpty ? 'Rejected' : raw.trim();
   }
 
-  Map<String, int> _breakdownBySize() {
-    return <String, int>{
-      for (final String size in _sizes)
-        size: _todayRecords
-            .where((record) => record.size == size)
-            .fold<int>(
-              0,
-              (int sum, _GradingEntry record) => sum + record.quantity,
-            ),
+  Map<String, int> _breakdownByQuality(DateTime day) {
+    final List<_GradingEntry> rows = _recordsOn(day);
+    final Map<String, int> counts = <String, int>{
+      for (final String quality in _qualities) quality: 0,
     };
+    for (final _GradingEntry record in rows) {
+      final String key = _normalizeQuality(record.quality);
+      if (!counts.containsKey(key)) {
+        continue;
+      }
+      counts[key] = (counts[key] ?? 0) + record.quantity;
+    }
+    // Live board is today-only — use as floor so Dirty/Clean appear immediately.
+    if (_isSameDay(day, DateTime.now())) {
+      final AppState app = widget.appState;
+      counts['Good'] = <int>[counts['Good'] ?? 0, app.liveGoodEggs]
+          .reduce((int a, int b) => a > b ? a : b);
+      counts['Cracked'] = <int>[counts['Cracked'] ?? 0, app.liveCrackedEggs]
+          .reduce((int a, int b) => a > b ? a : b);
+      counts['Dirty'] = <int>[counts['Dirty'] ?? 0, app.liveDirtyEggs]
+          .reduce((int a, int b) => a > b ? a : b);
+    }
+    return counts;
   }
 
-  void _toggleForm() {
+  Map<String, int> _breakdownBySize(DateTime day) {
+    final List<_GradingEntry> rows = _recordsOn(day);
+    final Map<String, int> counts = <String, int>{
+      for (final String size in _sizes) size: 0,
+    };
+    for (final _GradingEntry record in rows) {
+      final String key = AppState.normalizeSellableSize(record.size);
+      if (!counts.containsKey(key)) {
+        continue;
+      }
+      counts[key] = (counts[key] ?? 0) + record.quantity;
+    }
+    if (_isSameDay(day, DateTime.now())) {
+      final String iso = _toIsoDate(day);
+      for (final DetectionRecord row in widget.appState.detectionRecords) {
+        final DateTime? parsed = DateTime.tryParse(row.timestamp)?.toLocal();
+        if (parsed == null || _toIsoDate(parsed) != iso) {
+          continue;
+        }
+        if (row.isPendingWeight) {
+          continue;
+        }
+        final String label = row.label.toLowerCase();
+        if (label.contains('crack') ||
+            label.contains('dirty') ||
+            label.contains('empty') ||
+            label.contains('reject')) {
+          continue;
+        }
+        final String key = AppState.normalizeSellableSize(row.sizeClass.name);
+        if (!counts.containsKey(key)) {
+          continue;
+        }
+        counts[key] = (counts[key] ?? 0) + 1;
+      }
+    }
+    return counts;
+  }
+
+  Future<void> _pickBreakdownDate({required bool forQuality}) async {
+    final DateTime initial = forQuality ? _qualityDate : _sizeDate;
+    final DateTime now = DateTime.now();
+    final DateTime? picked = await showDatePicker(
+      context: context,
+      initialDate: initial,
+      firstDate: DateTime(now.year - 2),
+      lastDate: DateTime(now.year, now.month, now.day),
+      builder: (BuildContext context, Widget? child) {
+        return Theme(
+          data: Theme.of(context).copyWith(
+            colorScheme: const ColorScheme.dark(
+              primary: _DashboardPalette.primary,
+              onPrimary: Color(0xFF2A2118),
+              surface: Color(0xFF241C16),
+              onSurface: _DashboardPalette.foreground,
+            ),
+          ),
+          child: child!,
+        );
+      },
+    );
+    if (picked == null || !mounted) {
+      return;
+    }
     setState(() {
-      _showForm = !_showForm;
-      if (!_showForm) {
-        _errors = <String, String>{};
+      final DateTime day = DateTime(picked.year, picked.month, picked.day);
+      if (forQuality) {
+        _qualityDate = day;
+      } else {
+        _sizeDate = day;
       }
     });
   }
 
-  void _submitGrading() {
-    final Map<String, String> errors = <String, String>{};
-    final int? quantity = int.tryParse(_quantityController.text.trim());
-    final String gradedBy = _gradedByController.text.trim();
-
-    if (quantity == null || quantity <= 0) {
-      errors['quantity'] = 'Enter a valid quantity';
-    } else if (quantity > _maxQuantity) {
-      errors['quantity'] = 'Max $_maxQuantity';
-    }
-
-    if (gradedBy.isEmpty) {
-      errors['gradedBy'] = 'Enter grader name';
-    } else if (gradedBy.length > _maxNameLength) {
-      errors['gradedBy'] = 'Max $_maxNameLength characters';
-    }
-
-    if (errors.isNotEmpty) {
-      setState(() => _errors = errors);
-      return;
-    }
-
-    final DateTime now = DateTime.now();
-    final _GradingEntry newRecord = _GradingEntry(
-      id: 'grade-${now.microsecondsSinceEpoch}',
-      date: _activeDateString,
-      time:
-          '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}',
-      batchId: _nextBatch,
-      size: _selectedSize,
-      quality: _selectedQuality,
-      quantity: quantity!,
-      gradedBy: gradedBy,
-    );
-
-    setState(() {
-      _records = <_GradingEntry>[newRecord, ..._records];
-      _quantityController.clear();
-      _showForm = false;
-      _errors = <String, String>{};
-    });
-    _persistGrading();
-  }
-
-  void _deleteRecord(String id) {
-    setState(() {
-      _records = _records
-          .where((_GradingEntry record) => record.id != id)
-          .toList();
-    });
-    _persistGrading();
-  }
-
-  void _persistGrading() {
-    widget.appState.replaceGradingRecords(
-      _records
-          .map(
-            (_GradingEntry record) => GradingRecord(
-              id: record.id,
-              date: record.date,
-              time: record.time,
-              batchId: record.batchId,
-              size: record.size,
-              quality: record.quality,
-              quantity: record.quantity,
-              gradedBy: record.gradedBy,
-            ),
-          )
-          .toList(),
+  Widget _breakdownDateButton({
+    required DateTime date,
+    required VoidCallback onTap,
+  }) {
+    final bool isToday = _isSameDay(date, DateTime.now());
+    return TextButton.icon(
+      onPressed: onTap,
+      icon: const Icon(Icons.calendar_month_outlined, size: 18),
+      label: Text(
+        isToday ? 'Today' : _toIsoDate(date),
+        style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
+      ),
+      style: TextButton.styleFrom(
+        foregroundColor: _DashboardPalette.primary,
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+        minimumSize: Size.zero,
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+      ),
     );
   }
 
   @override
   Widget build(BuildContext context) {
     final bool isWorker = !widget.appState.isAdmin;
-    final bool narrow = MediaQuery.sizeOf(context).width < 760;
-    final Map<String, int> qualityBreakdown = _breakdownByQuality();
-    final Map<String, int> sizeBreakdown = _breakdownBySize();
+    final Map<String, int> qualityBreakdown = _breakdownByQuality(_qualityDate);
+    final Map<String, int> sizeBreakdown = _breakdownBySize(_sizeDate);
+    final int qualityTotal =
+        qualityBreakdown.values.fold<int>(0, (int a, int b) => a + b);
+    final int qualityGood = qualityBreakdown['Good'] ?? 0;
+    final int sizeTotal =
+        sizeBreakdown.values.fold<int>(0, (int a, int b) => a + b);
     final List<_ProductionStat> stats = <_ProductionStat>[
       _ProductionStat(
         icon: Icons.egg_alt_outlined,
@@ -3552,7 +3205,7 @@ class _GradingScreenState extends State<GradingScreen> {
                     ),
                     const SizedBox(height: 4),
                     Text(
-                      'Grade eggs and track damaged or rejected units',
+                      'Automatic quality and size from live inspection — view only',
                       style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                         color: _DashboardPalette.mutedForeground,
                       ),
@@ -3560,46 +3213,8 @@ class _GradingScreenState extends State<GradingScreen> {
                   ],
                 ),
               ),
-              if (!narrow)
-                FilledButton.icon(
-                  onPressed: _toggleForm,
-                  style: FilledButton.styleFrom(
-                    backgroundColor: _DashboardPalette.primary,
-                    foregroundColor: _DashboardPalette.primaryForeground,
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 18,
-                      vertical: 16,
-                    ),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(16),
-                    ),
-                  ),
-                  icon: Icon(
-                    _showForm ? Icons.close_rounded : Icons.add_rounded,
-                  ),
-                  label: const Text('Grade Eggs'),
-                ),
             ],
           ),
-          if (narrow) ...<Widget>[
-            const SizedBox(height: 16),
-            SizedBox(
-              width: double.infinity,
-              child: FilledButton.icon(
-                onPressed: _toggleForm,
-                style: FilledButton.styleFrom(
-                  backgroundColor: _DashboardPalette.primary,
-                  foregroundColor: _DashboardPalette.primaryForeground,
-                  padding: const EdgeInsets.symmetric(vertical: 16),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(16),
-                  ),
-                ),
-                icon: Icon(_showForm ? Icons.close_rounded : Icons.add_rounded),
-                label: const Text('Grade Eggs'),
-              ),
-            ),
-          ],
           const SizedBox(height: 18),
           _GradingValidationBar(
             collectedToday: _collectedToday,
@@ -3613,7 +3228,7 @@ class _GradingScreenState extends State<GradingScreen> {
             const SizedBox(height: 18),
             LayoutBuilder(
               builder: (BuildContext context, BoxConstraints constraints) {
-                final bool medium = constraints.maxWidth >= 860;
+                final bool medium = constraints.maxWidth >= EggBreakpoints.medium;
                 final double width = medium
                     ? (constraints.maxWidth - 16) / 2
                     : constraints.maxWidth;
@@ -3626,12 +3241,16 @@ class _GradingScreenState extends State<GradingScreen> {
                       width: width,
                       child: _GlassSection(
                         title: 'Quality Breakdown',
+                        trailing: _breakdownDateButton(
+                          date: _qualityDate,
+                          onTap: () => _pickBreakdownDate(forQuality: true),
+                        ),
                         child: _GradingBreakdownPanel(
-                          totalLabel: _todayGraded > 0
-                              ? '${((_sellable / _todayGraded) * 100).round()}%'
+                          totalLabel: qualityTotal > 0
+                              ? '${((qualityGood / qualityTotal) * 100).round()}%'
                               : '--',
-                          totalValue: _todayGraded > 0
-                              ? (_sellable / _todayGraded).clamp(0, 1)
+                          totalValue: qualityTotal > 0
+                              ? (qualityGood / qualityTotal).clamp(0, 1)
                               : 0,
                           centerColor: _DashboardPalette.success,
                           breakdown: qualityBreakdown,
@@ -3643,9 +3262,13 @@ class _GradingScreenState extends State<GradingScreen> {
                       width: width,
                       child: _GlassSection(
                         title: 'Size Breakdown',
+                        trailing: _breakdownDateButton(
+                          date: _sizeDate,
+                          onTap: () => _pickBreakdownDate(forQuality: false),
+                        ),
                         child: _GradingBreakdownPanel(
-                          totalLabel: _todayGraded.toString(),
-                          totalValue: _todayGraded > 0 ? 1 : 0,
+                          totalLabel: sizeTotal.toString(),
+                          totalValue: sizeTotal > 0 ? 1 : 0,
                           centerColor: _DashboardPalette.foreground,
                           breakdown: sizeBreakdown,
                           colorForKey: _gradingSizeColor,
@@ -3657,38 +3280,10 @@ class _GradingScreenState extends State<GradingScreen> {
               },
             ),
           ],
-          if (_showForm) ...<Widget>[
-            const SizedBox(height: 18),
-            _GlassSection(
-              title: 'Grade Eggs',
-              child: _GradingForm(
-                nextBatch: _nextBatch,
-                remaining: _remaining,
-                sizes: _sizes,
-                qualities: _qualities,
-                selectedSize: _selectedSize,
-                selectedQuality: _selectedQuality,
-                quantityController: _quantityController,
-                gradedByController: _gradedByController,
-                errors: _errors,
-                onSizeSelected: (String size) {
-                  setState(() => _selectedSize = size);
-                },
-                onQualitySelected: (String quality) {
-                  setState(() => _selectedQuality = quality);
-                },
-                onCancel: _toggleForm,
-                onSubmit: _submitGrading,
-              ),
-            ),
-          ],
           const SizedBox(height: 18),
           _GlassSection(
             title: 'Grading Records',
-            child: _GradingRecordsTable(
-              records: _records,
-              onDelete: _deleteRecord,
-            ),
+            child: _GradingRecordsTable(records: _records),
           ),
         ],
       ),
@@ -3770,256 +3365,52 @@ class _GradingBreakdownPanel extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Row(
-      children: <Widget>[
-        _CircularScore(
-          value: totalValue,
-          label: totalLabel,
-          color: centerColor,
-        ),
-        const SizedBox(width: 20),
-        Expanded(
-          child: Column(
-            children: breakdown.entries
-                .map(
-                  (MapEntry<String, int> entry) => Padding(
-                    padding: const EdgeInsets.only(bottom: 12),
-                    child: _LegendRow(
-                      label: entry.key,
-                      value: entry.value.toString(),
-                      color: colorForKey(entry.key),
-                    ),
-                  ),
-                )
-                .toList(),
-          ),
-        ),
-      ],
+    final Widget legend = Column(
+      children: breakdown.entries
+          .map(
+            (MapEntry<String, int> entry) => Padding(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: _LegendRow(
+                label: entry.key,
+                value: entry.value.toString(),
+                color: colorForKey(entry.key),
+              ),
+            ),
+          )
+          .toList(),
     );
-  }
-}
-
-class _GradingForm extends StatelessWidget {
-  const _GradingForm({
-    required this.nextBatch,
-    required this.remaining,
-    required this.sizes,
-    required this.qualities,
-    required this.selectedSize,
-    required this.selectedQuality,
-    required this.quantityController,
-    required this.gradedByController,
-    required this.errors,
-    required this.onSizeSelected,
-    required this.onQualitySelected,
-    required this.onCancel,
-    required this.onSubmit,
-  });
-
-  final String nextBatch;
-  final int remaining;
-  final List<String> sizes;
-  final List<String> qualities;
-  final String selectedSize;
-  final String selectedQuality;
-  final TextEditingController quantityController;
-  final TextEditingController gradedByController;
-  final Map<String, String> errors;
-  final ValueChanged<String> onSizeSelected;
-  final ValueChanged<String> onQualitySelected;
-  final VoidCallback onCancel;
-  final VoidCallback onSubmit;
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: <Widget>[
-        RichText(
-          text: TextSpan(
-            style: const TextStyle(color: _DashboardPalette.mutedForeground),
-            children: <InlineSpan>[
-              const TextSpan(text: 'Batch: '),
-              TextSpan(
-                text: nextBatch,
-                style: const TextStyle(
-                  color: _DashboardPalette.primary,
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-              TextSpan(
-                text: remaining > 0
-                    ? ' - $remaining remaining to grade'
-                    : ' - All collected eggs graded',
-              ),
+    final Widget score = _CircularScore(
+      value: totalValue,
+      label: totalLabel,
+      color: centerColor,
+    );
+    return LayoutBuilder(
+      builder: (BuildContext context, BoxConstraints constraints) {
+        if (constraints.maxWidth < EggBreakpoints.compact) {
+          return Column(
+            children: <Widget>[
+              score,
+              const SizedBox(height: 16),
+              legend,
             ],
-          ),
-        ),
-        const SizedBox(height: 18),
-        Text(
-          'Size',
-          style: Theme.of(context).textTheme.labelMedium?.copyWith(
-            color: _DashboardPalette.mutedForeground,
-            letterSpacing: 0.8,
-          ),
-        ),
-        const SizedBox(height: 8),
-        Wrap(
-          spacing: 8,
-          runSpacing: 8,
-          children: sizes
-              .map(
-                (String size) => _GradingChoiceButton(
-                  label: size,
-                  selected: selectedSize == size,
-                  onTap: () => onSizeSelected(size),
-                ),
-              )
-              .toList(),
-        ),
-        const SizedBox(height: 16),
-        Text(
-          'Quality',
-          style: Theme.of(context).textTheme.labelMedium?.copyWith(
-            color: _DashboardPalette.mutedForeground,
-            letterSpacing: 0.8,
-          ),
-        ),
-        const SizedBox(height: 8),
-        Wrap(
-          spacing: 8,
-          runSpacing: 8,
-          children: qualities
-              .map(
-                (String quality) => _GradingChoiceButton(
-                  label: quality,
-                  selected: selectedQuality == quality,
-                  onTap: () => onQualitySelected(quality),
-                ),
-              )
-              .toList(),
-        ),
-        const SizedBox(height: 18),
-        LayoutBuilder(
-          builder: (BuildContext context, BoxConstraints constraints) {
-            final bool medium = constraints.maxWidth >= 700;
-            final double width = medium
-                ? (constraints.maxWidth - 12) / 2
-                : constraints.maxWidth;
-
-            return Wrap(
-              spacing: 12,
-              runSpacing: 12,
-              children: <Widget>[
-                SizedBox(
-                  width: width,
-                  child: _ProductionField(
-                    label: 'Quantity',
-                    errorText: errors['quantity'],
-                    child: _ProductionTextField(
-                      controller: quantityController,
-                      hintText: 'e.g. 200',
-                      keyboardType: TextInputType.number,
-                    ),
-                  ),
-                ),
-                SizedBox(
-                  width: width,
-                  child: _ProductionField(
-                    label: 'Graded By',
-                    errorText: errors['gradedBy'],
-                    child: _ProductionTextField(
-                      controller: gradedByController,
-                      hintText: 'e.g. Staff A',
-                    ),
-                  ),
-                ),
-              ],
-            );
-          },
-        ),
-        const SizedBox(height: 16),
-        Row(
-          mainAxisAlignment: MainAxisAlignment.end,
+          );
+        }
+        return Row(
           children: <Widget>[
-            TextButton(
-              onPressed: onCancel,
-              child: const Text(
-                'Cancel',
-                style: TextStyle(color: _DashboardPalette.mutedForeground),
-              ),
-            ),
-            const SizedBox(width: 12),
-            FilledButton(
-              onPressed: onSubmit,
-              style: FilledButton.styleFrom(
-                backgroundColor: _DashboardPalette.primary,
-                foregroundColor: _DashboardPalette.primaryForeground,
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 18,
-                  vertical: 14,
-                ),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(14),
-                ),
-              ),
-              child: const Text('Record Grading'),
-            ),
+            score,
+            const SizedBox(width: 20),
+            Expanded(child: legend),
           ],
-        ),
-      ],
-    );
-  }
-}
-
-class _GradingChoiceButton extends StatelessWidget {
-  const _GradingChoiceButton({
-    required this.label,
-    required this.selected,
-    required this.onTap,
-  });
-
-  final String label;
-  final bool selected;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    return InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(14),
-      child: Ink(
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-        decoration: BoxDecoration(
-          color: selected
-              ? _DashboardPalette.primary.withValues(alpha: 0.12)
-              : _DashboardPalette.tabBackground,
-          borderRadius: BorderRadius.circular(14),
-          border: Border.all(
-            color: selected
-                ? _DashboardPalette.primary
-                : _DashboardPalette.glassBorder,
-          ),
-        ),
-        child: Text(
-          label,
-          style: TextStyle(
-            color: selected
-                ? _DashboardPalette.primary
-                : _DashboardPalette.mutedForeground,
-            fontWeight: FontWeight.w600,
-          ),
-        ),
-      ),
+        );
+      },
     );
   }
 }
 
 class _GradingRecordsTable extends StatelessWidget {
-  const _GradingRecordsTable({required this.records, required this.onDelete});
+  const _GradingRecordsTable({required this.records});
 
   final List<_GradingEntry> records;
-  final ValueChanged<String> onDelete;
 
   @override
   Widget build(BuildContext context) {
@@ -4052,7 +3443,6 @@ class _GradingRecordsTable extends StatelessWidget {
           DataColumn(label: Text('Quality')),
           DataColumn(numeric: true, label: Text('Qty')),
           DataColumn(label: Text('Grader')),
-          DataColumn(label: Text('')),
         ],
         rows: records
             .map(
@@ -4072,13 +3462,6 @@ class _GradingRecordsTable extends StatelessWidget {
                   DataCell(_GradingQualityChip(quality: record.quality)),
                   DataCell(Text(record.quantity.toString())),
                   DataCell(Text(record.gradedBy)),
-                  DataCell(
-                    IconButton(
-                      onPressed: () => onDelete(record.id),
-                      icon: const Icon(Icons.delete_outline_rounded),
-                      color: _DashboardPalette.mutedForeground,
-                    ),
-                  ),
                 ],
               ),
             )
@@ -4146,6 +3529,8 @@ Color _gradingQualityColor(String quality) {
       return _DashboardPalette.success;
     case 'Cracked':
       return _DashboardPalette.warning;
+    case 'Dirty':
+      return const Color(0xFFC4A574);
     case 'Rejected':
       return _DashboardPalette.danger;
     default:
@@ -4154,14 +3539,14 @@ Color _gradingQualityColor(String quality) {
 }
 
 Color _gradingSizeColor(String size) {
-  switch (size) {
+  switch (AppState.normalizeSellableSize(size)) {
     case 'Small':
       return const Color(0xFF9B5DE5);
     case 'Medium':
       return const Color(0xFF4DA3FF);
     case 'Large':
       return _DashboardPalette.primary;
-    case 'Extra Large':
+    case 'Jumbo':
       return const Color(0xFFFF7F50);
     default:
       return _DashboardPalette.mutedForeground;
@@ -4200,23 +3585,14 @@ class InventoryScreen extends StatefulWidget {
 }
 
 class _InventoryScreenState extends State<InventoryScreen> {
-  final TextEditingController _todayTraysController = TextEditingController();
-
   late List<InventoryItem> _items;
-  late List<InventoryZone> _zones;
   late List<InventoryMovement> _movements;
-  String _zoneFilter = 'all';
 
   @override
   void initState() {
     super.initState();
     widget.appState.addListener(_onAppState);
     _reloadFromAppState();
-    if (widget.appState.hasTodayTrayStock) {
-      _todayTraysController.text = '${widget.appState.todayTrayStockSet}';
-    } else if (widget.appState.availableTrays > 0) {
-      _todayTraysController.text = '${widget.appState.availableTrays}';
-    }
   }
 
   void _onAppState() {
@@ -4228,135 +3604,15 @@ class _InventoryScreenState extends State<InventoryScreen> {
 
   void _reloadFromAppState() {
     _items = List<InventoryItem>.from(widget.appState.inventoryItems);
-    _zones = List<InventoryZone>.from(widget.appState.inventoryZones);
     _movements = List<InventoryMovement>.from(
       widget.appState.inventoryMovements,
-    );
-  }
-
-  void _saveTodayTrays() {
-    final int? trays = int.tryParse(_todayTraysController.text.trim());
-    if (trays == null || trays < 0) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Enter how many trays are available today.')),
-      );
-      return;
-    }
-    widget.appState.setTodayTrayStock(trays);
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(
-          'Saved $trays tray(s) for today (${trays * 30} eggs). Sellers will see this stock.',
-        ),
-      ),
-    );
-  }
-
-  Future<void> _deleteTodayTrays() async {
-    final bool hasStock = widget.appState.availableTrays > 0 ||
-        widget.appState.availableSellableEggs > 0 ||
-        widget.appState.hasTodayTrayStock;
-    if (!hasStock) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('No tray stock to delete.')),
-      );
-      return;
-    }
-    final bool? confirmed = await showDialog<bool>(
-      context: context,
-      builder: (BuildContext context) {
-        return AlertDialog(
-          backgroundColor: const Color(0xFF241C16),
-          title: const Text(
-            'Delete today\'s trays permanently?',
-            style: TextStyle(color: _DashboardPalette.foreground),
-          ),
-          content: Text(
-            'This hard-deletes today\'s tray stock '
-            '(${widget.appState.availableTrays} trays / '
-            '${widget.appState.availableSellableEggs} eggs) from the app and farm database. '
-            'Sellers will see 0 available.',
-            style: const TextStyle(color: _DashboardPalette.mutedForeground),
-          ),
-          actions: <Widget>[
-            TextButton(
-              onPressed: () => Navigator.of(context).pop(false),
-              child: const Text('Cancel'),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.of(context).pop(true),
-              style: FilledButton.styleFrom(
-                backgroundColor: const Color(0xFFDC2626),
-                foregroundColor: Colors.white,
-              ),
-              child: const Text('Delete'),
-            ),
-          ],
-        );
-      },
-    );
-    if (confirmed != true || !mounted) {
-      return;
-    }
-    widget.appState.deleteTodayTrayStock();
-    _todayTraysController.clear();
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Today\'s trays permanently deleted.')),
     );
   }
 
   @override
   void dispose() {
     widget.appState.removeListener(_onAppState);
-    _todayTraysController.dispose();
     super.dispose();
-  }
-
-  List<InventoryItem> get _visibleItems {
-    if (_zoneFilter == 'all') {
-      return _items;
-    }
-    return _items
-        .where((InventoryItem item) => item.zoneId == _zoneFilter)
-        .toList();
-  }
-
-  List<InventoryMovement> get _visibleMovements {
-    if (_zoneFilter == 'all') {
-      return _movements;
-    }
-    final Set<String> itemIds = _visibleItems
-        .map((InventoryItem item) => item.id)
-        .toSet();
-    return _movements
-        .where(
-          (InventoryMovement movement) => itemIds.contains(movement.itemId),
-        )
-        .toList();
-  }
-
-  int get _totalStockUnits => _visibleItems.fold<int>(
-    0,
-    (int sum, InventoryItem item) => sum + item.quantity,
-  );
-
-  int get _lowStockCount => _visibleItems
-      .where(
-        (InventoryItem item) =>
-            item.minThreshold > 0 && item.quantity <= item.minThreshold,
-      )
-      .length;
-
-  int get _capacityPercentage {
-    final int used = _totalStockUnits;
-    final int max = _visibleItems.fold<int>(
-      0,
-      (int sum, InventoryItem item) => sum + item.maxCapacity,
-    );
-    if (max == 0) {
-      return 0;
-    }
-    return ((used / max) * 100).round();
   }
 
   InventoryItem? _itemById(String itemId) {
@@ -4370,27 +3626,29 @@ class _InventoryScreenState extends State<InventoryScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final int sellableEggs = widget.appState.availableSellableEggs;
+    final int sellableTrays = widget.appState.availableTrays;
     final List<_ProductionStat> stats = <_ProductionStat>[
       _ProductionStat(
-        icon: Icons.inventory_2_outlined,
+        icon: Icons.egg_alt_outlined,
         iconColor: _DashboardPalette.primary,
-        label: 'Total Stock',
-        value: _totalStockUnits.toString(),
-        suffix: 'units',
+        label: 'Sellable eggs',
+        value: sellableEggs.toString(),
+        suffix: 'eggs',
       ),
       _ProductionStat(
-        icon: Icons.warning_amber_rounded,
-        iconColor: _DashboardPalette.warning,
-        label: 'Low Stock Items',
-        value: _lowStockCount.toString(),
-        suffix: 'items',
-      ),
-      _ProductionStat(
-        icon: Icons.speed_outlined,
+        icon: Icons.inventory_2_outlined,
         iconColor: _DashboardPalette.success,
-        label: 'Capacity Used',
-        value: _capacityPercentage.toString(),
-        suffix: '%',
+        label: 'Full trays',
+        value: sellableTrays.toString(),
+        suffix: 'trays',
+      ),
+      _ProductionStat(
+        icon: Icons.history_rounded,
+        iconColor: _DashboardPalette.warning,
+        label: 'Movements',
+        value: _movements.length.toString(),
+        suffix: 'logged',
       ),
     ];
 
@@ -4431,7 +3689,7 @@ class _InventoryScreenState extends State<InventoryScreen> {
                     ),
                     const SizedBox(height: 4),
                     Text(
-                      'Track stock and recent inventory movements',
+                      'Trays unlock automatically from grading — 30 eggs = 1 tray',
                       style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                         color: _DashboardPalette.mutedForeground,
                       ),
@@ -4445,133 +3703,71 @@ class _InventoryScreenState extends State<InventoryScreen> {
           _ProductionStatGrid(stats: stats),
           const SizedBox(height: 18),
           _GlassSection(
-            title: 'Trays available for sale today',
+            title: 'Trays ready for sale',
             titleIcon: Icons.egg_alt_outlined,
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: <Widget>[
                 const Text(
-                  'Enter how many trays the seller can sell today. '
-                  '1 tray = 30 eggs. This updates inventory and shows on the seller screen.',
+                  'Counted from Good graded eggs (Small, Medium, Large, Jumbo). '
+                  'Every 30 eggs of a size becomes 1 tray on the seller screen.',
                   style: TextStyle(
                     color: _DashboardPalette.mutedForeground,
                     height: 1.4,
                   ),
                 ),
-                const SizedBox(height: 14),
+                const SizedBox(height: 16),
                 LayoutBuilder(
                   builder: (BuildContext context, BoxConstraints constraints) {
-                    final bool stacked = constraints.maxWidth < 560;
-                    final Widget field = TextField(
-                      controller: _todayTraysController,
-                      keyboardType: TextInputType.number,
-                      style: const TextStyle(
-                        color: _DashboardPalette.foreground,
-                      ),
-                      cursorColor: _DashboardPalette.primary,
-                      decoration: InputDecoration(
-                        labelText: 'Trays for today',
-                        labelStyle: const TextStyle(
-                          color: _DashboardPalette.mutedForeground,
-                        ),
-                        hintText: 'e.g. 10',
-                        hintStyle: const TextStyle(color: Color(0xFFB7AA9A)),
-                        filled: true,
-                        fillColor: const Color(0xFF3A322B),
-                        border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(12),
-                          borderSide: const BorderSide(color: Color(0xFF4A4038)),
-                        ),
-                        enabledBorder: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(12),
-                          borderSide: const BorderSide(color: Color(0xFF4A4038)),
-                        ),
-                      ),
-                    );
-                    final Widget saveButton = FilledButton.icon(
-                      onPressed: _saveTodayTrays,
-                      icon: const Icon(Icons.save_outlined),
-                      label: const Text('Save for sellers'),
-                      style: FilledButton.styleFrom(
-                        backgroundColor: _DashboardPalette.primary,
-                        foregroundColor: const Color(0xFF2A2118),
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 18,
-                          vertical: 16,
-                        ),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                      ),
-                    );
-                    final Widget deleteButton = OutlinedButton.icon(
-                      onPressed: _deleteTodayTrays,
-                      icon: const Icon(Icons.delete_outline_rounded),
-                      label: const Text('Delete trays'),
-                      style: OutlinedButton.styleFrom(
-                        foregroundColor: const Color(0xFFDC2626),
-                        side: const BorderSide(color: Color(0xFFDC2626)),
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 18,
-                          vertical: 16,
-                        ),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                      ),
-                    );
-                    if (stacked) {
-                      return Column(
-                        crossAxisAlignment: CrossAxisAlignment.stretch,
-                        children: <Widget>[
-                          field,
-                          const SizedBox(height: 12),
-                          saveButton,
-                          const SizedBox(height: 10),
-                          deleteButton,
-                        ],
-                      );
-                    }
-                    return Row(
+                    final int columns =
+                        constraints.maxWidth >= EggBreakpoints.medium
+                            ? 4
+                            : constraints.maxWidth >= EggBreakpoints.compact
+                                ? 2
+                                : 1;
+                    final double width =
+                        (constraints.maxWidth - 12 * (columns - 1)) / columns;
+                    return Wrap(
+                      spacing: 12,
+                      runSpacing: 12,
                       children: <Widget>[
-                        Expanded(child: field),
-                        const SizedBox(width: 12),
-                        saveButton,
-                        const SizedBox(width: 10),
-                        deleteButton,
+                        for (final String size in AppState.sellableEggSizes)
+                          SizedBox(
+                            width: width,
+                            child: _SizeStockCard(
+                              size: size,
+                              eggs: widget.appState.eggsAvailableForSize(size),
+                              trays:
+                                  widget.appState.traysAvailableForSize(size),
+                            ),
+                          ),
                       ],
                     );
                   },
-                ),
-                const SizedBox(height: 12),
-                Text(
-                  widget.appState.hasTodayTrayStock
-                      ? 'Today: ${widget.appState.todayTrayStockSet} trays set · '
-                          '${widget.appState.availableTrays} trays left · '
-                          '${widget.appState.availableSellableEggs} eggs left'
-                      : 'No trays set for today yet. '
-                          'Current stock: ${widget.appState.availableTrays} trays · '
-                          '${widget.appState.availableSellableEggs} sellable eggs.',
-                  style: const TextStyle(
-                    color: _DashboardPalette.foreground,
-                    fontWeight: FontWeight.w600,
-                  ),
                 ),
               ],
             ),
           ),
           const SizedBox(height: 18),
           _GlassSection(
-            title: 'Stock on hand',
+            title: 'Other stock',
             titleIcon: Icons.inventory_2_outlined,
-            child: _items.isEmpty
+            child: _items
+                    .where(
+                      (InventoryItem item) =>
+                          item.id != 'inv-trays' && item.id != 'inv-egg-a',
+                    )
+                    .isEmpty
                 ? const Text(
-                    'No inventory items.',
+                    'No other inventory items.',
                     style: TextStyle(color: _DashboardPalette.mutedForeground),
                   )
                 : Column(
                     children: <Widget>[
-                      for (final InventoryItem item in _visibleItems)
+                      for (final InventoryItem item in _items.where(
+                        (InventoryItem item) =>
+                            item.id != 'inv-trays' && item.id != 'inv-egg-a',
+                      ))
                         Padding(
                           padding: const EdgeInsets.only(bottom: 10),
                           child: Container(
@@ -4625,33 +3821,10 @@ class _InventoryScreenState extends State<InventoryScreen> {
           ),
           const SizedBox(height: 18),
           _GlassSection(
-            title: 'Zone Scope',
-            titleIcon: Icons.location_on_outlined,
-            child: Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: <Widget>[
-                _InventoryFilterChip(
-                  label: 'All Zones',
-                  selected: _zoneFilter == 'all',
-                  onTap: () => setState(() => _zoneFilter = 'all'),
-                ),
-                ..._zones.map(
-                  (InventoryZone zone) => _InventoryFilterChip(
-                    label: zone.name,
-                    selected: _zoneFilter == zone.id,
-                    onTap: () => setState(() => _zoneFilter = zone.id),
-                  ),
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 18),
-          _GlassSection(
             title: 'Recent Movements',
             titleIcon: Icons.history_rounded,
             child: _InventoryMovementsTable(
-              movements: _visibleMovements,
+              movements: _movements,
               itemById: _itemById,
             ),
           ),
@@ -4661,44 +3834,66 @@ class _InventoryScreenState extends State<InventoryScreen> {
   }
 }
 
-class _InventoryFilterChip extends StatelessWidget {
-  const _InventoryFilterChip({
-    required this.label,
-    required this.selected,
-    required this.onTap,
+class _SizeStockCard extends StatelessWidget {
+  const _SizeStockCard({
+    required this.size,
+    required this.eggs,
+    required this.trays,
   });
 
-  final String label;
-  final bool selected;
-  final VoidCallback onTap;
+  final String size;
+  final int eggs;
+  final int trays;
 
   @override
   Widget build(BuildContext context) {
-    return InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(999),
-      child: Ink(
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-        decoration: BoxDecoration(
-          color: selected
-              ? _DashboardPalette.primary.withValues(alpha: 0.14)
-              : _DashboardPalette.tabBackground,
-          borderRadius: BorderRadius.circular(999),
-          border: Border.all(
-            color: selected
-                ? _DashboardPalette.primary
-                : _DashboardPalette.glassBorder,
+    final Color accent = _gradingSizeColor(size);
+    final int remainder = eggs % AppState.eggsPerTray;
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: const Color(0xFF241C16),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: const Color(0xFF3A322B)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Text(
+            size,
+            style: TextStyle(
+              color: accent,
+              fontWeight: FontWeight.w800,
+              fontSize: 14,
+            ),
           ),
-        ),
-        child: Text(
-          label,
-          style: TextStyle(
-            color: selected
-                ? _DashboardPalette.primary
-                : _DashboardPalette.mutedForeground,
-            fontWeight: FontWeight.w600,
+          const SizedBox(height: 12),
+          Text(
+            '$trays',
+            style: const TextStyle(
+              color: _DashboardPalette.foreground,
+              fontWeight: FontWeight.w800,
+              fontSize: 28,
+            ),
           ),
-        ),
+          const Text(
+            'full trays',
+            style: TextStyle(
+              color: _DashboardPalette.mutedForeground,
+              fontSize: 12,
+            ),
+          ),
+          const SizedBox(height: 10),
+          Text(
+            '$eggs eggs'
+            '${remainder > 0 ? ' · $remainder toward next tray' : ''}',
+            style: const TextStyle(
+              color: _DashboardPalette.mutedForeground,
+              fontSize: 12,
+              height: 1.35,
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -4906,18 +4101,26 @@ class _ReportsScreenState extends State<ReportsScreen> {
   }
 
   List<ReportTrendPoint> get _trendPoints {
-    final List<ReportTrendPoint> points = widget.appState.reportTrendPoints;
+    final DateTime now = DateTime.now();
+    final DateTime today = DateTime(now.year, now.month, now.day);
     switch (_selectedPeriod) {
       case _ReportPeriod.daily:
-        return points.isEmpty
-            ? <ReportTrendPoint>[]
-            : <ReportTrendPoint>[points.last];
+        return widget.appState.reportTrendPointsForRange(today, today);
       case _ReportPeriod.weekly:
-        return points;
+        return widget.appState.reportTrendPointsForRange(
+          today.subtract(const Duration(days: 6)),
+          today,
+        );
       case _ReportPeriod.monthly:
-        return points;
+        return widget.appState.reportTrendPointsForRange(
+          DateTime(now.year, now.month, 1),
+          today,
+        );
     }
   }
+
+  List<ReportBreakdownRow> get _breakdownRows =>
+      widget.appState.reportBreakdownFor(_trendPoints);
 
   bool get _sellerMode => widget.appState.isSales;
 
@@ -5086,47 +4289,54 @@ class _ReportsScreenState extends State<ReportsScreen> {
       body: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
-          Row(
-            children: <Widget>[
-              Container(
-                width: 48,
-                height: 48,
-                decoration: BoxDecoration(
-                  color: _DashboardPalette.primary.withValues(alpha: 0.12),
-                  borderRadius: BorderRadius.circular(16),
-                ),
-                child: const Icon(
-                  Icons.insert_chart_outlined,
-                  color: _DashboardPalette.primary,
-                ),
-              ),
-              const SizedBox(width: 14),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: <Widget>[
-                    Text(
-                      'REPORTS & SUMMARIES',
-                      style: Theme.of(context).textTheme.headlineSmall
-                          ?.copyWith(
-                            color: _DashboardPalette.foreground,
-                            fontWeight: FontWeight.w800,
-                            letterSpacing: 1.2,
-                          ),
+          LayoutBuilder(
+            builder: (BuildContext context, BoxConstraints constraints) {
+              final bool stackHeader =
+                  constraints.maxWidth < EggBreakpoints.compact;
+              final Widget titleBlock = Row(
+                children: <Widget>[
+                  Container(
+                    width: 48,
+                    height: 48,
+                    decoration: BoxDecoration(
+                      color: _DashboardPalette.primary.withValues(alpha: 0.12),
+                      borderRadius: BorderRadius.circular(16),
                     ),
-                    const SizedBox(height: 4),
-                    Text(
-                      _sellerMode
-                          ? 'Generate and download daily, weekly, or monthly sales reports'
-                          : 'Exportable daily, weekly, and monthly admin summaries',
-                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                        color: _DashboardPalette.mutedForeground,
-                      ),
+                    child: const Icon(
+                      Icons.insert_chart_outlined,
+                      color: _DashboardPalette.primary,
                     ),
-                  ],
-                ),
-              ),
-              FilledButton.icon(
+                  ),
+                  const SizedBox(width: 14),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: <Widget>[
+                        Text(
+                          'REPORTS & SUMMARIES',
+                          style: Theme.of(context).textTheme.headlineSmall
+                              ?.copyWith(
+                                color: _DashboardPalette.foreground,
+                                fontWeight: FontWeight.w800,
+                                letterSpacing: 1.2,
+                              ),
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          _sellerMode
+                              ? 'Generate and download daily, weekly, or monthly sales reports'
+                              : 'Exportable daily, weekly, and monthly admin summaries',
+                          style: Theme.of(context).textTheme.bodyMedium
+                              ?.copyWith(
+                                color: _DashboardPalette.mutedForeground,
+                              ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              );
+              final Widget exportButton = FilledButton.icon(
                 onPressed: _exportCsv,
                 style: FilledButton.styleFrom(
                   backgroundColor: _DashboardPalette.primary,
@@ -5140,9 +4350,31 @@ class _ReportsScreenState extends State<ReportsScreen> {
                   ),
                 ),
                 icon: const Icon(Icons.download_rounded),
-                label: Text(_sellerMode ? 'Generate / Download' : 'Export CSV'),
-              ),
-            ],
+                label: Text(
+                  _sellerMode ? 'Generate / Download' : 'Export CSV',
+                ),
+              );
+              if (stackHeader) {
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: <Widget>[
+                    titleBlock,
+                    const SizedBox(height: 12),
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: exportButton,
+                    ),
+                  ],
+                );
+              }
+              return Row(
+                children: <Widget>[
+                  Expanded(child: titleBlock),
+                  const SizedBox(width: 12),
+                  exportButton,
+                ],
+              );
+            },
           ),
           const SizedBox(height: 18),
           _GlassSection(
@@ -5192,31 +4424,34 @@ class _ReportsScreenState extends State<ReportsScreen> {
           ),
           const SizedBox(height: 18),
           _ProductionStatGrid(stats: stats),
-          const SizedBox(height: 18),
-          _GlassSection(
-            title: 'Overview Trend',
-            titleIcon: Icons.show_chart_rounded,
-            child: _ReportsTrendChart(points: _trendPoints),
-          ),
-          const SizedBox(height: 18),
-          _GlassSection(
-            title: 'Module Summaries',
-            titleIcon: Icons.dashboard_customize_outlined,
-            child: _ReportsModuleGrid(
-              modules: widget.appState.reportModuleSummaries,
-              expandedModule: _expandedModule,
-              onToggle: (String module) {
-                setState(() {
-                  _expandedModule = _expandedModule == module ? null : module;
-                });
-              },
+          if (!_sellerMode) ...<Widget>[
+            const SizedBox(height: 18),
+            _GlassSection(
+              title: 'Overview Trend',
+              titleIcon: Icons.show_chart_rounded,
+              child: _ReportsTrendChart(points: _trendPoints),
             ),
-          ),
+            const SizedBox(height: 18),
+            _GlassSection(
+              title: 'Module Summaries',
+              titleIcon: Icons.dashboard_customize_outlined,
+              child: _ReportsModuleGrid(
+                modules: widget.appState.reportModuleSummaries,
+                expandedModule: _expandedModule,
+                onToggle: (String module) {
+                  setState(() {
+                    _expandedModule =
+                        _expandedModule == module ? null : module;
+                  });
+                },
+              ),
+            ),
+          ],
           const SizedBox(height: 18),
           LayoutBuilder(
             builder: (BuildContext context, BoxConstraints constraints) {
-              final bool medium = constraints.maxWidth >= 920;
-              final double width = medium
+              final bool medium = constraints.maxWidth >= EggBreakpoints.medium;
+              final double width = (!_sellerMode && medium)
                   ? (constraints.maxWidth - 16) / 2
                   : constraints.maxWidth;
 
@@ -5224,16 +4459,19 @@ class _ReportsScreenState extends State<ReportsScreen> {
                 spacing: 16,
                 runSpacing: 16,
                 children: <Widget>[
-                  SizedBox(
-                    width: width,
-                    child: _GlassSection(
-                      title: 'Monthly Breakdown by Week',
-                      titleIcon: Icons.bar_chart_rounded,
-                      child: _ReportsBreakdownChart(
-                        rows: widget.appState.reportWeeklyBreakdown,
+                  if (!_sellerMode)
+                    SizedBox(
+                      width: width,
+                      child: _GlassSection(
+                        title: _selectedPeriod == _ReportPeriod.monthly
+                            ? 'Monthly Breakdown by Day'
+                            : _selectedPeriod == _ReportPeriod.daily
+                                ? 'Daily Breakdown'
+                                : 'Weekly Breakdown by Day',
+                        titleIcon: Icons.bar_chart_rounded,
+                        child: _ReportsBreakdownChart(rows: _breakdownRows),
                       ),
                     ),
-                  ),
                   SizedBox(
                     width: width,
                     child: _GlassSection(
@@ -5252,14 +4490,16 @@ class _ReportsScreenState extends State<ReportsScreen> {
               );
             },
           ),
-          const SizedBox(height: 18),
-          _GlassSection(
-            title: 'Key Insights',
-            titleIcon: Icons.lightbulb_outline_rounded,
-            child: _ReportsInsightsGrid(
-              insights: widget.appState.reportInsights,
+          if (!_sellerMode) ...<Widget>[
+            const SizedBox(height: 18),
+            _GlassSection(
+              title: 'Key Insights',
+              titleIcon: Icons.lightbulb_outline_rounded,
+              child: _ReportsInsightsGrid(
+                insights: widget.appState.reportInsights,
+              ),
             ),
-          ),
+          ],
         ],
       ),
     );
@@ -5317,10 +4557,16 @@ class _ReportsTrendChart extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     if (points.isEmpty) {
-      return const SizedBox.shrink();
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 24),
+        child: Text(
+          'No trend data for this period yet.',
+          style: TextStyle(color: _DashboardPalette.mutedForeground),
+        ),
+      );
     }
 
-    final int maxValue = points
+    final int rawMax = points
         .map(
           (ReportTrendPoint point) => <int>[
             point.production,
@@ -5329,6 +4575,34 @@ class _ReportsTrendChart extends StatelessWidget {
           ].reduce((int a, int b) => a > b ? a : b),
         )
         .reduce((int a, int b) => a > b ? a : b);
+    final int maxValue = rawMax <= 0 ? 1 : rawMax;
+    final bool compact =
+        MediaQuery.sizeOf(context).width < EggBreakpoints.compact;
+    final bool scrollBars =
+        points.length > 10 || (compact && points.length > 5);
+
+    if (scrollBars) {
+      return SizedBox(
+        height: 280,
+        child: SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: points
+                .map(
+                  (ReportTrendPoint point) => SizedBox(
+                    width: 56,
+                    child: _ReportsTrendColumn(
+                      point: point,
+                      maxValue: maxValue,
+                    ),
+                  ),
+                )
+                .toList(),
+          ),
+        ),
+      );
+    }
 
     return SizedBox(
       height: 280,
@@ -5337,75 +4611,95 @@ class _ReportsTrendChart extends StatelessWidget {
         children: points
             .map(
               (ReportTrendPoint point) => Expanded(
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 6),
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.end,
-                    children: <Widget>[
-                      Text(
-                        point.label,
-                        style: const TextStyle(
-                          color: _DashboardPalette.mutedForeground,
-                          fontSize: 11,
-                        ),
-                      ),
-                      const SizedBox(height: 12),
-                      Expanded(
-                        child: Align(
-                          alignment: Alignment.bottomCenter,
-                          child: Row(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            crossAxisAlignment: CrossAxisAlignment.end,
-                            children: <Widget>[
-                              _MiniBar(
-                                heightFactor: point.production / maxValue,
-                                color: _DashboardPalette.primary,
-                              ),
-                              const SizedBox(width: 6),
-                              _MiniBar(
-                                heightFactor: point.sales / maxValue,
-                                color: _DashboardPalette.success,
-                              ),
-                              const SizedBox(width: 6),
-                              _MiniBar(
-                                heightFactor: point.losses / maxValue,
-                                color: _DashboardPalette.danger,
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                      const SizedBox(height: 12),
-                      Text(
-                        'P ${point.production}',
-                        style: const TextStyle(
-                          color: _DashboardPalette.primary,
-                          fontSize: 10,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                      Text(
-                        'S ${point.sales}',
-                        style: const TextStyle(
-                          color: _DashboardPalette.success,
-                          fontSize: 10,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                      Text(
-                        'L ${point.losses}',
-                        style: const TextStyle(
-                          color: _DashboardPalette.danger,
-                          fontSize: 10,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                    ],
-                  ),
+                child: _ReportsTrendColumn(
+                  point: point,
+                  maxValue: maxValue,
                 ),
               ),
             )
             .toList(),
+      ),
+    );
+  }
+}
+
+class _ReportsTrendColumn extends StatelessWidget {
+  const _ReportsTrendColumn({
+    required this.point,
+    required this.maxValue,
+  });
+
+  final ReportTrendPoint point;
+  final int maxValue;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 4),
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.end,
+        children: <Widget>[
+          Text(
+            point.label,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              color: _DashboardPalette.mutedForeground,
+              fontSize: 10,
+            ),
+          ),
+          const SizedBox(height: 10),
+          Expanded(
+            child: Align(
+              alignment: Alignment.bottomCenter,
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: <Widget>[
+                  _MiniBar(
+                    heightFactor: point.production / maxValue,
+                    color: _DashboardPalette.primary,
+                  ),
+                  const SizedBox(width: 4),
+                  _MiniBar(
+                    heightFactor: point.sales / maxValue,
+                    color: _DashboardPalette.success,
+                  ),
+                  const SizedBox(width: 4),
+                  _MiniBar(
+                    heightFactor: point.losses / maxValue,
+                    color: _DashboardPalette.danger,
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            'P ${point.production}',
+            style: const TextStyle(
+              color: _DashboardPalette.primary,
+              fontSize: 9,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          Text(
+            'S ${point.sales}',
+            style: const TextStyle(
+              color: _DashboardPalette.success,
+              fontSize: 9,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          Text(
+            'L ${point.losses}',
+            style: const TextStyle(
+              color: _DashboardPalette.danger,
+              fontSize: 9,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -5427,7 +4721,7 @@ class _ReportsModuleGrid extends StatelessWidget {
     return LayoutBuilder(
       builder: (BuildContext context, BoxConstraints constraints) {
         final bool large = constraints.maxWidth >= 1120;
-        final bool medium = constraints.maxWidth >= 720;
+        final bool medium = constraints.maxWidth >= EggBreakpoints.compact;
         final double width = large
             ? (constraints.maxWidth - 36) / 4
             : medium
@@ -5611,10 +4905,16 @@ class _ReportsBreakdownChart extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     if (rows.isEmpty) {
-      return const SizedBox.shrink();
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 24),
+        child: Text(
+          'No breakdown data for this period yet.',
+          style: TextStyle(color: _DashboardPalette.mutedForeground),
+        ),
+      );
     }
 
-    final int maxValue = rows
+    final int rawMax = rows
         .map(
           (ReportBreakdownRow row) => <int>[
             row.production,
@@ -5623,6 +4923,7 @@ class _ReportsBreakdownChart extends StatelessWidget {
           ].reduce((int a, int b) => a > b ? a : b),
         )
         .reduce((int a, int b) => a > b ? a : b);
+    final int maxValue = rawMax <= 0 ? 1 : rawMax;
 
     return Column(
       children: rows
@@ -5870,17 +5171,11 @@ class EggSalesScreen extends StatefulWidget {
 }
 
 class _EggSalesScreenState extends State<EggSalesScreen> {
-  static const int _eggsPerTray = 30;
-  static const List<String> _sizes = <String>[
-    'Small',
-    'Medium',
-    'Large',
-    'Extra Large',
-  ];
+  static const List<String> _sizes = AppState.sellableEggSizes;
   static const List<int> _quickAmounts = <int>[1, 2, 5, 10];
 
   bool _perTray = true;
-  String _size = 'Extra Large';
+  String _size = 'Medium';
   int _quantity = 1;
   String? _error;
   final TextEditingController _priceController = TextEditingController();
@@ -5922,35 +5217,41 @@ class _EggSalesScreenState extends State<EggSalesScreen> {
     return price * _quantity;
   }
 
-  int get _eggCount => _perTray ? _quantity * _eggsPerTray : _quantity;
+  int get _eggCount =>
+      _perTray ? _quantity * AppState.eggsPerTray : _quantity;
+
+  int get _sizeEggsLeft => widget.appState.eggsAvailableForSize(_size);
+
+  int get _sizeTraysLeft => widget.appState.traysAvailableForSize(_size);
 
   void _recordSale() {
     final double? price = _unitPrice;
     if (_quantity < 1) {
-      setState(() => _error = 'Enter how many ${_perTray ? 'trays' : 'pieces'}.');
+      setState(
+        () => _error =
+            'Enter how many ${_perTray ? 'trays' : 'pieces'}.',
+      );
       return;
     }
     if (price == null || price <= 0) {
       setState(() => _error = 'Enter the price.');
       return;
     }
-    final int needEggs = _eggCount;
-    final int needTrays = _perTray ? _quantity : 0;
-    if (needTrays > widget.appState.availableTrays) {
+    if (_perTray && _quantity > _sizeTraysLeft) {
       setState(() {
         _error =
-            'Only ${widget.appState.availableTrays} tray(s) left in inventory. Ask admin to add trays for today.';
+            'Only $_sizeTraysLeft full $_size tray(s) ready (need 30 eggs each).';
       });
       return;
     }
-    if (needEggs > widget.appState.availableSellableEggs) {
+    if (_eggCount > _sizeEggsLeft) {
       setState(() {
-        _error =
-            'Only ${widget.appState.availableSellableEggs} egg(s) left in inventory. Ask admin to add trays for today.';
+        _error = 'Only $_sizeEggsLeft $_size egg(s) left to sell.';
       });
       return;
     }
     final DemoUser? user = widget.appState.currentUser;
+    final int before = widget.appState.eggSales.length;
     widget.appState.addEggSale(
       EggSale(
         id: 'sale-${DateTime.now().microsecondsSinceEpoch}',
@@ -5965,6 +5266,10 @@ class _EggSalesScreenState extends State<EggSalesScreen> {
         sellerEmail: user?.email ?? '',
       ),
     );
+    if (widget.appState.eggSales.length == before) {
+      setState(() => _error = 'Could not record sale — stock may have changed.');
+      return;
+    }
     _priceController.clear();
     _buyerController.clear();
     setState(() {
@@ -5976,20 +5281,23 @@ class _EggSalesScreenState extends State<EggSalesScreen> {
   @override
   Widget build(BuildContext context) {
     final DateTime today = _dashboardDay(DateTime.now());
-    final List<EggSale> todaySales = widget.appState.eggSales.where((EggSale sale) {
+    final List<EggSale> todaySales =
+        widget.appState.eggSales.where((EggSale sale) {
       final DateTime? parsed = DateTime.tryParse(sale.createdAt);
       return parsed != null && _dashboardDay(parsed) == today;
     }).toList();
-    final int eggsSold = todaySales.fold<int>(0, (int sum, EggSale sale) => sum + sale.eggCount);
-    final int trays = todaySales.fold<int>(
+    final int eggsSold = todaySales.fold<int>(
+      0,
+      (int sum, EggSale sale) => sum + sale.eggCount,
+    );
+    final int traysSold = todaySales.fold<int>(
       0,
       (int sum, EggSale sale) => sum + (sale.perTray ? sale.quantity : 0),
     );
-    final int pieces = todaySales.fold<int>(
+    final double revenue = todaySales.fold<double>(
       0,
-      (int sum, EggSale sale) => sum + (sale.perTray ? 0 : sale.quantity),
+      (double sum, EggSale sale) => sum + sale.total,
     );
-    final double revenue = todaySales.fold<double>(0, (double sum, EggSale sale) => sum + sale.total);
 
     return EggScaffold(
       appState: widget.appState,
@@ -5999,101 +5307,51 @@ class _EggSalesScreenState extends State<EggSalesScreen> {
       body: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: <Widget>[
-          Row(
-            children: <Widget>[
-              Container(
-                width: 42,
-                height: 42,
-                decoration: BoxDecoration(
-                  color: const Color(0xFF2A2118),
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: const Color(0x66EFB73E)),
-                ),
-                child: const Icon(Icons.shopping_cart_outlined, color: Color(0xFFEFB73E)),
-              ),
-              const SizedBox(width: 12),
-              const Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: <Widget>[
-                    Text(
-                      'EGG SALES',
-                      style: TextStyle(
-                        color: _DashboardPalette.foreground,
-                        fontWeight: FontWeight.w800,
-                        fontSize: 22,
-                        letterSpacing: 0.6,
-                      ),
-                    ),
-                    SizedBox(height: 2),
-                    Text(
-                      'Record eggs sold per piece or per tray (1 tray = 30 eggs)',
-                      style: TextStyle(color: _DashboardPalette.mutedForeground),
-                    ),
-                  ],
-                ),
-              ),
-            ],
+          const Text(
+            'EGG SALES',
+            style: TextStyle(
+              color: _DashboardPalette.foreground,
+              fontWeight: FontWeight.w800,
+              fontSize: 22,
+              letterSpacing: 0.8,
+            ),
           ),
-          const SizedBox(height: 16),
+          const SizedBox(height: 4),
+          const Text(
+            '1 tray = 30 eggs. Stock fills automatically from grading.',
+            style: TextStyle(
+              color: _DashboardPalette.mutedForeground,
+              height: 1.35,
+            ),
+          ),
+          const SizedBox(height: 18),
           _GlassSection(
-            title: 'Inventory for sale',
+            title: 'Available stock',
             titleIcon: Icons.inventory_2_outlined,
             child: LayoutBuilder(
               builder: (BuildContext context, BoxConstraints constraints) {
-                final int columns = constraints.maxWidth >= 700 ? 3 : 1;
+                final int columns = constraints.maxWidth >= EggBreakpoints.medium
+                    ? 4
+                    : constraints.maxWidth >= EggBreakpoints.compact
+                        ? 2
+                        : 1;
                 final double width =
                     (constraints.maxWidth - 12 * (columns - 1)) / columns;
-                final int availableTrays = widget.appState.availableTrays;
-                final int availableEggs = widget.appState.availableSellableEggs;
-                final List<Widget> stockCards = <Widget>[
-                  _SalesMetric(
-                    icon: Icons.inventory_2_outlined,
-                    label: 'Trays available',
-                    value: '$availableTrays',
-                    accent: availableTrays > 0
-                        ? _DashboardPalette.primary
-                        : _DashboardPalette.warning,
-                  ),
-                  _SalesMetric(
-                    icon: Icons.egg_alt_outlined,
-                    label: 'Eggs available',
-                    value: '$availableEggs',
-                    accent: availableEggs > 0
-                        ? _DashboardPalette.success
-                        : _DashboardPalette.warning,
-                  ),
-                  _SalesMetric(
-                    icon: Icons.today_outlined,
-                    label: 'Admin set today',
-                    value: widget.appState.hasTodayTrayStock
-                        ? '${widget.appState.todayTrayStockSet} trays'
-                        : 'Not set',
-                  ),
-                ];
-                return Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                return Wrap(
+                  spacing: 12,
+                  runSpacing: 12,
                   children: <Widget>[
-                    Text(
-                      availableTrays > 0 || availableEggs > 0
-                          ? 'Stock from admin Inventory. Sales reduce these numbers automatically.'
-                          : 'No stock yet. Ask the admin to open Inventory and enter trays for today.',
-                      style: const TextStyle(
-                        color: _DashboardPalette.mutedForeground,
-                        height: 1.35,
+                    for (final String size in _sizes)
+                      SizedBox(
+                        width: width,
+                        child: _SellerSizeStockTile(
+                          size: size,
+                          eggs: widget.appState.eggsAvailableForSize(size),
+                          trays: widget.appState.traysAvailableForSize(size),
+                          selected: _size == size,
+                          onTap: () => setState(() => _size = size),
+                        ),
                       ),
-                    ),
-                    const SizedBox(height: 12),
-                    Wrap(
-                      spacing: 12,
-                      runSpacing: 12,
-                      children: stockCards
-                          .map(
-                            (Widget card) =>
-                                SizedBox(width: width, child: card),
-                          )
-                          .toList(),
-                    ),
                   ],
                 );
               },
@@ -6102,16 +5360,24 @@ class _EggSalesScreenState extends State<EggSalesScreen> {
           const SizedBox(height: 16),
           LayoutBuilder(
             builder: (BuildContext context, BoxConstraints constraints) {
-              final int columns = constraints.maxWidth >= 900
-                  ? 4
-                  : constraints.maxWidth >= 560
-                  ? 2
-                  : 1;
-              final double width = (constraints.maxWidth - 12 * (columns - 1)) / columns;
+              final int columns = constraints.maxWidth >= EggBreakpoints.medium
+                  ? 3
+                  : constraints.maxWidth >= EggBreakpoints.compact
+                      ? 2
+                      : 1;
+              final double width =
+                  (constraints.maxWidth - 12 * (columns - 1)) / columns;
               final List<Widget> cards = <Widget>[
-                _SalesMetric(icon: Icons.egg_alt_outlined, label: 'Eggs sold today', value: '$eggsSold'),
-                _SalesMetric(icon: Icons.inventory_2_outlined, label: 'Trays sold today', value: '$trays'),
-                _SalesMetric(icon: Icons.egg_outlined, label: 'Loose pieces today', value: '$pieces'),
+                _SalesMetric(
+                  icon: Icons.egg_alt_outlined,
+                  label: 'Eggs sold today',
+                  value: '$eggsSold',
+                ),
+                _SalesMetric(
+                  icon: Icons.inventory_2_outlined,
+                  label: 'Trays sold today',
+                  value: '$traysSold',
+                ),
                 _SalesMetric(
                   icon: Icons.payments_outlined,
                   label: 'Revenue today',
@@ -6130,22 +5396,23 @@ class _EggSalesScreenState extends State<EggSalesScreen> {
           ),
           const SizedBox(height: 16),
           _GlassSection(
-            title: 'New sale',
+            title: 'Record sale',
             titleIcon: Icons.point_of_sale_outlined,
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: <Widget>[
-                const Text(
-                  'Sold by',
-                  style: TextStyle(
+                Text(
+                  'Selling $_size  ·  $_sizeTraysLeft tray(s) / $_sizeEggsLeft egg(s) left',
+                  style: const TextStyle(
                     color: _DashboardPalette.mutedForeground,
-                    fontWeight: FontWeight.w700,
+                    height: 1.35,
                   ),
                 ),
-                const SizedBox(height: 8),
+                const SizedBox(height: 14),
                 LayoutBuilder(
                   builder: (BuildContext context, BoxConstraints constraints) {
-                    final bool stacked = constraints.maxWidth < 640;
+                    final bool stacked =
+                        constraints.maxWidth < EggBreakpoints.compact;
                     final Widget tray = _SaleModeCard(
                       icon: Icons.inventory_2_outlined,
                       title: 'Per Tray',
@@ -6162,7 +5429,11 @@ class _EggSalesScreenState extends State<EggSalesScreen> {
                     );
                     if (stacked) {
                       return Column(
-                        children: <Widget>[tray, const SizedBox(height: 10), piece],
+                        children: <Widget>[
+                          tray,
+                          const SizedBox(height: 10),
+                          piece,
+                        ],
                       );
                     }
                     return Row(
@@ -6175,33 +5446,12 @@ class _EggSalesScreenState extends State<EggSalesScreen> {
                   },
                 ),
                 const SizedBox(height: 16),
-                const Text(
-                  'Egg size',
-                  style: TextStyle(
-                    color: _DashboardPalette.mutedForeground,
-                    fontWeight: FontWeight.w700,
-                  ),
-                ),
-                const SizedBox(height: 8),
-                Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: _sizes
-                      .map(
-                        (String size) => _SaleChoiceChip(
-                          label: size,
-                          selected: _size == size,
-                          onTap: () => setState(() => _size = size),
-                        ),
-                      )
-                      .toList(),
-                ),
-                const SizedBox(height: 16),
                 LayoutBuilder(
                   builder: (BuildContext context, BoxConstraints constraints) {
-                    final bool stacked = constraints.maxWidth < 720;
+                    final bool stacked =
+                        constraints.maxWidth < EggBreakpoints.compact;
                     final Widget amount = _SalesField(
-                      label: _perTray ? 'How many trays?' : 'How many pieces?',
+                      label: _perTray ? 'Trays' : 'Pieces',
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: <Widget>[
@@ -6238,7 +5488,8 @@ class _EggSalesScreenState extends State<EggSalesScreen> {
                                   (int amount) => _SaleChoiceChip(
                                     label: '$amount',
                                     selected: _quantity == amount,
-                                    onTap: () => setState(() => _quantity = amount),
+                                    onTap: () =>
+                                        setState(() => _quantity = amount),
                                   ),
                                 )
                                 .toList(),
@@ -6247,19 +5498,31 @@ class _EggSalesScreenState extends State<EggSalesScreen> {
                       ),
                     );
                     final Widget price = _SalesField(
-                      label: _perTray ? 'Price per tray (₱)' : 'Price per piece (₱)',
+                      label: _perTray
+                          ? 'Price per tray (₱)'
+                          : 'Price per piece (₱)',
                       child: TextField(
                         controller: _priceController,
-                        keyboardType: const TextInputType.numberWithOptions(decimal: true),
-                        style: const TextStyle(color: _DashboardPalette.foreground),
+                        keyboardType: const TextInputType.numberWithOptions(
+                          decimal: true,
+                        ),
+                        style: const TextStyle(
+                          color: _DashboardPalette.foreground,
+                        ),
                         cursorColor: _DashboardPalette.primary,
                         onChanged: (_) => setState(() {}),
-                        decoration: _salesInput(_perTray ? 'e.g. 240' : 'e.g. 8'),
+                        decoration: _salesInput(
+                          _perTray ? 'e.g. 240' : 'e.g. 8',
+                        ),
                       ),
                     );
                     if (stacked) {
                       return Column(
-                        children: <Widget>[amount, const SizedBox(height: 12), price],
+                        children: <Widget>[
+                          amount,
+                          const SizedBox(height: 12),
+                          price,
+                        ],
                       );
                     }
                     return Row(
@@ -6284,7 +5547,10 @@ class _EggSalesScreenState extends State<EggSalesScreen> {
                 ),
                 if (_error != null) ...<Widget>[
                   const SizedBox(height: 12),
-                  Text(_error!, style: const TextStyle(color: Color(0xFFDC2626))),
+                  Text(
+                    _error!,
+                    style: const TextStyle(color: Color(0xFFDC2626)),
+                  ),
                 ],
                 const SizedBox(height: 16),
                 Container(
@@ -6292,10 +5558,11 @@ class _EggSalesScreenState extends State<EggSalesScreen> {
                   decoration: BoxDecoration(
                     color: const Color(0xFF241C16),
                     borderRadius: BorderRadius.circular(14),
-                    border: Border.all(color: const Color(0x66EFB73E)),
+                    border: Border.all(color: const Color(0xFF3A322B)),
                   ),
                   child: LayoutBuilder(
-                    builder: (BuildContext context, BoxConstraints constraints) {
+                    builder:
+                        (BuildContext context, BoxConstraints constraints) {
                       final Widget summary = Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: <Widget>[
@@ -6303,7 +5570,9 @@ class _EggSalesScreenState extends State<EggSalesScreen> {
                             _perTray
                                 ? '$_quantity ${_quantity == 1 ? 'tray' : 'trays'} = $_eggCount eggs · $_size'
                                 : '$_quantity ${_quantity == 1 ? 'piece' : 'pieces'} · $_size',
-                            style: const TextStyle(color: _DashboardPalette.foreground),
+                            style: const TextStyle(
+                              color: _DashboardPalette.foreground,
+                            ),
                           ),
                           const SizedBox(height: 4),
                           Text(
@@ -6319,11 +5588,14 @@ class _EggSalesScreenState extends State<EggSalesScreen> {
                       final Widget button = FilledButton.icon(
                         onPressed: _recordSale,
                         icon: const Icon(Icons.receipt_long_outlined),
-                        label: const Text('RECORD SALE'),
+                        label: const Text('Record sale'),
                         style: FilledButton.styleFrom(
                           backgroundColor: _DashboardPalette.primary,
                           foregroundColor: const Color(0xFF2A2118),
-                          padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 16),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 18,
+                            vertical: 16,
+                          ),
                           shape: RoundedRectangleBorder(
                             borderRadius: BorderRadius.circular(12),
                           ),
@@ -6332,7 +5604,11 @@ class _EggSalesScreenState extends State<EggSalesScreen> {
                       if (constraints.maxWidth < 560) {
                         return Column(
                           crossAxisAlignment: CrossAxisAlignment.stretch,
-                          children: <Widget>[summary, const SizedBox(height: 12), button],
+                          children: <Widget>[
+                            summary,
+                            const SizedBox(height: 12),
+                            button,
+                          ],
                         );
                       }
                       return Row(
@@ -6466,7 +5742,13 @@ class _SalesMetric extends StatelessWidget {
         children: <Widget>[
           Icon(icon, color: accent, size: 20),
           const SizedBox(height: 8),
-          Text(label, style: const TextStyle(color: _DashboardPalette.mutedForeground, fontSize: 12)),
+          Text(
+            label,
+            style: const TextStyle(
+              color: _DashboardPalette.mutedForeground,
+              fontSize: 12,
+            ),
+          ),
           const SizedBox(height: 4),
           Text(
             value,
@@ -6477,6 +5759,81 @@ class _SalesMetric extends StatelessWidget {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+class _SellerSizeStockTile extends StatelessWidget {
+  const _SellerSizeStockTile({
+    required this.size,
+    required this.eggs,
+    required this.trays,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final String size;
+  final int eggs;
+  final int trays;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final Color accent = _gradingSizeColor(size);
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(14),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 160),
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+          color: selected
+              ? accent.withValues(alpha: 0.12)
+              : const Color(0xFF1C1612),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(
+            color: selected ? accent : const Color(0xFF3A322B),
+            width: selected ? 1.4 : 1,
+          ),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            Text(
+              size,
+              style: TextStyle(
+                color: selected ? accent : _DashboardPalette.foreground,
+                fontWeight: FontWeight.w800,
+              ),
+            ),
+            const SizedBox(height: 10),
+            Text(
+              '$trays',
+              style: const TextStyle(
+                color: _DashboardPalette.foreground,
+                fontWeight: FontWeight.w800,
+                fontSize: 26,
+              ),
+            ),
+            const Text(
+              'trays ready',
+              style: TextStyle(
+                color: _DashboardPalette.mutedForeground,
+                fontSize: 12,
+              ),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              '$eggs eggs',
+              style: const TextStyle(
+                color: _DashboardPalette.mutedForeground,
+                fontSize: 12,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -6962,14 +6319,10 @@ class _AccountScreenState extends State<AccountScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final int adminCount =
-        _accounts.where((DemoUser u) => u.role == AppRole.admin).length;
     final int workerCount =
         _accounts.where((DemoUser u) => u.role == AppRole.worker).length;
     final int sellerCount =
         _accounts.where((DemoUser u) => u.role == AppRole.sales).length;
-    final int disabledCount =
-        _accounts.where((DemoUser u) => u.disabled).length;
     final List<DemoUser> visible = _filteredAccounts;
 
     return EggScaffold(
@@ -6994,10 +6347,10 @@ class _AccountScreenState extends State<AccountScreen> {
                             letterSpacing: 1.1,
                           ),
                     ),
-                    const SizedBox(height: 4),
-                    const Text(
-                      'Create staff, change roles, and disable access',
-                      style: TextStyle(
+                    const SizedBox(height: 6),
+                    Text(
+                      '${_accounts.length} staff  ·  $workerCount workers  ·  $sellerCount sellers',
+                      style: const TextStyle(
                         color: _DashboardPalette.mutedForeground,
                         height: 1.35,
                       ),
@@ -7021,322 +6374,267 @@ class _AccountScreenState extends State<AccountScreen> {
               ),
             ],
           ),
-          const SizedBox(height: 18),
-          _ProductionStatGrid(
-            stats: <_ProductionStat>[
-              _ProductionStat(
-                icon: Icons.groups_outlined,
-                iconColor: _DashboardPalette.primary,
-                label: 'Total',
-                value: '${_accounts.length}',
-                suffix: 'accounts',
-              ),
-              _ProductionStat(
-                icon: Icons.engineering_outlined,
-                iconColor: const Color(0xFF8BB4E8),
-                label: 'Workers',
-                value: '$workerCount',
-                suffix: 'floor',
-              ),
-              _ProductionStat(
-                icon: Icons.storefront_outlined,
-                iconColor: _DashboardPalette.warning,
-                label: 'Sellers',
-                value: '$sellerCount',
-                suffix: 'sales',
-              ),
-              _ProductionStat(
-                icon: Icons.person_off_outlined,
-                iconColor: _DashboardPalette.danger,
-                label: 'Disabled',
-                value: '$disabledCount',
-                suffix: 'locked',
-              ),
-              _ProductionStat(
-                icon: Icons.shield_outlined,
-                iconColor: _DashboardPalette.primary,
-                label: 'Admin',
-                value: '$adminCount',
-                suffix: 'owner',
-              ),
-            ],
-          ),
-          const SizedBox(height: 18),
-          LayoutBuilder(
-            builder: (BuildContext context, BoxConstraints constraints) {
-              final bool wide = constraints.maxWidth >= 980;
-              final double listWidth =
-                  wide ? constraints.maxWidth * 0.62 : constraints.maxWidth;
-              final double formWidth = wide
-                  ? constraints.maxWidth - listWidth - 16
-                  : constraints.maxWidth;
-
-              return Wrap(
-                spacing: 16,
-                runSpacing: 16,
-                children: <Widget>[
-                  SizedBox(
-                    width: listWidth,
-                    child: _GlassSection(
-                      title: 'All accounts',
-                      titleIcon: Icons.badge_outlined,
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.stretch,
-                        children: <Widget>[
-                          TextField(
-                            controller: _searchController,
-                            onChanged: (_) => setState(() {}),
-                            style: const TextStyle(
-                              color: _DashboardPalette.foreground,
-                            ),
-                            decoration: _decoration(
-                              'Search name or Gmail',
-                              suffixIcon: const Icon(
-                                Icons.search_rounded,
-                                color: Color(0xFFB7AA9A),
-                                size: 20,
-                              ),
-                            ),
-                          ),
-                          const SizedBox(height: 12),
-                          Wrap(
-                            spacing: 8,
-                            runSpacing: 8,
-                            children: <Widget>[
-                              for (final MapEntry<String, String> entry
-                                  in const <MapEntry<String, String>>[
-                                MapEntry<String, String>('all', 'All'),
-                                MapEntry<String, String>('admin', 'Admin'),
-                                MapEntry<String, String>('worker', 'Worker'),
-                                MapEntry<String, String>('sales', 'Seller'),
-                                MapEntry<String, String>('disabled', 'Disabled'),
-                              ])
-                                _AccountFilterChip(
-                                  label: entry.value,
-                                  selected: _roleFilter == entry.key,
-                                  onTap: () => setState(
-                                    () => _roleFilter = entry.key,
-                                  ),
-                                ),
-                            ],
-                          ),
-                          const SizedBox(height: 14),
-                          if (_listError != null)
-                            Text(
-                              _listError!,
-                              style: const TextStyle(
-                                color: _DashboardPalette.danger,
-                                height: 1.35,
-                              ),
-                            )
-                          else if (_loading)
-                            const Padding(
-                              padding: EdgeInsets.symmetric(vertical: 28),
-                              child: Center(
-                                child: CircularProgressIndicator(strokeWidth: 2.4),
-                              ),
-                            )
-                          else if (visible.isEmpty)
-                            const Padding(
-                              padding: EdgeInsets.symmetric(vertical: 28),
-                              child: Text(
-                                'No accounts match this filter.',
-                                textAlign: TextAlign.center,
-                                style: TextStyle(
-                                  color: _DashboardPalette.mutedForeground,
-                                ),
-                              ),
-                            )
-                          else
-                            Column(
-                              children: <Widget>[
-                                for (int i = 0; i < visible.length; i++) ...<Widget>[
-                                  _AccountManageRow(
-                                    user: visible[i],
-                                    roleLabel: _roleLabel(visible[i].role),
-                                    roleColor: _roleColor(visible[i].role),
-                                    busy: _busyEmail == visible[i].email,
-                                    isLast: i == visible.length - 1,
-                                    onRoleChanged: (String role) =>
-                                        unawaited(_setRole(visible[i], role)),
-                                    onDisabledChanged: (bool value) =>
-                                        unawaited(
-                                      _setDisabled(visible[i], value),
-                                    ),
-                                  ),
-                                ],
-                              ],
-                            ),
-                        ],
-                      ),
+          const SizedBox(height: 20),
+          _GlassSection(
+            title: 'Staff directory',
+            titleIcon: Icons.groups_outlined,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: <Widget>[
+                TextField(
+                  controller: _searchController,
+                  onChanged: (_) => setState(() {}),
+                  style: const TextStyle(color: _DashboardPalette.foreground),
+                  decoration: _decoration(
+                    'Search by name or Gmail',
+                    suffixIcon: const Icon(
+                      Icons.search_rounded,
+                      color: Color(0xFFB7AA9A),
+                      size: 20,
                     ),
                   ),
-                  SizedBox(
-                    width: formWidth,
-                    child: Form(
-                      key: _formKey,
-                      child: _GlassSection(
-                        title: 'Add staff',
-                        titleIcon: Icons.person_add_alt_1_outlined,
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                ),
+                const SizedBox(height: 16),
+                _AccountFilterBar(
+                  selected: _roleFilter,
+                  onChanged: (String value) =>
+                      setState(() => _roleFilter = value),
+                ),
+                const SizedBox(height: 8),
+                if (_listError != null)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 16),
+                    child: Text(
+                      _listError!,
+                      style: const TextStyle(
+                        color: _DashboardPalette.danger,
+                        height: 1.35,
+                      ),
+                    ),
+                  )
+                else if (_loading)
+                  const Padding(
+                    padding: EdgeInsets.symmetric(vertical: 40),
+                    child: Center(
+                      child: CircularProgressIndicator(strokeWidth: 2.4),
+                    ),
+                  )
+                else if (visible.isEmpty)
+                  const Padding(
+                    padding: EdgeInsets.symmetric(vertical: 40),
+                    child: Text(
+                      'No accounts match this filter.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        color: _DashboardPalette.mutedForeground,
+                      ),
+                    ),
+                  )
+                else
+                  Column(
+                    children: <Widget>[
+                      for (int i = 0; i < visible.length; i++)
+                        _AccountManageRow(
+                          user: visible[i],
+                          roleLabel: _roleLabel(visible[i].role),
+                          roleColor: _roleColor(visible[i].role),
+                          busy: _busyEmail == visible[i].email,
+                          isLast: i == visible.length - 1,
+                          onRoleChanged: (String role) =>
+                              unawaited(_setRole(visible[i], role)),
+                          onDisabledChanged: (bool value) =>
+                              unawaited(_setDisabled(visible[i], value)),
+                        ),
+                    ],
+                  ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 18),
+          Form(
+            key: _formKey,
+            child: _GlassSection(
+              title: 'Invite staff',
+              titleIcon: Icons.person_add_alt_1_outlined,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: <Widget>[
+                  const Text(
+                    'Creates a Gmail login and sends a verification code. Workers use production and QC; sellers use sales only.',
+                    style: TextStyle(
+                      color: _DashboardPalette.mutedForeground,
+                      height: 1.45,
+                      fontSize: 13.5,
+                    ),
+                  ),
+                  const SizedBox(height: 18),
+                  _AccountRoleToggle(
+                    salesSelected: _salesAccount,
+                    onChanged: (bool sales) =>
+                        setState(() => _salesAccount = sales),
+                  ),
+                  const SizedBox(height: 18),
+                  LayoutBuilder(
+                    builder:
+                        (BuildContext context, BoxConstraints constraints) {
+                      final bool wide = constraints.maxWidth >= EggBreakpoints.compact;
+                      final List<Widget> fields = <Widget>[
+                        TextFormField(
+                          controller: _nameController,
+                          style: const TextStyle(
+                            color: _DashboardPalette.foreground,
+                          ),
+                          decoration: _decoration('Full name'),
+                          validator: (String? value) =>
+                              (value ?? '').trim().isEmpty
+                                  ? 'Name is required'
+                                  : null,
+                        ),
+                        TextFormField(
+                          controller: _emailController,
+                          keyboardType: TextInputType.emailAddress,
+                          style: const TextStyle(
+                            color: _DashboardPalette.foreground,
+                          ),
+                          decoration: _decoration('Gmail address'),
+                          validator: (String? value) {
+                            final String email =
+                                (value ?? '').trim().toLowerCase();
+                            if (!AppState.isRealGmail(email)) {
+                              return 'Use a real @gmail.com address';
+                            }
+                            return null;
+                          },
+                        ),
+                        TextFormField(
+                          controller: _passwordController,
+                          obscureText: _obscurePassword,
+                          style: const TextStyle(
+                            color: _DashboardPalette.foreground,
+                          ),
+                          decoration: _decoration(
+                            'Temporary password',
+                            suffixIcon: IconButton(
+                              onPressed: () => setState(
+                                () => _obscurePassword = !_obscurePassword,
+                              ),
+                              icon: Icon(
+                                _obscurePassword
+                                    ? Icons.visibility_outlined
+                                    : Icons.visibility_off_outlined,
+                                color: const Color(0xFFB7AA9A),
+                              ),
+                            ),
+                          ),
+                          validator: _validatePassword,
+                        ),
+                        TextFormField(
+                          controller: _confirmController,
+                          obscureText: _obscurePassword,
+                          style: const TextStyle(
+                            color: _DashboardPalette.foreground,
+                          ),
+                          decoration: _decoration('Confirm password'),
+                          validator: (String? value) {
+                            if ((value ?? '') != _passwordController.text) {
+                              return 'Passwords do not match';
+                            }
+                            return null;
+                          },
+                        ),
+                      ];
+
+                      if (!wide) {
+                        return Column(
                           children: <Widget>[
-                            const Text(
-                              'Invite a real Gmail. Worker uses production/QC; Seller uses the sales desk only.',
-                              style: TextStyle(
-                                color: _DashboardPalette.mutedForeground,
-                                height: 1.4,
-                                fontSize: 13.5,
-                              ),
-                            ),
-                            const SizedBox(height: 14),
-                            Row(
-                              children: <Widget>[
-                                Expanded(
-                                  child: _AccountFilterChip(
-                                    label: 'Worker',
-                                    selected: !_salesAccount,
-                                    expanded: true,
-                                    onTap: () =>
-                                        setState(() => _salesAccount = false),
-                                  ),
-                                ),
-                                const SizedBox(width: 8),
-                                Expanded(
-                                  child: _AccountFilterChip(
-                                    label: 'Seller',
-                                    selected: _salesAccount,
-                                    expanded: true,
-                                    onTap: () =>
-                                        setState(() => _salesAccount = true),
-                                  ),
-                                ),
-                              ],
-                            ),
-                            const SizedBox(height: 14),
-                            TextFormField(
-                              controller: _nameController,
-                              style: const TextStyle(
-                                color: _DashboardPalette.foreground,
-                              ),
-                              decoration: _decoration('Full name'),
-                              validator: (String? value) =>
-                                  (value ?? '').trim().isEmpty
-                                      ? 'Name is required'
-                                      : null,
-                            ),
-                            const SizedBox(height: 10),
-                            TextFormField(
-                              controller: _emailController,
-                              keyboardType: TextInputType.emailAddress,
-                              style: const TextStyle(
-                                color: _DashboardPalette.foreground,
-                              ),
-                              decoration: _decoration('Gmail address'),
-                              validator: (String? value) {
-                                final String email =
-                                    (value ?? '').trim().toLowerCase();
-                                if (!AppState.isRealGmail(email)) {
-                                  return 'Use a real @gmail.com address';
-                                }
-                                return null;
-                              },
-                            ),
-                            const SizedBox(height: 10),
-                            TextFormField(
-                              controller: _passwordController,
-                              obscureText: _obscurePassword,
-                              style: const TextStyle(
-                                color: _DashboardPalette.foreground,
-                              ),
-                              decoration: _decoration(
-                                'Temporary password',
-                                suffixIcon: IconButton(
-                                  onPressed: () => setState(
-                                    () => _obscurePassword = !_obscurePassword,
-                                  ),
-                                  icon: Icon(
-                                    _obscurePassword
-                                        ? Icons.visibility_outlined
-                                        : Icons.visibility_off_outlined,
-                                    color: const Color(0xFFB7AA9A),
-                                  ),
-                                ),
-                              ),
-                              validator: _validatePassword,
-                            ),
-                            const SizedBox(height: 10),
-                            TextFormField(
-                              controller: _confirmController,
-                              obscureText: _obscurePassword,
-                              style: const TextStyle(
-                                color: _DashboardPalette.foreground,
-                              ),
-                              decoration: _decoration('Confirm password'),
-                              validator: (String? value) {
-                                if ((value ?? '') != _passwordController.text) {
-                                  return 'Passwords do not match';
-                                }
-                                return null;
-                              },
-                            ),
-                            if (_error != null) ...<Widget>[
-                              const SizedBox(height: 12),
-                              Text(
-                                _error!,
-                                style: const TextStyle(
-                                  color: _DashboardPalette.danger,
-                                  height: 1.35,
-                                ),
-                              ),
+                            for (int i = 0; i < fields.length; i++) ...<Widget>[
+                              if (i > 0) const SizedBox(height: 12),
+                              fields[i],
                             ],
-                            if (_success != null) ...<Widget>[
-                              const SizedBox(height: 12),
-                              Text(
-                                _success!,
-                                style: const TextStyle(
-                                  color: _DashboardPalette.success,
-                                  height: 1.35,
-                                ),
-                              ),
-                            ],
-                            const SizedBox(height: 16),
-                            FilledButton(
-                              onPressed: _saving ? null : _createAccount,
-                              style: FilledButton.styleFrom(
-                                backgroundColor: _DashboardPalette.primary,
-                                foregroundColor: const Color(0xFF2A2118),
-                                padding:
-                                    const EdgeInsets.symmetric(vertical: 15),
-                                shape: RoundedRectangleBorder(
-                                  borderRadius: BorderRadius.circular(10),
-                                ),
-                              ),
-                              child: _saving
-                                  ? const SizedBox(
-                                      width: 22,
-                                      height: 22,
-                                      child: CircularProgressIndicator(
-                                        strokeWidth: 2.4,
-                                      ),
-                                    )
-                                  : Text(
-                                      _salesAccount
-                                          ? 'Create seller'
-                                          : 'Create worker',
-                                      style: const TextStyle(
-                                        fontWeight: FontWeight.w700,
-                                      ),
-                                    ),
-                            ),
                           ],
+                        );
+                      }
+
+                      return Column(
+                        children: <Widget>[
+                          Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: <Widget>[
+                              Expanded(child: fields[0]),
+                              const SizedBox(width: 12),
+                              Expanded(child: fields[1]),
+                            ],
+                          ),
+                          const SizedBox(height: 12),
+                          Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: <Widget>[
+                              Expanded(child: fields[2]),
+                              const SizedBox(width: 12),
+                              Expanded(child: fields[3]),
+                            ],
+                          ),
+                        ],
+                      );
+                    },
+                  ),
+                  if (_error != null) ...<Widget>[
+                    const SizedBox(height: 14),
+                    Text(
+                      _error!,
+                      style: const TextStyle(
+                        color: _DashboardPalette.danger,
+                        height: 1.35,
+                      ),
+                    ),
+                  ],
+                  if (_success != null) ...<Widget>[
+                    const SizedBox(height: 14),
+                    Text(
+                      _success!,
+                      style: const TextStyle(
+                        color: _DashboardPalette.success,
+                        height: 1.35,
+                      ),
+                    ),
+                  ],
+                  const SizedBox(height: 18),
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: FilledButton(
+                      onPressed: _saving ? null : _createAccount,
+                      style: FilledButton.styleFrom(
+                        backgroundColor: _DashboardPalette.primary,
+                        foregroundColor: const Color(0xFF2A2118),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 22,
+                          vertical: 14,
+                        ),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(10),
                         ),
                       ),
+                      child: _saving
+                          ? const SizedBox(
+                              width: 20,
+                              height: 20,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2.4,
+                              ),
+                            )
+                          : Text(
+                              _salesAccount
+                                  ? 'Create seller account'
+                                  : 'Create worker account',
+                              style: const TextStyle(
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
                     ),
                   ),
                 ],
-              );
-            },
+              ),
+            ),
           ),
         ],
       ),
@@ -7344,51 +6642,168 @@ class _AccountScreenState extends State<AccountScreen> {
   }
 }
 
-class _AccountFilterChip extends StatelessWidget {
-  const _AccountFilterChip({
+class _AccountFilterBar extends StatelessWidget {
+  const _AccountFilterBar({
+    required this.selected,
+    required this.onChanged,
+  });
+
+  final String selected;
+  final ValueChanged<String> onChanged;
+
+  static const List<MapEntry<String, String>> _filters =
+      <MapEntry<String, String>>[
+    MapEntry<String, String>('all', 'All'),
+    MapEntry<String, String>('worker', 'Workers'),
+    MapEntry<String, String>('sales', 'Sellers'),
+    MapEntry<String, String>('admin', 'Admin'),
+    MapEntry<String, String>('disabled', 'Disabled'),
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: const BoxDecoration(
+        border: Border(
+          bottom: BorderSide(color: Color(0xFF332A24)),
+        ),
+      ),
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        child: Row(
+          children: <Widget>[
+            for (final MapEntry<String, String> entry in _filters)
+              InkWell(
+                onTap: () => onChanged(entry.key),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 12,
+                  ),
+                  decoration: BoxDecoration(
+                    border: Border(
+                      bottom: BorderSide(
+                        color: selected == entry.key
+                            ? _DashboardPalette.primary
+                            : Colors.transparent,
+                        width: 2,
+                      ),
+                    ),
+                  ),
+                  child: Text(
+                    entry.value,
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      color: selected == entry.key
+                          ? _DashboardPalette.primary
+                          : _DashboardPalette.mutedForeground,
+                      fontWeight: selected == entry.key
+                          ? FontWeight.w700
+                          : FontWeight.w500,
+                      fontSize: 13,
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _AccountRoleToggle extends StatelessWidget {
+  const _AccountRoleToggle({
+    required this.salesSelected,
+    required this.onChanged,
+  });
+
+  final bool salesSelected;
+  final ValueChanged<bool> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(4),
+      decoration: BoxDecoration(
+        color: const Color(0xFF221C18),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: const Color(0xFF332A24)),
+      ),
+      child: Row(
+        children: <Widget>[
+          Expanded(
+            child: _AccountRoleToggleItem(
+              label: 'Worker',
+              subtitle: 'Production & QC',
+              selected: !salesSelected,
+              onTap: () => onChanged(false),
+            ),
+          ),
+          Expanded(
+            child: _AccountRoleToggleItem(
+              label: 'Seller',
+              subtitle: 'Sales desk',
+              selected: salesSelected,
+              onTap: () => onChanged(true),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _AccountRoleToggleItem extends StatelessWidget {
+  const _AccountRoleToggleItem({
     required this.label,
+    required this.subtitle,
     required this.selected,
     required this.onTap,
-    this.expanded = false,
   });
 
   final String label;
+  final String subtitle;
   final bool selected;
   final VoidCallback onTap;
-  final bool expanded;
 
   @override
   Widget build(BuildContext context) {
     return InkWell(
       onTap: onTap,
-      borderRadius: BorderRadius.circular(10),
-      child: Container(
-        width: expanded ? double.infinity : null,
-        padding: EdgeInsets.symmetric(
-          horizontal: expanded ? 12 : 14,
-          vertical: 10,
-        ),
-        alignment: Alignment.center,
+      borderRadius: BorderRadius.circular(9),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 160),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
         decoration: BoxDecoration(
           color: selected
-              ? _DashboardPalette.primary.withValues(alpha: 0.16)
-              : const Color(0xFF2A221C),
-          borderRadius: BorderRadius.circular(10),
-          border: Border.all(
-            color: selected
-                ? _DashboardPalette.primary
-                : const Color(0xFF4A4038),
-          ),
+              ? _DashboardPalette.primary.withValues(alpha: 0.14)
+              : Colors.transparent,
+          borderRadius: BorderRadius.circular(9),
         ),
-        child: Text(
-          label,
-          style: TextStyle(
-            color: selected
-                ? _DashboardPalette.primary
-                : _DashboardPalette.foreground,
-            fontWeight: FontWeight.w700,
-            fontSize: 13,
-          ),
+        child: Column(
+          children: <Widget>[
+            Text(
+              label,
+              style: TextStyle(
+                color: selected
+                    ? _DashboardPalette.primary
+                    : _DashboardPalette.foreground,
+                fontWeight: FontWeight.w700,
+                fontSize: 14,
+              ),
+            ),
+            const SizedBox(height: 2),
+            Text(
+              subtitle,
+              style: TextStyle(
+                color: selected
+                    ? _DashboardPalette.primary.withValues(alpha: 0.85)
+                    : _DashboardPalette.mutedForeground,
+                fontSize: 12,
+              ),
+            ),
+          ],
         ),
       ),
     );
@@ -7421,139 +6836,185 @@ class _AccountManageRow extends StatelessWidget {
     final String initial = user.name.trim().isNotEmpty
         ? user.name.trim()[0].toUpperCase()
         : (user.email.isNotEmpty ? user.email[0].toUpperCase() : '?');
-    final String roleValue =
-        user.role == AppRole.sales ? 'sales' : 'worker';
+    final String displayName =
+        user.name.isEmpty ? user.email.split('@').first : user.name;
+    final String statusLabel = user.disabled
+        ? 'Disabled'
+        : (user.emailVerified ? 'Verified' : 'Pending verify');
+    final Color statusColor = user.disabled
+        ? _DashboardPalette.danger
+        : (user.emailVerified
+            ? _DashboardPalette.success
+            : _DashboardPalette.warning);
+
+    final Widget avatar = Container(
+      width: 42,
+      height: 42,
+      alignment: Alignment.center,
+      decoration: BoxDecoration(
+        color: roleColor.withValues(alpha: 0.14),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Text(
+        initial,
+        style: TextStyle(
+          color: roleColor,
+          fontWeight: FontWeight.w800,
+          fontSize: 15,
+        ),
+      ),
+    );
+    final Widget identity = Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        Text(
+          displayName,
+          style: TextStyle(
+            color: user.disabled
+                ? _DashboardPalette.mutedForeground
+                : _DashboardPalette.foreground,
+            fontWeight: FontWeight.w700,
+            fontSize: 15,
+          ),
+        ),
+        const SizedBox(height: 3),
+        Text(
+          user.email,
+          style: const TextStyle(
+            color: _DashboardPalette.mutedForeground,
+            fontSize: 12.5,
+          ),
+        ),
+        const SizedBox(height: 6),
+        Text(
+          statusLabel,
+          style: TextStyle(
+            color: statusColor,
+            fontSize: 12,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+      ],
+    );
+    final Widget actions;
+    if (busy) {
+      actions = const SizedBox(
+        width: 22,
+        height: 22,
+        child: CircularProgressIndicator(strokeWidth: 2),
+      );
+    } else if (isSoleAdmin) {
+      actions = Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        decoration: BoxDecoration(
+          color: roleColor.withValues(alpha: 0.12),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Text(
+          roleLabel,
+          style: TextStyle(
+            color: roleColor,
+            fontWeight: FontWeight.w700,
+            fontSize: 12.5,
+          ),
+        ),
+      );
+    } else {
+      actions = Wrap(
+        spacing: 8,
+        runSpacing: 8,
+        crossAxisAlignment: WrapCrossAlignment.center,
+        children: <Widget>[
+          PopupMenuButton<String>(
+            tooltip: 'Change role',
+            initialValue: user.role == AppRole.sales ? 'sales' : 'worker',
+            color: const Color(0xFF221C18),
+            onSelected: onRoleChanged,
+            itemBuilder: (BuildContext context) =>
+                const <PopupMenuEntry<String>>[
+              PopupMenuItem<String>(value: 'worker', child: Text('Worker')),
+              PopupMenuItem<String>(value: 'sales', child: Text('Seller')),
+            ],
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              decoration: BoxDecoration(
+                color: const Color(0xFF221C18),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: const Color(0xFF332A24)),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: <Widget>[
+                  Text(
+                    roleLabel,
+                    style: TextStyle(
+                      color: roleColor,
+                      fontWeight: FontWeight.w700,
+                      fontSize: 12.5,
+                    ),
+                  ),
+                  const SizedBox(width: 4),
+                  Icon(Icons.expand_more_rounded, size: 16, color: roleColor),
+                ],
+              ),
+            ),
+          ),
+          TextButton(
+            onPressed: () => onDisabledChanged(!user.disabled),
+            style: TextButton.styleFrom(
+              foregroundColor: user.disabled
+                  ? _DashboardPalette.success
+                  : _DashboardPalette.danger,
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            ),
+            child: Text(
+              user.disabled ? 'Enable' : 'Disable',
+              style: const TextStyle(fontWeight: FontWeight.w700),
+            ),
+          ),
+        ],
+      );
+    }
 
     return Container(
-      padding: const EdgeInsets.symmetric(vertical: 12),
+      padding: const EdgeInsets.symmetric(vertical: 16),
       decoration: BoxDecoration(
         border: isLast
             ? null
             : const Border(
-                bottom: BorderSide(color: Color(0x334A4038)),
+                bottom: BorderSide(color: Color(0xFF2A221C)),
               ),
       ),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.center,
-        children: <Widget>[
-          Container(
-            width: 40,
-            height: 40,
-            alignment: Alignment.center,
-            decoration: BoxDecoration(
-              color: roleColor.withValues(alpha: 0.16),
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: roleColor.withValues(alpha: 0.35)),
-            ),
-            child: Text(
-              initial,
-              style: TextStyle(
-                color: roleColor,
-                fontWeight: FontWeight.w800,
-              ),
-            ),
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
+      child: LayoutBuilder(
+        builder: (BuildContext context, BoxConstraints constraints) {
+          final bool stack = constraints.maxWidth < EggBreakpoints.compact;
+          if (stack) {
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
               children: <Widget>[
-                Text(
-                  user.name.isEmpty ? user.email.split('@').first : user.name,
-                  style: TextStyle(
-                    color: user.disabled
-                        ? _DashboardPalette.mutedForeground
-                        : _DashboardPalette.foreground,
-                    fontWeight: FontWeight.w700,
-                    fontSize: 14.5,
-                    decoration:
-                        user.disabled ? TextDecoration.lineThrough : null,
-                  ),
+                Row(
+                  children: <Widget>[
+                    avatar,
+                    const SizedBox(width: 14),
+                    Expanded(child: identity),
+                  ],
                 ),
-                const SizedBox(height: 2),
-                Text(
-                  user.email,
-                  style: const TextStyle(
-                    color: _DashboardPalette.mutedForeground,
-                    fontSize: 12.5,
-                  ),
-                ),
-                const SizedBox(height: 4),
-                Text(
-                  user.disabled
-                      ? 'Disabled'
-                      : (user.emailVerified ? 'Verified' : 'Pending verify'),
-                  style: TextStyle(
-                    color: user.disabled
-                        ? _DashboardPalette.danger
-                        : (user.emailVerified
-                            ? _DashboardPalette.success
-                            : _DashboardPalette.warning),
-                    fontSize: 11.5,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
+                const SizedBox(height: 12),
+                Align(alignment: Alignment.centerLeft, child: actions),
               ],
-            ),
-          ),
-          const SizedBox(width: 8),
-          if (busy)
-            const SizedBox(
-              width: 22,
-              height: 22,
-              child: CircularProgressIndicator(strokeWidth: 2),
-            )
-          else if (isSoleAdmin)
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-              decoration: BoxDecoration(
-                color: roleColor.withValues(alpha: 0.14),
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: Text(
-                roleLabel,
-                style: TextStyle(
-                  color: roleColor,
-                  fontWeight: FontWeight.w700,
-                  fontSize: 12,
-                ),
-              ),
-            )
-          else ...<Widget>[
-            DropdownButtonHideUnderline(
-              child: DropdownButton<String>(
-                value: roleValue,
-                dropdownColor: const Color(0xFF2A221C),
-                style: const TextStyle(
-                  color: _DashboardPalette.foreground,
-                  fontWeight: FontWeight.w600,
-                  fontSize: 13,
-                ),
-                items: const <DropdownMenuItem<String>>[
-                  DropdownMenuItem<String>(
-                    value: 'worker',
-                    child: Text('Worker'),
-                  ),
-                  DropdownMenuItem<String>(
-                    value: 'sales',
-                    child: Text('Seller'),
-                  ),
-                ],
-                onChanged: (String? value) {
-                  if (value != null) {
-                    onRoleChanged(value);
-                  }
-                },
-              ),
-            ),
-            const SizedBox(width: 4),
-            Switch.adaptive(
-              value: !user.disabled,
-              activeThumbColor: _DashboardPalette.success,
-              onChanged: (bool enabled) => onDisabledChanged(!enabled),
-            ),
-          ],
-        ],
+            );
+          }
+          return Row(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: <Widget>[
+              avatar,
+              const SizedBox(width: 14),
+              Expanded(child: identity),
+              const SizedBox(width: 12),
+              actions,
+            ],
+          );
+        },
       ),
     );
   }
@@ -7840,7 +7301,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                 const SizedBox(height: 12),
                 LayoutBuilder(
                   builder: (BuildContext context, BoxConstraints constraints) {
-                    final bool medium = constraints.maxWidth >= 700;
+                    final bool medium = constraints.maxWidth >= EggBreakpoints.compact;
                     final double width = medium
                         ? (constraints.maxWidth - 12) / 2
                         : constraints.maxWidth;
@@ -8217,18 +7678,6 @@ class _Sidebar extends StatelessWidget {
                         ),
                       ),
                     ),
-                    const SizedBox(height: 8),
-                    _SidebarTile(
-                      item: _NavItem(
-                        label: 'Notifications',
-                        route: 'notifications',
-                        icon: appState.workerUnreadCount > 0
-                            ? Icons.notifications_active_outlined
-                            : Icons.notifications_none_outlined,
-                      ),
-                      selected: false,
-                      onTap: () => _showNotificationPanel(context, appState),
-                    ),
                     const SizedBox(height: 24),
                     const Text(
                       'ACCOUNT',
@@ -8290,7 +7739,7 @@ class _Sidebar extends StatelessWidget {
 
 void _showNotificationPanel(BuildContext context, AppState appState) {
   appState.refreshOperationalNotifications();
-  final bool wide = MediaQuery.sizeOf(context).width >= 700;
+  final bool wide = EggBreakpoints.isExpanded(context);
   final Widget panel = AnimatedBuilder(
     animation: appState,
     builder: (BuildContext context, Widget? child) {
@@ -8299,7 +7748,7 @@ void _showNotificationPanel(BuildContext context, AppState appState) {
           ? const Padding(
               padding: EdgeInsets.symmetric(vertical: 24),
               child: Text(
-                'No notifications yet. Live farm status will appear here.',
+                'No alerts right now.',
                 style: TextStyle(color: _DashboardPalette.mutedForeground),
               ),
             )
@@ -8698,7 +8147,7 @@ class _EggScaffoldState extends State<EggScaffold> {
     final Widget body = widget.body;
     final DemoUser? user = appState.currentUser;
     final String dateLabel = _formatDashboardDate();
-    final bool wide = MediaQuery.sizeOf(context).width >= 840;
+    final bool wide = EggBreakpoints.isExpanded(context);
 
     final List<_NavItem> navItems = appState.isSales
         ? <_NavItem>[
@@ -8915,6 +8364,9 @@ class _EggScaffoldState extends State<EggScaffold> {
                     fontWeight: FontWeight.w700,
                   ),
                   unselectedLabelStyle: const TextStyle(fontSize: 10),
+                  showSelectedLabels: true,
+                  showUnselectedLabels:
+                      MediaQuery.sizeOf(context).width >= 390,
                   items: bottomItems
                       .map(
                         (_NavItem item) => BottomNavigationBarItem(
@@ -8923,7 +8375,11 @@ class _EggScaffoldState extends State<EggScaffold> {
                             item.route == selectedRoute,
                             appState,
                           ),
-                          label: item.label,
+                          label: item.label == 'Quality Control'
+                              ? 'QC'
+                              : item.label == 'Account Management'
+                                  ? 'Accounts'
+                                  : item.label,
                         ),
                       )
                       .toList(),
@@ -9023,34 +8479,6 @@ class _EggScaffoldState extends State<EggScaffold> {
                                     }
                                   },
                                 ),
-                              ),
-                            ),
-                            Padding(
-                              padding: const EdgeInsets.only(bottom: 8),
-                              child: _DrawerNavTile(
-                                item: _NavItem(
-                                  label: 'Notifications',
-                                  route: 'notifications',
-                                  icon: appState.workerUnreadCount > 0
-                                      ? Icons.notifications_active_outlined
-                                      : Icons.notifications_none_outlined,
-                                ),
-                                selected: false,
-                                onTap: () {
-                                  final NavigatorState rootNav =
-                                      Navigator.of(context, rootNavigator: true);
-                                  Navigator.of(context).pop();
-                                  WidgetsBinding.instance.addPostFrameCallback((_) {
-                                    final BuildContext panelContext =
-                                        rootNav.context;
-                                    if (panelContext.mounted) {
-                                      _showNotificationPanel(
-                                        panelContext,
-                                        appState,
-                                      );
-                                    }
-                                  });
-                                },
                               ),
                             ),
                           ],
@@ -9232,7 +8660,7 @@ class _DashboardStatGrid extends StatelessWidget {
     return LayoutBuilder(
       builder: (BuildContext context, BoxConstraints constraints) {
         final bool large = constraints.maxWidth >= 1080;
-        final bool medium = constraints.maxWidth >= 700;
+        final bool medium = constraints.maxWidth >= EggBreakpoints.compact;
         final int columns = !medium
             ? 1
             : (stats.length == 4 && constraints.maxWidth >= 780)
@@ -9477,13 +8905,12 @@ class _EggAnalyticsBoard extends StatelessWidget {
   Widget build(BuildContext context) {
     final int good = appState.liveGoodEggs;
     final int cracked = appState.liveCrackedEggs;
-    final int inspected = good + cracked;
-    final int produced = appState.productionRecords.fold<int>(
-      0,
-      (int sum, ProductionRecord record) => sum + record.count,
-    );
+    final int dirty = appState.liveDirtyEggs;
+    final int inspected = good + cracked + dirty;
+    final int producedToday = appState.todayProductionTotal;
     final bool hasRecords = inspected > 0 ||
-        produced > 0 ||
+        producedToday > 0 ||
+        appState.productionRecords.isNotEmpty ||
         appState.iotReadings.isNotEmpty ||
         appState.detectionRecords.isNotEmpty;
     if (!hasRecords) {
@@ -9523,13 +8950,30 @@ class _EggAnalyticsBoard extends StatelessWidget {
             children: <Widget>[
               _AnalyticsPill(label: 'Inspected', value: '$inspected'),
               _AnalyticsPill(label: 'Good', value: '$goodPercent%'),
-              _AnalyticsPill(label: 'Logged production', value: '$produced'),
+              _AnalyticsPill(label: 'Today production', value: '$producedToday'),
             ],
           ),
           const SizedBox(height: 14),
-          _GradeBar(label: 'Good', count: good, total: base, color: _DashboardPalette.success),
+          _GradeBar(
+            label: 'Good',
+            count: good,
+            total: base,
+            color: _DashboardPalette.success,
+          ),
           const SizedBox(height: 8),
-          _GradeBar(label: 'Cracked', count: cracked, total: base, color: _DashboardPalette.primary),
+          _GradeBar(
+            label: 'Dirty',
+            count: dirty,
+            total: base,
+            color: _DashboardPalette.danger,
+          ),
+          const SizedBox(height: 8),
+          _GradeBar(
+            label: 'Cracked',
+            count: cracked,
+            total: base,
+            color: _DashboardPalette.primary,
+          ),
           if (recentDates.isNotEmpty) ...<Widget>[
             const SizedBox(height: 16),
             const Text(
@@ -9566,7 +9010,9 @@ class _EggAnalyticsBoard extends StatelessWidget {
                 padding: const EdgeInsets.only(bottom: 6),
                 child: Text(
                   '${reading.displayGrade} · ${reading.sizeClass.isEmpty ? 'size n/a' : reading.sizeClass} · ${reading.weightGrams.toStringAsFixed(1)} g',
-                  style: const TextStyle(color: _DashboardPalette.mutedForeground),
+                  style: const TextStyle(
+                    color: _DashboardPalette.mutedForeground,
+                  ),
                 ),
               ),
             ),
@@ -9619,25 +9065,32 @@ class _GradeBar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final double share = total == 0 ? 0 : count / total;
+    final bool compact =
+        MediaQuery.sizeOf(context).width < EggBreakpoints.compact;
     return Row(
       children: <Widget>[
         SizedBox(
-          width: 110,
+          width: compact ? 64 : 88,
           child: Text(
             label,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
             style: const TextStyle(color: _DashboardPalette.mutedForeground),
           ),
         ),
         Expanded(child: _GradientProgressBar(value: share)),
-        const SizedBox(width: 10),
+        const SizedBox(width: 8),
         SizedBox(
-          width: 64,
+          width: compact ? 56 : 72,
           child: Text(
             '$count  ${(share * 100).round()}%',
             textAlign: TextAlign.right,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
             style: const TextStyle(
               color: _DashboardPalette.foreground,
               fontWeight: FontWeight.w700,
+              fontSize: 12,
             ),
           ),
         ),
@@ -9807,13 +9260,15 @@ class _DayHarvest {
 void _countGrade(String raw, int qty, List<int> counts) {
   final String grade = raw.toLowerCase();
   final int amount = qty <= 0 ? 1 : qty;
-  if (grade.contains('crack')) {
+  if (grade.contains('crack') && !grade.contains('no crack')) {
     counts[1] += amount;
+  } else if (grade.contains('dirty') ||
+      grade.contains('soil') ||
+      grade.contains('stain')) {
+    counts[2] += amount;
   } else if (grade.contains('good') ||
       grade.contains('clean') ||
-      grade.contains('dirt') ||
-      grade.contains('reject')) {
-    // Dirty/dust is not a system grade — count as Good.
+      grade.contains('no crack')) {
     counts[0] += amount;
   }
 }
@@ -9855,22 +9310,16 @@ _DayHarvest _harvestOnDay(AppState appState, DateTime day) {
     sources.add(<int>[
       appState.liveGoodEggs,
       appState.liveCrackedEggs,
-      0,
+      appState.liveDirtyEggs,
     ]);
   }
 
   List<int> best = <int>[0, 0, 0];
   int bestTotal = 0;
   for (final List<int> source in sources) {
-    // Index 2 was Dirty — fold into Good; Crack only is reject.
-    final List<int> folded = <int>[
-      source[0] + source[2],
-      source[1],
-      0,
-    ];
-    final int total = folded[0] + folded[1];
+    final int total = source[0] + source[1] + source[2];
     if (total > bestTotal) {
-      best = folded;
+      best = source;
       bestTotal = total;
     }
   }
@@ -9880,7 +9329,7 @@ _DayHarvest _harvestOnDay(AppState appState, DateTime day) {
     harvested: logged > bestTotal ? logged : bestTotal,
     good: best[0],
     crack: best[1],
-    rejected: 0,
+    rejected: best[2],
   );
 }
 
@@ -9958,6 +9407,7 @@ class _WeeklyProductionOverviewState extends State<_WeeklyProductionOverview> {
               day: _fullWeekDayLabels[selected.weekday - DateTime.monday],
               total: harvest.harvested,
               good: harvest.good,
+              dirty: harvest.rejected,
               cracked: harvest.crack,
             ),
             onSelect: (int index) => setState(() => _selectedIndex = index),
@@ -10266,74 +9716,84 @@ class _LiveCameraStream extends StatelessWidget {
     // Hosted tunnel cannot keep multipart /stream open — poll still JPEGs.
     // Prefer the farm tunnel for snapshots: workers.dev returns 429 when the
     // dashboard polls /live.jpg too often through the Worker proxy.
-    final bool usePoll = pollSnapshots || ApiConfig.isHostedHttpsWeb;
-    final String camBase = ApiConfig.isHostedHttpsWeb
-        ? ApiConfig.farmTunnelUrl
-        : base;
+    // LAN: continuous /stream MJPEG (low lag). Hosted: poll /live.jpg (tunnel-safe).
+    // Hosted: always poll the farm tunnel for /live.jpg (Worker proxy times out
+    // under live detect load and left the tile on "Waiting for internet camera").
+    final bool usePoll = ApiConfig.isHostedHttpsWeb || pollSnapshots;
+    final String camBase =
+        usePoll ? ApiConfig.farmTunnelUrl : base;
     final String streamUrl = usePoll ? '$camBase/live.jpg' : '$camBase/stream';
 
-    return SizedBox(
-      width: 280,
-      child: Container(
-        padding: const EdgeInsets.all(10),
-        decoration: BoxDecoration(
-          color: const Color(0xFF171210),
-          borderRadius: BorderRadius.circular(14),
-          border: Border.all(color: const Color(0xFF3A302A)),
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: <Widget>[
-            Row(
+    return LayoutBuilder(
+      builder: (BuildContext context, BoxConstraints constraints) {
+        final double camWidth = constraints.maxWidth.isFinite
+            ? constraints.maxWidth.clamp(0, 420).toDouble()
+            : 280;
+        final double camHeight = camWidth < EggBreakpoints.compact ? 180 : 140;
+        return SizedBox(
+          width: camWidth,
+          child: Container(
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(
+              color: const Color(0xFF171210),
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(color: const Color(0xFF3A302A)),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: <Widget>[
-                const Icon(
-                  Icons.videocam_outlined,
-                  size: 14,
-                  color: _DashboardPalette.primary,
-                ),
-                const SizedBox(width: 6),
-                const Expanded(
-                  child: Text(
-                    'Live Camera',
-                    style: TextStyle(
-                      color: _DashboardPalette.foreground,
-                      fontWeight: FontWeight.w700,
-                      fontSize: 12,
+                Row(
+                  children: <Widget>[
+                    const Icon(
+                      Icons.videocam_outlined,
+                      size: 14,
+                      color: _DashboardPalette.primary,
                     ),
-                  ),
+                    const SizedBox(width: 6),
+                    const Expanded(
+                      child: Text(
+                        'Live Camera',
+                        style: TextStyle(
+                          color: _DashboardPalette.foreground,
+                          fontWeight: FontWeight.w700,
+                          fontSize: 12,
+                        ),
+                      ),
+                    ),
+                    Text(
+                      live ? 'LIVE' : 'OPEN',
+                      style: TextStyle(
+                        color: live
+                            ? _DashboardPalette.success
+                            : _DashboardPalette.warning,
+                        fontSize: 9,
+                        fontWeight: FontWeight.w800,
+                        letterSpacing: 0.8,
+                      ),
+                    ),
+                  ],
                 ),
-                Text(
-                  live ? 'LIVE' : 'OPEN',
-                  style: TextStyle(
-                    color: live
-                        ? _DashboardPalette.success
-                        : _DashboardPalette.warning,
-                    fontSize: 9,
-                    fontWeight: FontWeight.w800,
-                    letterSpacing: 0.8,
+                const SizedBox(height: 8),
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(8),
+                  child: SizedBox(
+                    height: camHeight,
+                    width: double.infinity,
+                    child: ColoredBox(
+                      color: const Color(0xFF211A16),
+                      child: LiveCamMjpeg(
+                        key: ValueKey<String>('$streamUrl|$usePoll'),
+                        streamUrl: streamUrl,
+                        pollSnapshots: usePoll,
+                      ),
+                    ),
                   ),
                 ),
               ],
             ),
-            const SizedBox(height: 8),
-            ClipRRect(
-              borderRadius: BorderRadius.circular(8),
-              child: SizedBox(
-                height: 140,
-                width: double.infinity,
-                child: ColoredBox(
-                  color: const Color(0xFF211A16),
-                  child: LiveCamMjpeg(
-                    key: ValueKey<String>('$streamUrl|$usePoll'),
-                    streamUrl: streamUrl,
-                    pollSnapshots: usePoll,
-                  ),
-                ),
-              ),
-            ),
-          ],
-        ),
-      ),
+          ),
+        );
+      },
     );
   }
 }
@@ -10546,7 +10006,7 @@ class _InspectionSystemStatus extends StatelessWidget {
 // ── Combined quality + size result card ────────────────────────────────────
 
 /// Shows the most recent egg's quality (Good / Cracked) side-by-side
-/// with its weight class (Peewee → Jumbo).  When no egg has been seen yet the
+/// with its weight class (Small → Jumbo).  When no egg has been seen yet the
 /// card shows a neutral waiting state.
 class _EggResultCard extends StatelessWidget {
   const _EggResultCard({required this.appState, required this.hasResult});
@@ -10556,39 +10016,41 @@ class _EggResultCard extends StatelessWidget {
 
   Color _qualityColor(String label) {
     final String s = label.toLowerCase();
+    if (s.contains('crack') || s.contains('broken')) {
+      return _DashboardPalette.warning;
+    }
+    if (s.contains('dirty') || s.contains('soil') || s.contains('stain')) {
+      return _DashboardPalette.danger;
+    }
     if (s.contains('no crack') ||
         s.contains('clean') ||
         s.contains('good') ||
         s.contains('ok')) {
       return _DashboardPalette.success;
     }
-    if (s.contains('crack') || s.contains('broken')) {
-      return _DashboardPalette.warning;
-    }
     return _DashboardPalette.primary;
   }
 
   String _qualityShort(String label) {
     final String s = label.toLowerCase();
+    if (s.contains('crack') || s.contains('broken')) return 'Cracked';
+    if (s.contains('dirty') || s.contains('soil') || s.contains('stain')) {
+      return 'Dirty';
+    }
     if (s.contains('no crack') ||
         s.contains('clean') ||
         s.contains('good') ||
-        s.contains('ok') ||
-        s.contains('dirty') ||
-        s.contains('soil')) {
+        s.contains('ok')) {
       return 'Good';
     }
-    if (s.contains('crack') || s.contains('broken')) return 'Cracked';
     return label;
   }
 
   // Each size class gets a distinct accent colour for its badge.
   static const Map<EggSizeClass, Color> _sizeColors = <EggSizeClass, Color>{
-    EggSizeClass.peewee: Color(0xFF9E9E9E),
     EggSizeClass.small: Color(0xFF64B5F6),
     EggSizeClass.medium: Color(0xFF4DB6AC),
     EggSizeClass.large: Color(0xFF81C784),
-    EggSizeClass.extraLarge: Color(0xFFFFB74D),
     EggSizeClass.jumbo: Color(0xFFBA68C8),
   };
 
@@ -10650,13 +10112,14 @@ class _EggResultCard extends StatelessWidget {
     }
     final Color qColor = _qualityColor(displayLabel);
     final String qShort = _qualityShort(displayLabel);
-    final EggSizeClass sz = appState.liveLastSizeClass;
+    final EggSizeClass sz = appState.liveLastSizeClass.canonical;
     final Color szColor = _sizeColors[sz] ?? _DashboardPalette.primary;
     final double weight = appState.liveLastWeightGrams;
     final double conf = appState.liveLastConfidence;
     final String meas = appState.liveLastMeasurementStatus;
     final bool pendingWeight = appState.liveAwaitingWeight ||
-        (qShort == 'Good' && weight < 5.0) ||
+        ((qShort == 'Good' || qShort == 'Cracked' || qShort == 'Dirty') &&
+            weight < 5.0) ||
         (appState.detectionRecords.isNotEmpty &&
             appState.detectionRecords.first.isPendingWeight);
     final bool measWarn =
@@ -10922,33 +10385,30 @@ class _ResultHalf extends StatelessWidget {
   }
 }
 
-/// Horizontal scale bar showing all six size classes with the current one
-/// highlighted.
+/// Horizontal scale bar showing Small / Medium / Large / Jumbo with the
+/// current class highlighted.
 class _SizeScaleBar extends StatelessWidget {
   const _SizeScaleBar({required this.current});
 
   final EggSizeClass current;
 
   static const List<EggSizeClass> _order = <EggSizeClass>[
-    EggSizeClass.peewee,
     EggSizeClass.small,
     EggSizeClass.medium,
     EggSizeClass.large,
-    EggSizeClass.extraLarge,
     EggSizeClass.jumbo,
   ];
 
   static const Map<EggSizeClass, Color> _colors = <EggSizeClass, Color>{
-    EggSizeClass.peewee: Color(0xFF9E9E9E),
     EggSizeClass.small: Color(0xFF64B5F6),
     EggSizeClass.medium: Color(0xFF4DB6AC),
     EggSizeClass.large: Color(0xFF81C784),
-    EggSizeClass.extraLarge: Color(0xFFFFB74D),
     EggSizeClass.jumbo: Color(0xFFBA68C8),
   };
 
   @override
   Widget build(BuildContext context) {
+    final EggSizeClass activeClass = current.canonical;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: <Widget>[
@@ -10964,7 +10424,7 @@ class _SizeScaleBar extends StatelessWidget {
         const SizedBox(height: 8),
         Row(
           children: _order.map((EggSizeClass sc) {
-            final bool active = sc == current;
+            final bool active = sc == activeClass;
             final Color c = _colors[sc] ?? _DashboardPalette.primary;
             return Expanded(
               child: Padding(
@@ -11020,15 +10480,24 @@ class _EggCountRow extends StatelessWidget {
     // (farm /metrics can reset on backend restart while cached rows remain).
     int good = appState.liveGoodEggs;
     int cracked = appState.liveCrackedEggs;
+    int dirty = appState.liveDirtyEggs;
     int boardGood = 0;
     int boardCrack = 0;
+    int boardDirty = 0;
     for (final DetectionRecord row in appState.detectionRecords) {
       final String cat = row.category.toLowerCase();
       final String lab = row.label.toLowerCase();
       final bool isCrack = cat == 'crackedeggs' ||
           (lab.contains('crack') && !lab.contains('no crack'));
+      final bool isDirty = !isCrack &&
+          (cat == 'dirtyeggs' ||
+              lab.contains('dirty') ||
+              lab.contains('soil') ||
+              lab.contains('stain'));
       if (isCrack) {
         boardCrack += 1;
+      } else if (isDirty) {
+        boardDirty += 1;
       } else {
         boardGood += 1;
       }
@@ -11038,6 +10507,9 @@ class _EggCountRow extends StatelessWidget {
     }
     if (boardCrack > cracked) {
       cracked = boardCrack;
+    }
+    if (boardDirty > dirty) {
+      dirty = boardDirty;
     }
     return Row(
       children: <Widget>[
@@ -11049,7 +10521,16 @@ class _EggCountRow extends StatelessWidget {
             accent: _DashboardPalette.success,
           ),
         ),
-        const SizedBox(width: 12),
+        const SizedBox(width: 10),
+        Expanded(
+          child: _CountTile(
+            label: 'Dirty',
+            value: dirty,
+            icon: Icons.spa_outlined,
+            accent: _DashboardPalette.danger,
+          ),
+        ),
+        const SizedBox(width: 10),
         Expanded(
           child: _CountTile(
             label: 'Cracked',
@@ -11280,13 +10761,16 @@ class _IotReadingsPanel extends StatelessWidget {
 String _farmRecordQuality(DetectionRecord rec) {
   final String s = '${rec.label} ${rec.category}'.toLowerCase();
   if (s.contains('crack') || s.contains('broken')) return 'Cracked';
+  if (s.contains('dirty') ||
+      s.contains('soil') ||
+      s.contains('stain') ||
+      s.contains('dirtyeggs')) {
+    return 'Dirty';
+  }
   if (s.contains('clean') ||
       s.contains('good') ||
       s.contains('no crack') ||
-      s.contains('goodeggs') ||
-      s.contains('dirty') ||
-      s.contains('soil') ||
-      s.contains('dirtyeggs')) {
+      s.contains('goodeggs')) {
     return 'Good';
   }
   return rec.label.isNotEmpty ? rec.label : 'Egg';
@@ -11427,65 +10911,6 @@ class _PulsingDotState extends State<_PulsingDot>
         height: 10,
         decoration: BoxDecoration(shape: BoxShape.circle, color: widget.color),
       ),
-    );
-  }
-}
-
-// ── Notifications card ─────────────────────────────────────────────────────
-
-class _WorkerNotificationCard extends StatelessWidget {
-  const _WorkerNotificationCard({required this.appState});
-
-  final AppState appState;
-
-  @override
-  Widget build(BuildContext context) {
-    final int unread = appState.workerUnreadCount;
-    return _GlassSection(
-      titleIcon: Icons.notifications_outlined,
-      title: 'Notifications',
-      trailing: unread > 0
-          ? TextButton(
-              onPressed: appState.markAllNotificationsRead,
-              style: TextButton.styleFrom(
-                padding: EdgeInsets.zero,
-                minimumSize: Size.zero,
-                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                foregroundColor: _DashboardPalette.primary,
-              ),
-              child: const Text(
-                'Mark all read',
-                style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600),
-              ),
-            )
-          : null,
-      child: appState.workerNotifications.isEmpty
-          ? const Align(
-              alignment: Alignment.centerLeft,
-              child: Text(
-                'No notifications yet. Live farm status will appear here.',
-                style: TextStyle(
-                  color: _DashboardPalette.mutedForeground,
-                  fontSize: 12,
-                  height: 1.4,
-                ),
-              ),
-            )
-          : Column(
-              children: appState.workerNotifications
-                  .map(
-                    (WorkerNotification n) => Padding(
-                      padding: const EdgeInsets.only(bottom: 10),
-                      child: _WorkerNotificationTile(
-                        notification: n,
-                        onTap: n.read
-                            ? null
-                            : () => appState.markNotificationRead(n.id),
-                      ),
-                    ),
-                  )
-                  .toList(),
-            ),
     );
   }
 }
@@ -11694,12 +11119,14 @@ class _DayHarvestCallout extends StatelessWidget {
     required this.day,
     required this.total,
     required this.good,
+    required this.dirty,
     required this.cracked,
   });
 
   final String day;
   final int total;
   final int good;
+  final int dirty;
   final int cracked;
 
   @override
@@ -11739,6 +11166,8 @@ class _DayHarvestCallout extends StatelessWidget {
         ),
         const SizedBox(height: 8),
         _DayHarvestCount(label: 'Good Eggs', value: good),
+        const SizedBox(height: 6),
+        _DayHarvestCount(label: 'Dirty Eggs', value: dirty),
         const SizedBox(height: 6),
         _DayHarvestCount(label: 'Cracked Eggs', value: cracked),
       ],
@@ -11808,10 +11237,25 @@ class _SimpleLineChart extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    if (data.isEmpty) {
+      return const SizedBox(
+        height: 120,
+        child: Center(
+          child: Text(
+            'No chart data yet',
+            style: TextStyle(color: _DashboardPalette.mutedForeground),
+          ),
+        ),
+      );
+    }
     final bool detailed = showAxis &&
         (callout != null || (calloutLines != null && calloutLines!.isNotEmpty));
-    final double tipWidth = callout != null ? 250 : 148;
-    final double tipHeight = callout != null ? 168 : 118;
+    final double tipWidth = callout != null
+        ? (MediaQuery.sizeOf(context).width < EggBreakpoints.compact
+            ? 200.0
+            : 250.0)
+        : 148;
+    final double tipHeight = callout != null ? 196 : 118;
     return SizedBox(
       height: detailed ? (callout != null ? 300 : 236) : 210,
       child: Column(
@@ -11986,21 +11430,23 @@ class _LineChartPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    if (data.isEmpty) {
+    if (data.isEmpty || size.width <= 0 || size.height <= 0) {
       return;
     }
 
     final double maxVal = axisMax ??
         data
             .map((point) => point.value)
-            .reduce((double a, double b) => a > b ? a : b);
+            .fold<double>(0, (double a, double b) => a > b ? a : b);
     final double minVal = 0;
 
-    final double widthBetweenPoints = size.width / (data.length - 1);
+    final double widthBetweenPoints =
+        data.length <= 1 ? 0 : size.width / (data.length - 1);
     final List<Offset> points = <Offset>[];
 
     for (int i = 0; i < data.length; i++) {
-      final double x = i * widthBetweenPoints;
+      final double x =
+          data.length <= 1 ? size.width / 2 : i * widthBetweenPoints;
       final double ratio = maxVal > 0 ? (data[i].value - minVal) / maxVal : 0;
       final double y = size.height - (ratio * (size.height - 20)) - 10;
       points.add(Offset(x, y));
@@ -12110,8 +11556,10 @@ class _MiniBar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final double safeFactor =
+        heightFactor.isFinite ? heightFactor.clamp(0.01, 1.0) : 0.01;
     return FractionallySizedBox(
-      heightFactor: heightFactor.clamp(0.01, 1.0),
+      heightFactor: safeFactor,
       child: Container(
         width: 8,
         decoration: BoxDecoration(
